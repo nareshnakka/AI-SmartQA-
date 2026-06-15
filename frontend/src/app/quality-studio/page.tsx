@@ -1,0 +1,417 @@
+"use client";
+
+import { Suspense, useCallback, useEffect, useState } from "react";
+import Link from "next/link";
+import {
+  Sparkles, Loader2, PlayCircle, Zap, GitBranch, FileText, Rocket,
+  CheckCircle2, ArrowRight, Brain, Layers, Target, Calendar,
+} from "lucide-react";
+import { AppShell } from "@/components/shell/AppShell";
+import { PageHeader, Badge, Tabs } from "@/components/ui";
+import { apiFetch } from "@/lib/api";
+import { useActiveProject } from "@/context/ProjectContext";
+
+interface LlmProvider { name: string; models: string[]; available: boolean }
+interface StudioOverview {
+  stats: Record<string, number>;
+  default_llm_provider: string;
+  llm_providers: LlmProvider[];
+  automation_input_types: { id: string; name: string; description: string }[];
+  performance_input_types: { id: string; name: string; description: string }[];
+}
+interface Sprint { id: string; name: string; goal?: string; status: string; test_case_ids: string[] }
+interface Release { id: string; name: string; version: string; status: string; sprint_ids: string[] }
+interface TestCase { id: string; title: string; steps?: string[] }
+
+const WORKLOADS = ["smoke", "load", "stress", "soak", "spike"];
+const FRAMEWORKS = ["playwright", "cypress", "selenium", "webdriverio"];
+
+function QualityStudioContent() {
+  const { projectId, activeProject } = useActiveProject();
+  const [overview, setOverview] = useState<StudioOverview | null>(null);
+  const [tab, setTab] = useState("overview");
+  const [llmProvider, setLlmProvider] = useState("qeos-native");
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const [functionalInput, setFunctionalInput] = useState("");
+  const [functionalType, setFunctionalType] = useState("prompt");
+
+  const [autoInput, setAutoInput] = useState("");
+  const [autoType, setAutoType] = useState("prompt");
+  const [framework, setFramework] = useState("playwright");
+  const [baseUrl, setBaseUrl] = useState("https://opensource-demo.orangehrmlive.com");
+
+  const [perfInput, setPerfInput] = useState("");
+  const [perfType, setPerfType] = useState("prompt");
+  const [workload, setWorkload] = useState("load");
+
+  const [sprints, setSprints] = useState<Sprint[]>([]);
+  const [releases, setReleases] = useState<Release[]>([]);
+  const [testCases, setTestCases] = useState<TestCase[]>([]);
+  const [newSprintName, setNewSprintName] = useState("");
+  const [newReleaseName, setNewReleaseName] = useState("");
+  const [selectedCases, setSelectedCases] = useState<Set<string>>(new Set());
+  const [nfrTitle, setNfrTitle] = useState("");
+  const [nfrContent, setNfrContent] = useState("");
+
+  const loadStudio = useCallback(async () => {
+    if (!projectId) return;
+    const [ov, sp, rel, tc] = await Promise.all([
+      apiFetch<StudioOverview>(`/api/v1/projects/${projectId}/quality-studio/overview`),
+      apiFetch<Sprint[]>(`/api/v1/projects/${projectId}/quality-studio/sprints`),
+      apiFetch<Release[]>(`/api/v1/projects/${projectId}/quality-studio/releases`),
+      apiFetch<TestCase[]>(`/api/v1/projects/${projectId}/test-cases`),
+    ]);
+    setOverview(ov);
+    setLlmProvider(ov.default_llm_provider || "qeos-native");
+    setSprints(sp);
+    setReleases(rel);
+    setTestCases(tc);
+  }, [projectId]);
+
+  useEffect(() => { loadStudio().catch(() => {}); }, [loadStudio]);
+
+  const run = async (label: string, fn: () => Promise<unknown>) => {
+    setBusy(true);
+    setMessage("");
+    try {
+      const result = await fn();
+      setMessage(`${label} — success`);
+      await loadStudio();
+      return result;
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const generateFunctional = () => run("Functional tests generated", () =>
+    apiFetch(`/api/v1/projects/${projectId}/quality-studio/functional/generate`, {
+      method: "POST",
+      body: JSON.stringify({ input_type: functionalType, content: functionalInput, llm_provider: llmProvider }),
+    })
+  );
+
+  const generateAutomation = () => run("Automation scripts generated", () =>
+    apiFetch(`/api/v1/projects/${projectId}/quality-studio/automation/generate`, {
+      method: "POST",
+      body: JSON.stringify({
+        input_type: autoType, content: autoInput, framework, base_url: baseUrl, llm_provider: llmProvider,
+      }),
+    })
+  );
+
+  const generatePerformance = () => run("Performance scripts generated", () =>
+    apiFetch(`/api/v1/projects/${projectId}/quality-studio/performance/generate`, {
+      method: "POST",
+      body: JSON.stringify({
+        input_type: perfType, content: perfInput, workload_profile: workload,
+        base_url: baseUrl, llm_provider: llmProvider,
+      }),
+    })
+  );
+
+  const createSprint = () => run("Sprint created", () =>
+    apiFetch(`/api/v1/projects/${projectId}/quality-studio/sprints`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: newSprintName || `Sprint ${sprints.length + 1}`,
+        test_case_ids: [...selectedCases],
+      }),
+    })
+  );
+
+  const createRelease = () => run("Release created", () =>
+    apiFetch(`/api/v1/projects/${projectId}/quality-studio/releases`, {
+      method: "POST",
+      body: JSON.stringify({ name: newReleaseName || "Release", version: "1.0.0" }),
+    })
+  );
+
+  const saveNfr = () => run("NFR document saved", () =>
+    apiFetch(`/api/v1/projects/${projectId}/quality-studio/nfr`, {
+      method: "POST",
+      body: JSON.stringify({ title: nfrTitle || "NFR Document", content: nfrContent, source_type: "mixed" }),
+    })
+  );
+
+  const executeSprint = (sprintId: string) => run("Sprint execution started", () =>
+    apiFetch(`/api/v1/projects/${projectId}/quality-studio/sprints/execute`, {
+      method: "POST",
+      body: JSON.stringify({ sprint_id: sprintId, framework, base_url: baseUrl, mode: "live" }),
+    })
+  );
+
+  const stats = overview?.stats;
+
+  return (
+    <AppShell title="Quality Studio">
+      <PageHeader
+        title="Quality Studio"
+        subtitle="One-stop hub — functional tests, automation, performance, sprints & releases. No manual test cases required."
+        actions={
+          <div className="flex items-center gap-2">
+            <Brain className="w-4 h-4 text-brand-700" />
+            <select
+              className="ds-input py-1.5 text-sm w-44"
+              value={llmProvider}
+              onChange={(e) => setLlmProvider(e.target.value)}
+              title="LLM provider — QEOS Native is default (fast, no API key)"
+            >
+              {(overview?.llm_providers ?? [{ name: "qeos-native", available: true }]).map((p) => (
+                <option key={p.name} value={p.name} disabled={!p.available}>
+                  {p.name}{!p.available ? " (unavailable)" : p.name === "qeos-native" ? " ★ default" : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+        }
+      />
+
+      <div className="ds-card mb-4 px-4 py-3 flex flex-wrap items-center gap-3">
+        {activeProject && (
+          <span className="text-sm font-medium text-[var(--text-secondary)]">{activeProject.name}</span>
+        )}
+        {stats && (
+          <div className="flex flex-wrap gap-2 text-xs">
+            <Badge variant="neutral">{stats.test_cases} test cases</Badge>
+            <Badge variant="neutral">{stats.automation_assets} automation</Badge>
+            <Badge variant="neutral">{stats.performance_assets} performance</Badge>
+            <Badge variant="neutral">{stats.sprints} sprints</Badge>
+            <Badge variant="neutral">{stats.releases} releases</Badge>
+          </div>
+        )}
+        <div className="ml-auto flex gap-2">
+          <Link href={`/discovery?project=${projectId}`} className="ds-btn-secondary text-xs">Discovery</Link>
+          <Link href={`/executions?project=${projectId}`} className="ds-btn-secondary text-xs">Executions</Link>
+          <Link href={`/studio?project=${projectId}`} className="ds-btn-secondary text-xs">Automation IDE</Link>
+        </div>
+      </div>
+
+      <Tabs
+        tabs={[
+          { id: "overview", label: "Overview" },
+          { id: "functional", label: "Functional Tests" },
+          { id: "automation", label: "Automation" },
+          { id: "performance", label: "Performance" },
+          { id: "sprint", label: "Sprint & Release" },
+        ]}
+        active={tab}
+        onChange={setTab}
+      />
+
+      <div className="mt-4">
+        {tab === "overview" && (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {[
+              { icon: FileText, title: "Functional Tests", desc: "Generate from prompts, requirements, BDD — no manual authoring", tab: "functional", color: "brand" },
+              { icon: Sparkles, title: "Automation", desc: "Playwright/Cypress/etc. from prompt, steps, HAR, OpenAPI, video — standalone", tab: "automation", color: "emerald" },
+              { icon: Zap, title: "Performance", desc: "k6 scripts from NFR docs, prompts, steps, HAR — no automation dependency", tab: "performance", color: "amber" },
+              { icon: Calendar, title: "Sprint & Release", desc: "Plan sprints, assign tests, execute & track by release", tab: "sprint", color: "violet" },
+              { icon: PlayCircle, title: "Execute", desc: "Run automation & performance with live agent", href: "/executions", color: "blue" },
+              { icon: Target, title: "Discovery", desc: "Browser crawl → auto-generate tests & scripts", href: "/discovery", color: "rose" },
+            ].map((card) => (
+              <button
+                key={card.title}
+                onClick={() => card.tab ? setTab(card.tab) : undefined}
+                className="ds-card p-5 text-left hover:ring-2 hover:ring-brand-200 transition-all"
+              >
+                <card.icon className="w-8 h-8 text-brand-700 mb-3" />
+                <h3 className="text-sm font-semibold mb-1">{card.title}</h3>
+                <p className="text-xs text-[var(--text-tertiary)] mb-3">{card.desc}</p>
+                {card.href ? (
+                  <Link href={`${card.href}?project=${projectId}`} className="text-xs text-brand-700 flex items-center gap-1">
+                    Open <ArrowRight className="w-3 h-3" />
+                  </Link>
+                ) : (
+                  <span className="text-xs text-brand-700 flex items-center gap-1">Start <ArrowRight className="w-3 h-3" /></span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {tab === "functional" && (
+          <div className="ds-card p-5 space-y-4 max-w-3xl">
+            <div className="flex items-center gap-2">
+              <Layers className="w-5 h-5 text-brand-700" />
+              <h2 className="text-sm font-semibold">Generate Functional Test Cases</h2>
+            </div>
+            <p className="text-xs text-[var(--text-tertiary)]">
+              Uses <strong>{llmProvider}</strong> — QEOS Native is fastest with zero external API keys.
+            </p>
+            <select className="ds-input text-sm w-full" value={functionalType} onChange={(e) => setFunctionalType(e.target.value)}>
+              <option value="prompt">Natural language prompt</option>
+              <option value="requirements">Requirements / BRD</option>
+              <option value="user_story">User stories</option>
+              <option value="bdd">BDD / Gherkin</option>
+              <option value="steps">Step list</option>
+            </select>
+            <textarea
+              className="ds-input text-sm font-mono w-full resize-none"
+              rows={10}
+              placeholder="Describe what to test, paste requirements, user stories, or numbered steps…"
+              value={functionalInput}
+              onChange={(e) => setFunctionalInput(e.target.value)}
+            />
+            <button onClick={generateFunctional} disabled={busy || !functionalInput.trim() || !projectId} className="ds-btn-primary">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+              Generate Test Cases
+            </button>
+          </div>
+        )}
+
+        {tab === "automation" && (
+          <div className="ds-card p-5 space-y-4 max-w-3xl">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-5 h-5 text-emerald-600" />
+              <h2 className="text-sm font-semibold">Standalone Automation Generation</h2>
+              <Badge variant="success">No manual test cases required</Badge>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <select className="ds-input text-sm" value={autoType} onChange={(e) => setAutoType(e.target.value)}>
+                {(overview?.automation_input_types ?? []).map((t) => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+              <select className="ds-input text-sm" value={framework} onChange={(e) => setFramework(e.target.value)}>
+                {FRAMEWORKS.map((f) => <option key={f} value={f}>{f}</option>)}
+              </select>
+            </div>
+            <input className="ds-input text-sm w-full" placeholder="Base URL" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
+            <textarea
+              className="ds-input text-sm font-mono w-full resize-none"
+              rows={10}
+              placeholder="Prompt, steps, paste OpenAPI/HAR JSON, or video session transcript…"
+              value={autoInput}
+              onChange={(e) => setAutoInput(e.target.value)}
+            />
+            <div className="flex gap-2">
+              <button onClick={generateAutomation} disabled={busy || !autoInput.trim()} className="ds-btn-primary">
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                Generate Automation
+              </button>
+              <Link href={`/studio?project=${projectId}`} className="ds-btn-secondary">Open in IDE</Link>
+            </div>
+          </div>
+        )}
+
+        {tab === "performance" && (
+          <div className="ds-card p-5 space-y-4 max-w-3xl">
+            <div className="flex items-center gap-2">
+              <Zap className="w-5 h-5 text-amber-600" />
+              <h2 className="text-sm font-semibold">Standalone Performance Engineering</h2>
+              <Badge variant="success">Independent of automation</Badge>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <select className="ds-input text-sm" value={perfType} onChange={(e) => setPerfType(e.target.value)}>
+                {(overview?.performance_input_types ?? []).map((t) => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+              <select className="ds-input text-sm" value={workload} onChange={(e) => setWorkload(e.target.value)}>
+                {WORKLOADS.map((w) => <option key={w} value={w}>{w}</option>)}
+              </select>
+            </div>
+            <input className="ds-input text-sm w-full" placeholder="Target base URL" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
+            <textarea
+              className="ds-input text-sm font-mono w-full resize-none"
+              rows={10}
+              placeholder="NFR doc (p95 &lt; 500ms, 1000 RPS), user journey steps, prompt, HAR/OpenAPI JSON…"
+              value={perfInput}
+              onChange={(e) => setPerfInput(e.target.value)}
+            />
+            <div className="flex gap-2">
+              <button onClick={generatePerformance} disabled={busy || !perfInput.trim()} className="ds-btn-primary">
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+                Generate k6 Scripts
+              </button>
+              <Link href={`/performance?project=${projectId}`} className="ds-btn-secondary">Performance Dashboard</Link>
+            </div>
+          </div>
+        )}
+
+        {tab === "sprint" && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="ds-card p-5 space-y-4">
+              <h2 className="text-sm font-semibold flex items-center gap-2"><GitBranch className="w-4 h-4" /> Sprints</h2>
+              <input className="ds-input text-sm" placeholder="Sprint name" value={newSprintName} onChange={(e) => setNewSprintName(e.target.value)} />
+              <div className="max-h-48 overflow-auto space-y-1 border rounded-md p-2">
+                {testCases.map((tc) => (
+                  <label key={tc.id} className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selectedCases.has(tc.id)}
+                      onChange={(e) => {
+                        setSelectedCases((prev) => {
+                          const n = new Set(prev);
+                          if (e.target.checked) n.add(tc.id); else n.delete(tc.id);
+                          return n;
+                        });
+                      }}
+                    />
+                    <span className="truncate">{tc.title}</span>
+                  </label>
+                ))}
+                {testCases.length === 0 && <p className="text-xs text-[var(--text-tertiary)]">Generate test cases first</p>}
+              </div>
+              <button onClick={createSprint} disabled={busy} className="ds-btn-primary text-sm">Create Sprint</button>
+              <ul className="space-y-2">
+                {sprints.map((s) => (
+                  <li key={s.id} className="flex items-center justify-between text-sm p-2 rounded bg-[var(--surface-sunken)]">
+                    <span>{s.name} <Badge variant="neutral">{s.test_case_ids.length} tests</Badge></span>
+                    <button onClick={() => executeSprint(s.id)} disabled={busy || !s.test_case_ids.length} className="ds-btn-secondary text-xs py-1">
+                      <PlayCircle className="w-3 h-3" /> Run
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            <div className="ds-card p-5 space-y-4">
+              <h2 className="text-sm font-semibold flex items-center gap-2"><Rocket className="w-4 h-4" /> Releases</h2>
+              <input className="ds-input text-sm" placeholder="Release name" value={newReleaseName} onChange={(e) => setNewReleaseName(e.target.value)} />
+              <button onClick={createRelease} disabled={busy} className="ds-btn-primary text-sm">Create Release</button>
+              <ul className="space-y-2">
+                {releases.map((r) => (
+                  <li key={r.id} className="text-sm p-2 rounded bg-[var(--surface-sunken)]">
+                    {r.name} <span className="text-[var(--text-tertiary)]">v{r.version}</span>
+                    <span className="ml-2"><Badge variant="neutral">{r.status}</Badge></span>
+                  </li>
+                ))}
+              </ul>
+
+              <hr className="border-[var(--border-default)]" />
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">NFR Documents</h3>
+              <input className="ds-input text-sm" placeholder="NFR title" value={nfrTitle} onChange={(e) => setNfrTitle(e.target.value)} />
+              <textarea className="ds-input text-sm resize-none" rows={4} placeholder="SLA: p95 &lt; 300ms, 500 concurrent users, 2000 RPS…"
+                value={nfrContent} onChange={(e) => setNfrContent(e.target.value)} />
+              <button onClick={saveNfr} disabled={busy || !nfrContent.trim()} className="ds-btn-secondary text-sm">Save NFR → use in Performance tab</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {message && (
+        <p className={`mt-4 text-sm p-3 rounded-md flex items-center gap-2 ${message.includes("success") ? "bg-emerald-50 text-emerald-800" : "bg-[var(--surface-sunken)]"}`}>
+          {message.includes("success") && <CheckCircle2 className="w-4 h-4" />}
+          {message}
+        </p>
+      )}
+    </AppShell>
+  );
+}
+
+export default function QualityStudioPage() {
+  return (
+    <Suspense fallback={
+      <AppShell title="Quality Studio">
+        <div className="flex justify-center p-16"><Loader2 className="w-6 h-6 animate-spin" /></div>
+      </AppShell>
+    }>
+      <QualityStudioContent />
+    </Suspense>
+  );
+}

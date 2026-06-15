@@ -1,0 +1,52 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+tmp/
+temp/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+qeos.db
+postgres_data/
+redis_data/
+
+# Execution artifacts (test videos)
+backend/execution_artifacts/
+execution_artifacts/
+
+# Playwright reports (generated)
+test-results/
+playwright-report/
