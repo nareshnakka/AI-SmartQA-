@@ -67,6 +67,10 @@ See [docs/EXTENSIBILITY.md](docs/EXTENSIBILITY.md) for adding integrations, agen
 
 ## Quick Start
 
+**New to the project?** See **[docs/GIT.md](docs/GIT.md)** for how to **clone**, install, run, and **stop** the app on a fresh machine.
+
+**Windows one-click:** run `setup-and-run.bat` from the repo root after cloning.
+
 ### Prerequisites
 
 - Docker & Docker Compose
