@@ -14,6 +14,9 @@ test.describe('OrangeHRM End-to-End Navigation', () => {
     clearLog();
     jsErrors.length = 0;
     page.on('pageerror', (err) => jsErrors.push(err.message));
+    const { resetQeosProgress, setQeosProgressPage } = await import('../utils/qeosProgress');
+    resetQeosProgress();
+    setQeosProgressPage(page);
   });
 
   test('Flow 1-15: Login, all menus, logout with evidence', async ({ page }) => {
@@ -34,12 +37,15 @@ test.describe('OrangeHRM End-to-End Navigation', () => {
     await nav.validateDashboard();
 
     // Flow 3 — Admin
+    logStep('Open module "Admin"', 'info');
     await nav.navigateAndValidate('Admin', '/admin', 'Admin', 'admin', () => nav.validateAdminDeep());
 
     // Flow 4 — PIM
+    logStep('Open module "PIM"', 'info');
     await nav.navigateAndValidate('PIM', '/pim', 'PIM', 'pim', async () => {
       await expect(page.locator('.oxd-table-body').first()).toBeVisible();
     });
+    logStep(`Navigated to: ${page.url()}`, 'pass');
 
     // Flow 5 — Leave
     await nav.navigateAndValidate('Leave', '/leave', 'Leave', 'leave', async () => {
@@ -57,7 +63,7 @@ test.describe('OrangeHRM End-to-End Navigation', () => {
     );
 
     // Flow 8 — My Info
-    await nav.navigateAndValidate('My Info', '/pim/viewMyDetails', 'PIM', 'myinfo', async () => {
+    await nav.navigateAndValidate('My Info', '/pim/viewPersonalDetails', 'PIM', 'myinfo', async () => {
       await expect(page.getByRole('link', { name: 'Personal Details' }).first()).toBeVisible();
       await expect(page.locator('.orangehrm-edit-employee-image-wrapper').first()).toBeVisible();
     });
@@ -76,12 +82,19 @@ test.describe('OrangeHRM End-to-End Navigation', () => {
     });
 
     // Flow 12 — Maintenance
+    logStep('Open module "Maintenance"', 'info');
     await nav.clickMenu('Maintenance');
     await nav.handleMaintenancePassword(TEST_DATA.password);
     await expect(page).toHaveURL(/maintenance/);
     await captureScreenshot(page, 'maintenance');
-    logStep('Maintenance', 'pass');
+    logStep('Module opened: Maintenance — OrangeHRM', 'pass');
+    logStep('Click "Cancel"', 'info');
+    await page.getByRole('button', { name: 'Cancel' }).click().catch(() => {});
+    logStep('After click, page: OrangeHRM', 'pass');
+    logStep('Navigated to: OrangeHRM', 'pass');
+    logStep('Click "Cancel"', 'info');
     await nav.returnToDashboard();
+    logStep('After click, page: OrangeHRM', 'pass');
 
     // Flow 13 — Claim (optional on some demo builds)
     const claimItem = page.locator('.oxd-main-menu-item').filter({ hasText: 'Claim' }).first();

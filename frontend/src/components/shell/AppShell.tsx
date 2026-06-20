@@ -8,7 +8,10 @@ import { useEffect, useState } from "react";
 import { NAVIGATION } from "@/config/navigation";
 import { getIcon } from "@/config/icons";
 import { GlobalSearch } from "@/components/GlobalSearch";
+import { BackendStatusBanner } from "@/components/BackendStatusBanner";
 import { ActiveProjectSelector } from "@/components/ProjectSelector";
+import { WorkspaceBar } from "@/components/workspace/WorkspaceBar";
+import { useClientMounted } from "@/hooks/useClientMounted";
 import { apiFetch, BACKEND_URL } from "@/lib/api";
 import { clearSession, getStoredUser, type AuthUser } from "@/lib/auth";
 
@@ -105,7 +108,12 @@ function SidebarUser() {
           <p className="text-xs font-medium text-gray-300 truncate">{displayName}</p>
           <p className="text-[10px] text-gray-500 truncate capitalize">{role}</p>
         </div>
-        <button onClick={logout} className="ds-btn-ghost p-1.5 text-gray-500 hover:text-gray-300" title="Sign out">
+        <button
+          onClick={logout}
+          className="ds-btn-ghost p-1.5 text-gray-500 hover:text-gray-300"
+          title="Sign out"
+          suppressHydrationWarning
+        >
           <LogOut className="w-3.5 h-3.5" />
         </button>
       </div>
@@ -116,6 +124,7 @@ function SidebarUser() {
 export function TopBar({ title }: { title?: string }) {
   const pathname = usePathname();
   const showProject = pathname !== "/login" && !pathname.startsWith("/projects/");
+  const mounted = useClientMounted();
 
   return (
     <header className="h-14 bg-[var(--surface-raised)] border-b border-[var(--border-default)] flex items-center justify-between px-6 sticky top-0 z-20">
@@ -128,19 +137,33 @@ export function TopBar({ title }: { title?: string }) {
           </div>
         )}
         {showProject && (
-          <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
             {title && <span className="text-gray-300">|</span>}
-            <ActiveProjectSelector className="ds-input py-1.5 text-sm w-52 max-w-[240px]" />
+            {mounted ? (
+              <>
+                <ActiveProjectSelector className="ds-input py-1.5 text-sm w-52 max-w-[240px] shrink-0" />
+                <WorkspaceBar />
+              </>
+            ) : (
+              <div
+                className="ds-input py-1.5 text-sm w-52 max-w-[240px] shrink-0 h-[34px] bg-[var(--surface-sunken)] animate-pulse rounded-md"
+                aria-hidden
+              />
+            )}
           </div>
         )}
       </div>
 
       <div className="flex items-center gap-2">
-        <GlobalSearch />
+        {mounted ? (
+          <GlobalSearch />
+        ) : (
+          <div className="w-64 h-[34px] bg-[var(--surface-sunken)] animate-pulse rounded-md" aria-hidden />
+        )}
         <a href={`${BACKEND_URL}/docs`} target="_blank" rel="noopener noreferrer" className="ds-btn-ghost p-2" title="API Docs">
           <HelpCircle className="w-4 h-4" />
         </a>
-        <button className="ds-btn-ghost p-2 relative" title="Notifications">
+        <button className="ds-btn-ghost p-2 relative" title="Notifications" suppressHydrationWarning>
           <Bell className="w-4 h-4" />
         </button>
       </div>
@@ -154,6 +177,7 @@ export function AppShell({ children, title }: { children: React.ReactNode; title
       <Sidebar />
       <div className="pl-[240px]">
         <TopBar title={title} />
+        <BackendStatusBanner />
         <main className="p-6 max-w-[1440px]">{children}</main>
       </div>
     </div>

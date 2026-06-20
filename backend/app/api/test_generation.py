@@ -10,6 +10,7 @@ from app.models.phase1_schemas import (
     RequirementCreate,
     RequirementResponse,
     TestCaseResponse,
+    TestCaseCreate,
     TestCaseUpdate,
     TestCaseBulkAction,
     TestSuiteResponse,
@@ -20,7 +21,7 @@ from app.models.phase1_schemas import (
 )
 from app.services.generation import GenerationService
 from app.services.export import ExportService
-from app.services.test_cases import bulk_test_case_action, list_project_test_cases, remove_case_references
+from app.services.test_cases import bulk_test_case_action, create_project_test_case, list_project_test_cases, remove_case_references, test_case_to_dict
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["Phase 1 — Test Generation"])
 
@@ -99,10 +100,49 @@ async def delete_requirement(
 async def list_test_cases(
     project_id: UUID,
     for_automation: bool = Query(False, description="Exclude disabled test cases"),
+    module_id: str | None = Query(None, description="Comma-separated module UUIDs to filter"),
+    environment_id: str | None = Query(None, description="Comma-separated environment UUIDs to filter"),
     db: AsyncSession = Depends(get_db),
 ):
     await _get_project(project_id, db)
-    return await list_project_test_cases(db, project_id, for_automation=for_automation)
+    module_ids = None
+    if module_id and module_id.lower() != "all":
+        module_ids = [UUID(x.strip()) for x in module_id.split(",") if x.strip()]
+    environment_ids = None
+    if environment_id and environment_id.lower() != "all":
+        environment_ids = [UUID(x.strip()) for x in environment_id.split(",") if x.strip()]
+    cases = await list_project_test_cases(
+        db,
+        project_id,
+        for_automation=for_automation,
+        module_ids=module_ids,
+        environment_ids=environment_ids,
+    )
+    return [TestCaseResponse(**test_case_to_dict(c)) for c in cases]
+
+
+@router.post("/test-cases", response_model=TestCaseResponse, status_code=201)
+async def create_test_case(
+    project_id: UUID, body: TestCaseCreate, db: AsyncSession = Depends(get_db)
+):
+    await _get_project(project_id, db)
+    try:
+        case = await create_project_test_case(
+            db,
+            project_id,
+            title=body.title,
+            description=body.description or "",
+            steps=body.steps,
+            expected_results=body.expected_results,
+            priority=body.priority,
+            module_id=body.module_id,
+            module_name=body.module_name,
+            environment_id=body.environment_id,
+            case_type="functional",
+        )
+        return TestCaseResponse(**test_case_to_dict(case))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @router.get("/test-cases/{case_id}", response_model=TestCaseResponse)
@@ -110,7 +150,11 @@ async def get_test_case(project_id: UUID, case_id: UUID, db: AsyncSession = Depe
     case = await db.get(TestCaseModel, case_id)
     if not case or case.project_id != project_id:
         raise HTTPException(404, "Test case not found")
-    return case
+    if case.module_id:
+        await db.refresh(case, attribute_names=["module"])
+    if case.environment_id:
+        await db.refresh(case, attribute_names=["environment"])
+    return TestCaseResponse(**test_case_to_dict(case))
 
 
 @router.patch("/test-cases/{case_id}", response_model=TestCaseResponse)
@@ -120,12 +164,16 @@ async def update_test_case(
     case = await db.get(TestCaseModel, case_id)
     if not case or case.project_id != project_id:
         raise HTTPException(404, "Test case not found")
-    for field in ["title", "description", "steps", "expected_results", "priority", "status"]:
+    for field in ["title", "description", "steps", "expected_results", "priority", "status", "module_id", "environment_id"]:
         val = getattr(body, field, None)
         if val is not None:
             setattr(case, field, val)
     await db.flush()
-    return case
+    if case.module_id:
+        await db.refresh(case, attribute_names=["module"])
+    if case.environment_id:
+        await db.refresh(case, attribute_names=["environment"])
+    return TestCaseResponse(**test_case_to_dict(case))
 
 
 @router.delete("/test-cases/{case_id}", status_code=204)

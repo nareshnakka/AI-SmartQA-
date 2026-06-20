@@ -1,8 +1,26 @@
 import { Page, expect } from '@playwright/test';
 
+/** Stream current page to Studio live browser panel (QEOS_LIVE_FRAME env). */
+export async function publishLiveFrame(page: Page) {
+  const framePath = process.env.QEOS_LIVE_FRAME;
+  if (!framePath) return;
+  try {
+    await page.screenshot({
+      path: framePath,
+      type: 'jpeg',
+      quality: 72,
+      timeout: 8_000,
+      animations: 'disabled',
+    });
+  } catch {
+    /* page may be mid-navigation */
+  }
+}
+
 export async function waitForPageLoad(page: Page) {
   await page.waitForLoadState('domcontentloaded');
   await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+  await publishLiveFrame(page);
 }
 
 export async function assertNoJsErrors(page: Page, errors: string[]) {

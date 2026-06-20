@@ -12,9 +12,10 @@ export interface FlowStep {
   status?: FlowStepStatus;
   action?: string;
   url?: string;
+  disabled?: boolean;
 }
 
-function statusIcon(status: FlowStepStatus | undefined, isActive: boolean) {
+function statusIcon(status: FlowStepStatus | undefined, isActive: boolean, disabled?: boolean) {
   if (status === "running" || isActive) {
     return (
       <span className="relative flex h-8 w-8 shrink-0 items-center justify-center">
@@ -39,6 +40,13 @@ function statusIcon(status: FlowStepStatus | undefined, isActive: boolean) {
       </span>
     );
   }
+  if (status === "skipped" || disabled) {
+    return (
+      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gray-100 text-gray-400 ring-2 ring-gray-200">
+        <Circle className="h-3.5 w-3.5" />
+      </span>
+    );
+  }
   return (
     <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gray-100 text-gray-400 ring-2 ring-gray-200">
       <Circle className="h-3.5 w-3.5" />
@@ -57,15 +65,21 @@ export function TestCaseFlowView({
   title,
   steps,
   activeStepIndex = null,
+  selectedStepIndex = null,
   showHeader = true,
   compact = false,
+  editable = false,
+  onSelectStep,
   onDebugStep,
 }: {
   title?: string;
   steps: FlowStep[];
   activeStepIndex?: number | null;
+  selectedStepIndex?: number | null;
   showHeader?: boolean;
   compact?: boolean;
+  editable?: boolean;
+  onSelectStep?: (index: number, step: FlowStep) => void;
   onDebugStep?: (step: FlowStep) => void;
 }) {
   if (!steps.length) {
@@ -88,12 +102,14 @@ export function TestCaseFlowView({
       <div className="relative pl-1">
         {steps.map((step, index) => {
           const isActive = activeStepIndex === index || step.status === "running";
+          const isSelected = selectedStepIndex === index;
           const isLast = index === steps.length - 1;
           const prevStatus = index > 0 ? steps[index - 1].status : undefined;
           const nextActive = activeStepIndex === index + 1;
+          const stepDisabled = step.disabled || step.status === "skipped";
 
           return (
-            <div key={step.order ?? index} className="relative flex gap-3 pb-1">
+            <div key={`${step.order ?? index}-${step.description}`} className="relative flex gap-3 pb-1">
               {!isLast && (
                 <div
                   className={clsx(
@@ -106,14 +122,23 @@ export function TestCaseFlowView({
                 </div>
               )}
 
-              <div className="z-10 shrink-0">{statusIcon(step.status, isActive)}</div>
+              <div className="z-10 shrink-0">{statusIcon(step.status, isActive, stepDisabled)}</div>
 
               <div
+                role={editable ? "button" : undefined}
+                tabIndex={editable ? 0 : undefined}
+                onClick={editable && onSelectStep ? () => onSelectStep(index, step) : undefined}
+                onKeyDown={editable && onSelectStep ? (e) => { if (e.key === "Enter" || e.key === " ") onSelectStep(index, step); } : undefined}
                 className={clsx(
                   "flex-1 min-w-0 rounded-lg border transition-all duration-300 mb-3",
-                  isActive
+                  editable && "cursor-pointer",
+                  isSelected && editable
+                    ? "border-brand-500 bg-brand-50/60 ring-2 ring-brand-300"
+                    : isActive
                     ? "border-brand-400 bg-brand-50/80 shadow-sm shadow-brand-100 ring-1 ring-brand-200"
-                    : step.status === "passed" || step.status === "passed_with_warnings"
+                    : stepDisabled
+                      ? "border-gray-200 bg-gray-50/80 opacity-70"
+                      : step.status === "passed" || step.status === "passed_with_warnings"
                       ? "border-emerald-200 bg-emerald-50/40"
                       : step.status === "failed"
                         ? "border-red-200 bg-red-50/40"
@@ -132,13 +157,22 @@ export function TestCaseFlowView({
                             {step.action}
                           </span>
                         )}
+                        {stepDisabled && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-200 text-gray-600">
+                            Disabled
+                          </span>
+                        )}
                         {isActive && (
                           <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-brand-700 text-white animate-pulse">
                             Executing…
                           </span>
                         )}
                       </div>
-                      <p className={clsx("mt-1 text-[var(--text-primary)]", compact ? "text-xs" : "text-sm")}>
+                      <p className={clsx(
+                        "mt-1 text-[var(--text-primary)]",
+                        compact ? "text-xs" : "text-sm",
+                        stepDisabled && "line-through text-[var(--text-tertiary)]"
+                      )}>
                         {step.description}
                       </p>
                       {step.url && (
@@ -203,7 +237,7 @@ export function parseStepsFromScript(content: string): FlowStep[] {
 
 /** Build flow steps from string[] test case steps */
 export function buildFlowSteps(
-  rawSteps: (string | { description?: string; action?: string; url?: string; order?: number })[],
+  rawSteps: (string | { description?: string; action?: string; url?: string; order?: number; disabled?: boolean })[],
   expected?: string[],
   stepStatuses?: { order: number; status: string; description?: string; expected?: string }[]
 ): FlowStep[] {
@@ -217,15 +251,18 @@ export function buildFlowSteps(
         description: st?.description ?? s,
         expected: st?.expected ?? expected?.[i] ?? null,
         status: (st?.status as FlowStepStatus) ?? "pending",
+        disabled: false,
       };
     }
+    const disabled = Boolean(s.disabled);
     return {
       order: s.order ?? order,
       description: st?.description ?? s.description ?? String(s),
       action: s.action,
       url: s.url,
       expected: st?.expected ?? expected?.[i] ?? null,
-      status: (st?.status as FlowStepStatus) ?? "pending",
+      status: disabled ? "skipped" : ((st?.status as FlowStepStatus) ?? "pending"),
+      disabled,
     };
   });
 }
@@ -244,7 +281,7 @@ export function deriveActiveStepIndex(
     executor?: string;
   },
   testCaseTitle?: string,
-  tick?: number,
+  _tick?: number,
   testCaseId?: string
 ): number | null {
   if (runStatus !== "running" || steps.length === 0) {
@@ -256,24 +293,26 @@ export function deriveActiveStepIndex(
   if (progress?.current && testCaseTitle && progress.current !== testCaseTitle && !progress.current_test_case_id) {
     return null;
   }
-  const completed = steps.filter((s) => s.status === "passed" || s.status === "failed").length;
-  if (completed > 0 && completed < steps.length) {
-    return completed;
-  }
-  if (progress?.phase === "playwright_test" && tick != null) {
-    return Math.min(Math.floor(tick / 2), steps.length - 1);
-  }
-  if (progress?.phase === "npm_install" || progress?.phase === "playwright_install") {
-    return 0;
-  }
+
   const backendIdx = progress?.current_step_index;
   if (backendIdx != null && backendIdx >= 0) {
     return Math.min(backendIdx, steps.length - 1);
   }
-  if (tick != null) {
-    return tick % steps.length;
+
+  // Install / prepare — highlight first step only, do not fake-advance
+  if (progress?.phase === "npm_install" || progress?.phase === "playwright_install" || progress?.phase === "prepare") {
+    return 0;
   }
-  return 0;
+
+  const runningIdx = steps.findIndex((s) => s.status === "running");
+  if (runningIdx >= 0) return runningIdx;
+
+  const completed = steps.filter((s) => s.status === "passed" || s.status === "failed").length;
+  if (completed > 0 && completed < steps.length) {
+    return completed;
+  }
+
+  return null;
 }
 
 /** Merge execution result step statuses onto flow steps and apply live debug highlight */
@@ -293,14 +332,18 @@ export function applyDebugFlowSteps(
     resultSteps?: { order: number; status: string; description?: string; expected?: string }[];
   }
 ): { steps: FlowStep[]; activeStepIndex: number | null } {
+  const runFinished = opts.runStatus && opts.runStatus !== "running";
   let steps = baseSteps;
+
+  // Merge live or final step statuses from backend (never fake-advance locally)
   if (opts.resultSteps?.length) {
     steps = buildFlowSteps(
-      opts.resultSteps.map((s) => s.description ?? ""),
-      opts.resultSteps.map((s) => s.expected ?? ""),
+      baseSteps.map((s) => s.description),
+      baseSteps.map((s) => s.expected ?? ""),
       opts.resultSteps
     );
   }
+
   const activeStepIndex =
     opts.runStatus === "running"
       ? deriveActiveStepIndex(
@@ -308,13 +351,16 @@ export function applyDebugFlowSteps(
           "running",
           opts.progress,
           opts.testCaseTitle,
-          opts.animTick,
+          undefined,
           opts.testCaseId
         )
       : null;
+
   const displaySteps = steps.map((s, i) => ({
     ...s,
-    status: (opts.runStatus === "running" && activeStepIndex === i ? "running" : s.status) as FlowStepStatus,
+    status: (opts.runStatus === "running" && activeStepIndex === i && s.status === "pending"
+      ? "running"
+      : s.status) as FlowStepStatus,
   }));
   return { steps: displaySteps, activeStepIndex };
 }

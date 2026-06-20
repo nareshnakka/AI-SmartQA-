@@ -28,7 +28,7 @@ def main() -> None:
             "mode": "live",
             "background": True,
             "framework": asset["framework"],
-            "base_url": "https://opensource-demo.orangehrmlive.com",
+            "base_url": os.environ.get("BASE_URL", "https://example.com"),
             "asset_id": asset["id"],
         }
     ).encode()

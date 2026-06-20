@@ -45,9 +45,11 @@ class ProjectModel(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True)
+    naming_patterns: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
+    modules: Mapped[list["ProjectModuleModel"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     requirements: Mapped[list["RequirementModel"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     test_cases: Mapped[list["TestCaseModel"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     test_suites: Mapped[list["TestSuiteModel"]] = relationship(back_populates="project", cascade="all, delete-orphan")
@@ -78,11 +80,32 @@ class RequirementModel(Base):
     project: Mapped["ProjectModel"] = relationship(back_populates="requirements")
 
 
+class ProjectModuleModel(Base):
+    __tablename__ = "project_modules"
+
+    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    environment_id: Mapped[uuid.UUID | None] = mapped_column(
+        GUID(), ForeignKey("environments.id", ondelete="CASCADE"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    code: Mapped[str] = mapped_column(String(10), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    project: Mapped["ProjectModel"] = relationship(back_populates="modules")
+    environment: Mapped["EnvironmentModel | None"] = relationship(back_populates="modules")
+    test_cases: Mapped[list["TestCaseModel"]] = relationship(back_populates="module")
+
+
 class TestCaseModel(Base):
     __tablename__ = "test_cases"
 
     id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
     project_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    module_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("project_modules.id", ondelete="SET NULL"), nullable=True)
+    environment_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), ForeignKey("environments.id", ondelete="SET NULL"), nullable=True)
+    case_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     steps: Mapped[list] = mapped_column(JSON, default=list)
@@ -95,6 +118,8 @@ class TestCaseModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     project: Mapped["ProjectModel"] = relationship(back_populates="test_cases")
+    module: Mapped["ProjectModuleModel | None"] = relationship(back_populates="test_cases")
+    environment: Mapped["EnvironmentModel | None"] = relationship(back_populates="test_cases")
 
 
 class TestScenarioModel(Base):
@@ -383,6 +408,9 @@ class EnvironmentModel(Base):
     is_default: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    test_cases: Mapped[list["TestCaseModel"]] = relationship(back_populates="environment")
+    modules: Mapped[list["ProjectModuleModel"]] = relationship(back_populates="environment", cascade="all, delete-orphan")
 
 
 class AuditLogModel(Base):

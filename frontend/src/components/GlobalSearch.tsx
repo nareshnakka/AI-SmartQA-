@@ -66,6 +66,7 @@ export function GlobalSearch() {
         onFocus={() => query && setOpen(true)}
         onBlur={() => setTimeout(() => setOpen(false), 150)}
         placeholder="Search projects, tests, integrations..."
+        suppressHydrationWarning
         className="w-64 pl-9 pr-3 py-1.5 text-sm bg-[var(--surface-sunken)] border border-transparent rounded-md
                    placeholder:text-[var(--text-tertiary)] focus:outline-none focus:bg-white focus:border-[var(--border-strong)]"
       />

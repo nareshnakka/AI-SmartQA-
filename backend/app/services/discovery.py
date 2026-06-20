@@ -105,11 +105,35 @@ class DiscoveryService:
         nav_log: list[dict] = list(session.navigation_log or [])
 
         async def on_event(event: dict) -> None:
+            from app.services.discovery_worker import (
+                is_discovery_cancel_requested,
+                is_nav_clear_requested,
+                clear_nav_clear_request,
+            )
+            from sqlalchemy.orm.attributes import flag_modified
+
+            if is_discovery_cancel_requested(session_id):
+                return
+            if is_nav_clear_requested(session_id):
+                nav_log.clear()
+                clear_nav_clear_request(session_id)
+            fresh = await self.db.get(DiscoverySessionModel, session_id)
+            if not fresh:
+                return
             nav_log.append(event)
-            session.navigation_log = nav_log[-200:]
+            fresh.navigation_log = list(nav_log[-200:])
+            flag_modified(fresh, "navigation_log")
             await self.db.flush()
 
         if mode in ("agent", "browser", "both"):
+            from app.services.discovery_worker import is_discovery_cancel_requested
+
+            if is_discovery_cancel_requested(session_id):
+                session.status = "cancelled"
+                session.completed_at = datetime.now(timezone.utc)
+                await self.db.flush()
+                return
+
             agent_result = await navigate_as_qa_user(
                 base_url,
                 username=username,
@@ -149,6 +173,17 @@ class DiscoveryService:
         coverage["crawl"] = crawl_meta
         coverage["discovery_mode"] = mode
         coverage["proposed_test_cases"] = len(proposed)
+
+        from app.services.discovery_worker import is_discovery_cancel_requested
+
+        session = await self.db.get(DiscoverySessionModel, session_id)
+        if not session:
+            return
+        if is_discovery_cancel_requested(session_id):
+            session.status = "cancelled"
+            session.completed_at = datetime.now(timezone.utc)
+            await self.db.flush()
+            return
 
         session.flow_map = flows
         session.screens = screens
@@ -347,12 +382,40 @@ class DiscoveryService:
             "completed_at": session.completed_at.isoformat() if session.completed_at else None,
         }
 
+    async def clear_navigation_log(self, project_id: uuid.UUID, session_id: uuid.UUID) -> DiscoverySessionModel:
+        session = await self.get_session(session_id)
+        if not session or session.project_id != project_id:
+            raise ValueError("Discovery session not found")
+        from app.services.discovery_worker import request_nav_clear
+        from sqlalchemy.orm.attributes import flag_modified
+
+        request_nav_clear(session_id)
+        session.navigation_log = []
+        flag_modified(session, "navigation_log")
+        await self.db.flush()
+        return session
+
+    async def delete_session(self, project_id: uuid.UUID, session_id: uuid.UUID) -> None:
+        session = await self.get_session(session_id)
+        if not session or session.project_id != project_id:
+            raise ValueError("Discovery session not found")
+        if session.status == "running":
+            from app.services.discovery_worker import request_cancel_discovery
+
+            request_cancel_discovery(session_id)
+        await self.db.delete(session)
+        await self.db.flush()
+
     async def commit_proposed_tests(
         self,
         project_id: uuid.UUID,
         session_id: uuid.UUID,
         test_ids: list[str],
+        default_module_id: uuid.UUID | None = None,
+        environment_id: uuid.UUID | None = None,
     ) -> dict:
+        from app.services.test_cases import create_project_test_case
+
         session = await self.get_session(session_id)
         if not session or session.project_id != project_id:
             raise ValueError("Discovery session not found")
@@ -369,21 +432,28 @@ class DiscoveryService:
                 s.get("description") if isinstance(s, dict) else str(s)
                 for s in steps
             ]
-            case = TestCaseModel(
-                project_id=project_id,
+            module_name = p.get("module") or p.get("screen") or "General"
+            case = await create_project_test_case(
+                self.db,
+                project_id,
                 title=p.get("title", "Discovered Test"),
                 description=f"Captured by QA Agent from {session.base_url}",
                 steps=step_texts,
                 expected_results=p.get("expected_results") or ["Test completes successfully"],
                 priority=p.get("priority", "medium"),
+                module_id=default_module_id,
+                module_name=module_name if not default_module_id else None,
+                environment_id=environment_id,
                 tags=["discovery", "qa_agent", p.get("type", "functional"), f"session:{session_id}"],
                 status="approved",
+                case_type="functional",
             )
-            self.db.add(case)
-            await self.db.flush()
             committed.append({
                 "id": str(case.id),
                 "title": case.title,
+                "case_code": case.case_code,
+                "module_id": str(case.module_id) if case.module_id else None,
+                "environment_id": str(case.environment_id) if case.environment_id else None,
                 "steps_count": len(step_texts),
                 "proposed_id": p.get("id"),
             })
@@ -394,7 +464,13 @@ class DiscoveryService:
             **(session.coverage_matrix or {}),
             **self._coverage_matrix(journeys, session.screens or []),
             "committed_from_session": len(committed),
+            "proposed_test_cases": len([p for p in proposed if p.get("id") not in set(test_ids)]),
         }
+        # Remove committed proposals from the session review list
+        session.proposed_test_cases = [p for p in proposed if p.get("id") not in set(test_ids)]
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(session, "proposed_test_cases")
         await self.db.flush()
 
         return {
@@ -402,6 +478,44 @@ class DiscoveryService:
             "committed_count": len(committed),
             "test_cases_created": len(committed),
             "test_cases": committed,
+            "remaining_proposed": len(session.proposed_test_cases or []),
+        }
+
+    async def dismiss_proposed_tests(
+        self,
+        project_id: uuid.UUID,
+        session_id: uuid.UUID,
+        test_ids: list[str],
+    ) -> dict:
+        """Remove selected AI-proposed test cases from the session (does not delete project test cases)."""
+        session = await self.get_session(session_id)
+        if not session or session.project_id != project_id:
+            raise ValueError("Discovery session not found")
+
+        if not test_ids:
+            raise ValueError("Select at least one proposed test case to remove")
+
+        proposed = session.proposed_test_cases or []
+        id_set = set(test_ids)
+        remaining = [p for p in proposed if p.get("id") not in id_set]
+        removed_count = len(proposed) - len(remaining)
+        if removed_count == 0:
+            raise ValueError("No matching proposed test cases to remove")
+
+        session.proposed_test_cases = remaining
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(session, "proposed_test_cases")
+        session.coverage_matrix = {
+            **(session.coverage_matrix or {}),
+            "proposed_test_cases": len(remaining),
+        }
+        await self.db.flush()
+
+        return {
+            "session_id": str(session_id),
+            "removed_count": removed_count,
+            "remaining_count": len(remaining),
         }
 
     async def generate_tests_from_session(

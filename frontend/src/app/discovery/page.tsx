@@ -1,15 +1,20 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef, Suspense } from "react";
+import { useEffect, useState, useCallback, useRef, Suspense, useMemo } from "react";
 import Link from "next/link";
 import {
-  Radar, Loader2, Globe, Map, CheckCircle2, ChevronDown, ChevronRight,
-  Bot, Play, CheckSquare, Square, GitCommitHorizontal,
+  Radar, Loader2, Globe, Map as MapIcon, CheckCircle2, ChevronDown, ChevronRight,
+  Bot, Play, CheckSquare, Square, GitCommitHorizontal, Trash2, Eraser,
 } from "lucide-react";
 import { AppShell } from "@/components/shell/AppShell";
 import { PageHeader, Badge, MetricCard } from "@/components/ui";
 import { apiFetch } from "@/lib/api";
 import { useActiveProject } from "@/context/ProjectContext";
+import { filterByModuleNames } from "@/components/modules/ModuleFilter";
+import { WorkspaceFilters } from "@/components/workspace/WorkspaceFilters";
+import { createModule, type ProjectModule } from "@/lib/modules";
+import { useWorkspaceScope } from "@/lib/workspace";
+import { bulkTestCaseAction, fetchTestCases, type AutomationTestCase } from "@/lib/test-cases";
 
 interface TestStep {
   order: number;
@@ -27,6 +32,8 @@ interface ProposedTestCase {
   priority: string;
   source: string;
   risk: string;
+  module?: string;
+  screen?: string;
   steps: TestStep[];
   expected_results: string[];
 }
@@ -51,8 +58,21 @@ interface DiscoverySession {
 
 function DiscoveryPageContent() {
   const { projectId } = useActiveProject();
+  const ws = useWorkspaceScope(projectId);
+  const {
+    environments,
+    modules,
+    activeModuleId,
+    setActiveModuleId,
+    activeEnvironmentId,
+    setActiveEnvironmentId,
+    activeEnvironment,
+    reloadModules,
+    moduleQueryIds,
+    environmentQueryIds,
+  } = ws;
   const prevProjectRef = useRef(projectId);
-  const [baseUrl, setBaseUrl] = useState("https://opensource-demo.orangehrmlive.com");
+  const [baseUrl, setBaseUrl] = useState("");
   const [requirements, setRequirements] = useState(
     "As a user, I want to login, manage employees, and run reports."
   );
@@ -63,9 +83,45 @@ function DiscoveryPageContent() {
   const [active, setActive] = useState<DiscoverySession | null>(null);
   const [message, setMessage] = useState("");
   const [committing, setCommitting] = useState(false);
+  const [dismissing, setDismissing] = useState(false);
+  const [clearingNav, setClearingNav] = useState(false);
+  const [clearingSession, setClearingSession] = useState(false);
+  const [commitModuleId, setCommitModuleId] = useState<string>("");
+  const [savedCases, setSavedCases] = useState<AutomationTestCase[]>([]);
+  const [selectedSaved, setSelectedSaved] = useState<Set<string>>(new Set());
+  const [deletingSaved, setDeletingSaved] = useState(false);
+  const [newModuleName, setNewModuleName] = useState("");
+  const [creatingModule, setCreatingModule] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [playwrightHint, setPlaywrightHint] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    const loadHealth = () => {
+      apiFetch<{ playwright_browsers?: boolean; playwright_hint?: string }>("/health")
+        .then((h) => {
+          if (!h.playwright_browsers) {
+            const hint = h.playwright_hint ?? "";
+            const staleBackend =
+              hint.toLowerCase().includes("sync api") || hint.toLowerCase().includes("asyncio loop");
+            setPlaywrightHint(
+              staleBackend
+                ? "Backend is outdated or multiple backends are running on port 8000. Close all QEOS Backend windows, run scripts\\restart-backend.bat once, then refresh this page."
+                : hint ||
+                    "Playwright Chromium not installed. Run scripts\\install-all-runners.bat and restart the backend."
+            );
+          } else {
+            setPlaywrightHint(null);
+          }
+        })
+        .catch(() => {});
+    };
+    loadHealth();
+    const onFocus = () => loadHealth();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
 
   useEffect(() => {
     if (prevProjectRef.current === projectId) return;
@@ -73,7 +129,32 @@ function DiscoveryPageContent() {
     setActive(null);
     setSessions([]);
     setSelected(new Set());
+    setSavedCases([]);
   }, [projectId]);
+
+  useEffect(() => {
+    if (activeEnvironment?.base_url && !baseUrl) {
+      setBaseUrl(activeEnvironment.base_url);
+    }
+  }, [activeEnvironment, baseUrl]);
+
+  const reloadSavedCases = useCallback(async () => {
+    if (!projectId || !activeEnvironmentId) return;
+    try {
+      setSavedCases(
+        await fetchTestCases(projectId, {
+          moduleIds: moduleQueryIds,
+          environmentIds: environmentQueryIds,
+        })
+      );
+    } catch {
+      setSavedCases([]);
+    }
+  }, [projectId, activeEnvironmentId, moduleQueryIds, environmentQueryIds]);
+
+  useEffect(() => {
+    reloadSavedCases();
+  }, [reloadSavedCases]);
 
   const refreshSession = useCallback(async (pid: string, sid: string) => {
     const s = await apiFetch<DiscoverySession>(`/api/v1/projects/${pid}/discovery/sessions/${sid}`);
@@ -99,9 +180,7 @@ function DiscoveryPageContent() {
           pollRef.current = null;
           setRunning(false);
           setMessage(`Discovery complete — ${s.proposed_test_cases?.length ?? 0} test cases proposed`);
-          if (s.proposed_test_cases?.length) {
-            setSelected(new Set(s.proposed_test_cases.map((t) => t.id)));
-          }
+          setSelected(new Set());
         }
       } catch {
         if (pollRef.current) clearInterval(pollRef.current);
@@ -114,6 +193,10 @@ function DiscoveryPageContent() {
 
   const run = async () => {
     if (!projectId) { setMessage("Select a project"); return; }
+    if (playwrightHint) {
+      setMessage(`Live browser discovery unavailable: ${playwrightHint}`);
+      return;
+    }
     setRunning(true);
     setMessage("");
     setSelected(new Set());
@@ -137,9 +220,7 @@ function DiscoveryPageContent() {
       } else {
         setRunning(false);
         setMessage(`Discovered ${session.proposed_test_cases?.length ?? 0} test cases`);
-        if (session.proposed_test_cases?.length) {
-          setSelected(new Set(session.proposed_test_cases.map((t) => t.id)));
-        }
+        setSelected(new Set());
       }
     } catch (e) {
       setMessage(String(e));
@@ -170,16 +251,145 @@ function DiscoveryPageContent() {
     setSelected(new Set(active.proposed_test_cases.map((t) => t.id)));
   };
 
+  const deselectAll = () => setSelected(new Set());
+
+  const applySessionUpdate = (session: DiscoverySession) => {
+    setActive(session);
+    setSessions((prev) => prev.map((x) => (x.id === session.id ? session : x)));
+    setSelected(new Set());
+    setExpanded(new Set());
+  };
+
+  const clearNavigation = async () => {
+    if (!projectId || !active) return;
+    setClearingNav(true);
+    setMessage("");
+    try {
+      const session = await apiFetch<DiscoverySession>(
+        `/api/v1/projects/${projectId}/discovery/sessions/${active.id}/clear-navigation`,
+        { method: "POST", body: JSON.stringify({}) }
+      );
+      applySessionUpdate(session);
+      setMessage("Live navigation log cleared");
+    } catch (e) {
+      const err = String(e);
+      setMessage(
+        err.includes("Not Found")
+          ? "Clear failed — restart the backend (scripts\\restart-all-auto.bat) so new Discovery APIs load, then try again."
+          : err
+      );
+    } finally {
+      setClearingNav(false);
+    }
+  };
+
+  const clearSession = async () => {
+    if (!projectId || !active) return;
+    const label = active.name || active.base_url;
+    if (
+      !window.confirm(
+        `Delete discovery session "${label}"? This removes all proposed tests, navigation log, and flow data for this session.`
+      )
+    ) {
+      return;
+    }
+    setClearingSession(true);
+    setMessage("");
+    const sid = active.id;
+    const wasRunning = active.status === "running";
+    try {
+      await apiFetch<{ deleted: boolean }>(
+        `/api/v1/projects/${projectId}/discovery/sessions/${sid}`,
+        { method: "DELETE" }
+      );
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      if (wasRunning) setRunning(false);
+      const list = await apiFetch<DiscoverySession[]>(
+        `/api/v1/projects/${projectId}/discovery/sessions`
+      );
+      setSessions(list);
+      setActive(list[0] ?? null);
+      setSelected(new Set());
+      setExpanded(new Set());
+      setMessage("Discovery session cleared");
+    } catch (e) {
+      const err = String(e);
+      setMessage(
+        err.includes("Not Found")
+          ? "Delete failed — restart the backend (scripts\\restart-all-auto.bat) so new Discovery APIs load, then try again."
+          : err
+      );
+    } finally {
+      setClearingSession(false);
+    }
+  };
+
+  const removeSelected = async () => {
+    if (!projectId || !active || selected.size === 0) return;
+    if (!window.confirm(`Remove ${selected.size} proposed test case(s) from this session? (Not deleted from project if already committed.)`)) {
+      return;
+    }
+    setDismissing(true);
+    setMessage("");
+    try {
+      const result = await apiFetch<{
+        removed_count: number;
+        remaining_count: number;
+        session?: DiscoverySession;
+      }>(
+        `/api/v1/projects/${projectId}/discovery/sessions/${active.id}/dismiss-tests`,
+        { method: "POST", body: JSON.stringify({ test_ids: Array.from(selected) }) }
+      );
+      if (result.session) {
+        applySessionUpdate(result.session);
+      } else if (projectId) {
+        await refreshSession(projectId, active.id);
+        setSelected(new Set());
+      }
+      setMessage(`Removed ${result.removed_count} proposed test case(s) — ${result.remaining_count} remaining`);
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setDismissing(false);
+    }
+  };
+
   const commitSelected = async () => {
     if (!projectId || !active || selected.size === 0) return;
     setCommitting(true);
     setMessage("");
     try {
-      const result = await apiFetch<{ committed_count: number; test_cases: { id: string; title: string }[] }>(
+      const result = await apiFetch<{
+        committed_count: number;
+        test_cases: { id: string; title: string; case_code?: string }[];
+        remaining_proposed?: number;
+        session?: DiscoverySession;
+      }>(
         `/api/v1/projects/${projectId}/discovery/sessions/${active.id}/commit-tests`,
-        { method: "POST", body: JSON.stringify({ test_ids: Array.from(selected) }) }
+        {
+          method: "POST",
+          body: JSON.stringify({
+            test_ids: Array.from(selected),
+            module_id: commitModuleId && !commitModuleId.startsWith("temp-") ? commitModuleId : undefined,
+            environment_id: activeEnvironmentId ?? undefined,
+          }),
+        }
       );
-      setMessage(`Committed ${result.committed_count} test case(s) to project`);
+      if (result.session) {
+        applySessionUpdate(result.session);
+      } else if (projectId) {
+        await refreshSession(projectId, active.id);
+        setSelected(new Set());
+      }
+      await reloadModules();
+      await reloadSavedCases();
+      setMessage(
+        `Saved ${result.committed_count} test case(s) with FTC naming` +
+          (result.remaining_proposed != null ? ` — ${result.remaining_proposed} still in review` : "")
+      );
     } catch (e) {
       setMessage(String(e));
     } finally {
@@ -201,6 +411,81 @@ function DiscoveryPageContent() {
   const proposed = active?.proposed_test_cases ?? [];
   const navLog = active?.navigation_log ?? [];
 
+  const displayModules = useMemo((): ProjectModule[] => {
+    const byName = new Map(modules.map((m) => [m.name.toLowerCase(), m]));
+    for (const p of proposed) {
+      const name = p.module || p.screen || "General";
+      if (!byName.has(name.toLowerCase())) {
+        byName.set(name.toLowerCase(), {
+          id: `temp-${name}`,
+          project_id: projectId || "",
+          environment_id: activeEnvironmentId,
+          name,
+          code: name.replace(/[^A-Za-z0-9]/g, "").slice(0, 5).toUpperCase().padEnd(5, "X"),
+          description: "Discovered module",
+          test_case_count: 0,
+          created_at: "",
+        });
+      }
+    }
+    return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [modules, proposed, projectId, activeEnvironmentId]);
+
+  const moduleFilterSet = useMemo(
+    () => (activeModuleId ? new Set([activeModuleId]) : new Set<string>()),
+    [activeModuleId]
+  );
+
+  const filteredProposed = useMemo(
+    () => filterByModuleNames(proposed, moduleFilterSet, displayModules),
+    [proposed, moduleFilterSet, displayModules]
+  );
+
+  const filteredSaved = savedCases;
+
+  const addModule = async () => {
+    if (!projectId || !newModuleName.trim() || !activeEnvironmentId) return;
+    setCreatingModule(true);
+    try {
+      await createModule(projectId, activeEnvironmentId, newModuleName.trim());
+      setNewModuleName("");
+      await reloadModules();
+      setMessage(`Module "${newModuleName.trim()}" created`);
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setCreatingModule(false);
+    }
+  };
+
+  const deleteSavedSelected = async () => {
+    if (!projectId || selectedSaved.size === 0) return;
+    if (
+      !window.confirm(
+        `Delete ${selectedSaved.size} saved test case(s)?\n\nThis cannot be undone. Deleted test cases cannot be restored.`
+      )
+    ) {
+      return;
+    }
+    setDeletingSaved(true);
+    const count = selectedSaved.size;
+    try {
+      await bulkTestCaseAction(projectId, "delete", Array.from(selectedSaved));
+      setSelectedSaved(new Set());
+      await reloadSavedCases();
+      await reloadModules();
+      setMessage(`Deleted ${count} test case(s)`);
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setDeletingSaved(false);
+    }
+  };
+
+  const selectAllFiltered = () => {
+    setSelected(new Set(filteredProposed.map((t) => t.id)));
+  };
+
   return (
     <AppShell title="App Discovery">
       <PageHeader
@@ -209,6 +494,14 @@ function DiscoveryPageContent() {
         breadcrumbs={[{ label: "Quality Engineering" }, { label: "Discovery" }]}
         actions={<Badge variant="success"><Bot className="w-3 h-3" /> QA Agent</Badge>}
       />
+
+      {playwrightHint && (
+        <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+          <p className="font-medium">Playwright not ready — QA Agent will only do a basic HTTP crawl until this is fixed.</p>
+          <p className="mt-1 text-xs">{playwrightHint}</p>
+          <p className="mt-2 text-xs font-mono">scripts\install-all-runners.bat → scripts\restart-backend.bat</p>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="space-y-4">
@@ -221,7 +514,7 @@ function DiscoveryPageContent() {
                 <input className="ds-input text-xs" type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} />
               </div>
               <textarea className="ds-input text-xs resize-none font-mono" rows={3} value={requirements} onChange={(e) => setRequirements(e.target.value)} placeholder="Context for the QA Agent…" />
-              <button onClick={run} disabled={running} className="ds-btn-primary w-full">
+              <button onClick={run} disabled={running || !!playwrightHint} className="ds-btn-primary w-full">
                 {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
                 {running ? "Agent Exploring…" : "Start QA Agent"}
               </button>
@@ -238,7 +531,61 @@ function DiscoveryPageContent() {
           )}
 
           <div className="ds-card">
-            <div className="ds-card-header"><h2 className="text-sm font-semibold">Live Navigation</h2></div>
+            <div className="ds-card-header"><h2 className="text-sm font-semibold">Environment & Modules</h2></div>
+            <div className="ds-card-body space-y-2 pt-0">
+              <WorkspaceFilters
+                environments={environments}
+                modules={displayModules}
+                activeEnvironmentId={activeEnvironmentId}
+                activeModuleId={activeModuleId}
+                onEnvironmentChange={setActiveEnvironmentId}
+                onModuleChange={setActiveModuleId}
+              />
+              <div className="flex gap-1">
+                <input
+                  className="ds-input text-xs flex-1"
+                  placeholder="New module name"
+                  value={newModuleName}
+                  onChange={(e) => setNewModuleName(e.target.value)}
+                />
+                <button type="button" onClick={addModule} disabled={creatingModule || !newModuleName.trim()} className="ds-btn-secondary text-xs px-2">
+                  Add
+                </button>
+              </div>
+              <p className="text-[10px] text-[var(--text-tertiary)]">
+                Naming: {"{PROJ5}_{ENV5}_{MOD5}_FTC#####"} · scoped per environment + module
+              </p>
+            </div>
+          </div>
+
+          <div className="ds-card">
+            <div className="ds-card-header flex items-center justify-between gap-2">
+              <h2 className="text-sm font-semibold">Live Navigation</h2>
+              {active && (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={clearNavigation}
+                    disabled={clearingNav || navLog.length === 0}
+                    className="ds-btn-secondary text-[10px] py-1 px-2 inline-flex items-center gap-1"
+                    title="Clear the live navigation log for this session"
+                  >
+                    {clearingNav ? <Loader2 className="w-3 h-3 animate-spin" /> : <Eraser className="w-3 h-3" />}
+                    Clear log
+                  </button>
+                  <button
+                    type="button"
+                    onClick={clearSession}
+                    disabled={clearingSession}
+                    className="text-[10px] py-1 px-2 inline-flex items-center gap-1 rounded-md border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50"
+                    title="Delete this discovery session entirely"
+                  >
+                    {clearingSession ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                    Clear session
+                  </button>
+                </div>
+              )}
+            </div>
             <div className="ds-card-body pt-0 max-h-72 overflow-auto space-y-1">
               {navLog.length === 0 && (
                 <p className="text-xs text-[var(--text-tertiary)]">Agent activity will appear here…</p>
@@ -275,9 +622,9 @@ function DiscoveryPageContent() {
           {active ? (
             <>
               <div className="grid grid-cols-4 gap-3">
-                <MetricCard label="Proposed Tests" value={proposed.length} icon={<CheckCircle2 className="w-4 h-4" />} />
+                <MetricCard label="Proposed Tests" value={filteredProposed.length} icon={<CheckCircle2 className="w-4 h-4" />} />
                 <MetricCard label="Screens" value={active.screens.length} icon={<Globe className="w-4 h-4" />} />
-                <MetricCard label="Flows" value={active.flow_map.length} icon={<Map className="w-4 h-4" />} />
+                <MetricCard label="Flows" value={active.flow_map.length} icon={<MapIcon className="w-4 h-4" />} />
                 <MetricCard label="Status" value={active.status} />
               </div>
 
@@ -285,28 +632,52 @@ function DiscoveryPageContent() {
                 <div className="ds-card-header flex items-center justify-between flex-wrap gap-2">
                   <div>
                     <h2 className="text-sm font-semibold">AI-Proposed Test Cases</h2>
-                    <p className="text-xs text-[var(--text-tertiary)]">Review steps, select cases to commit to your project</p>
+                    <p className="text-xs text-[var(--text-tertiary)]">
+                      Scope: sidebar env & module · saves under Project → Env → Module
+                    </p>
                   </div>
-                  <div className="flex gap-2">
-                    <button onClick={selectAll} className="ds-btn-secondary text-xs" disabled={!proposed.length}>
+                  <div className="flex flex-wrap gap-2 items-center">
+                    <select
+                      className="ds-input text-xs py-1.5"
+                      value={commitModuleId}
+                      onChange={(e) => setCommitModuleId(e.target.value)}
+                      title="Optional: save all selected to this module"
+                    >
+                      <option value="">Auto module (from discovery)</option>
+                      {displayModules.map((m) => (
+                        <option key={m.id} value={m.id.startsWith("temp-") ? "" : m.id}>{m.name}</option>
+                      ))}
+                    </select>
+                    <button onClick={selectAllFiltered} className="ds-btn-secondary text-xs" disabled={!filteredProposed.length}>
                       Select All
+                    </button>
+                    <button onClick={deselectAll} className="ds-btn-secondary text-xs" disabled={selected.size === 0}>
+                      Deselect All
+                    </button>
+                    <button
+                      onClick={removeSelected}
+                      disabled={dismissing || selected.size === 0}
+                      className="ds-btn-secondary text-xs text-red-700 border-red-200 hover:bg-red-50"
+                    >
+                      {dismissing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                      Remove Selected ({selected.size})
                     </button>
                     <button onClick={commitSelected} disabled={committing || selected.size === 0} className="ds-btn-primary text-xs">
                       {committing ? <Loader2 className="w-3 h-3 animate-spin" /> : <GitCommitHorizontal className="w-3 h-3" />}
-                      Commit Selected ({selected.size})
+                      Save to Project ({selected.size})
                     </button>
                   </div>
                 </div>
                 <div className="ds-card-body space-y-2 pt-0">
-                  {proposed.length === 0 && active.status === "running" && (
+                  {filteredProposed.length === 0 && active.status === "running" && (
                     <p className="text-sm text-[var(--text-tertiary)] py-8 text-center">
                       QA Agent is exploring — test cases will appear as navigation progresses…
                     </p>
                   )}
-                  {proposed.length === 0 && active.status !== "running" && (
-                    <p className="text-sm text-[var(--text-tertiary)] py-8 text-center">No test cases proposed. Run the QA Agent again.</p>
+                  {filteredProposed.length === 0 && active.status !== "running" && (
+                    <p className="text-sm text-[var(--text-tertiary)] py-8 text-center">No test cases for this module filter.</p>
                   )}
-                  {proposed.map((tc) => (
+                  {filteredProposed.map((tc) => (
                     <div key={tc.id} className={`rounded-lg border p-3 ${selected.has(tc.id) ? "border-brand-300 bg-brand-50/30" : "border-[var(--border-default)]"}`}>
                       <div className="flex items-start gap-3">
                         <button onClick={() => toggleSelect(tc.id)} className="mt-0.5 shrink-0">
@@ -317,6 +688,9 @@ function DiscoveryPageContent() {
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">
                             <span className="text-sm font-medium">{tc.title}</span>
+                            {(tc.module || tc.screen) && (
+                              <Badge variant="neutral">{tc.module || tc.screen}</Badge>
+                            )}
                             <Badge variant={tc.priority === "critical" || tc.priority === "high" ? "error" : "neutral"}>{tc.priority}</Badge>
                             <Badge variant="info">{tc.type}</Badge>
                           </div>
@@ -352,6 +726,63 @@ function DiscoveryPageContent() {
                             </div>
                           )}
                         </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="ds-card">
+                <div className="ds-card-header flex items-center justify-between flex-wrap gap-2">
+                  <div>
+                    <h2 className="text-sm font-semibold">Saved Test Cases ({filteredSaved.length})</h2>
+                    <p className="text-xs text-[var(--text-tertiary)]">Project modules · FTC naming · filter with sidebar</p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSaved(new Set(filteredSaved.map((c) => c.id)))}
+                      className="ds-btn-secondary text-xs"
+                      disabled={!filteredSaved.length}
+                    >
+                      Select all
+                    </button>
+                    <button
+                      type="button"
+                      onClick={deleteSavedSelected}
+                      disabled={deletingSaved || selectedSaved.size === 0}
+                      className="ds-btn-secondary text-xs text-red-700"
+                    >
+                      {deletingSaved ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                      Delete ({selectedSaved.size})
+                    </button>
+                  </div>
+                </div>
+                <div className="ds-card-body space-y-1 pt-0 max-h-64 overflow-auto">
+                  {filteredSaved.length === 0 && (
+                    <p className="text-xs text-[var(--text-tertiary)] py-4 text-center">No saved cases for this module filter.</p>
+                  )}
+                  {filteredSaved.map((tc) => (
+                    <div key={tc.id} className="flex items-start gap-2 py-1.5 border-b border-[var(--border-default)]/40">
+                      <button type="button" onClick={() => {
+                        setSelectedSaved((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(tc.id)) next.delete(tc.id); else next.add(tc.id);
+                          return next;
+                        });
+                      }} className="shrink-0 mt-0.5">
+                        {selectedSaved.has(tc.id) ? (
+                          <CheckSquare className="w-3.5 h-3.5 text-brand-700" />
+                        ) : (
+                          <Square className="w-3.5 h-3.5 text-gray-400" />
+                        )}
+                      </button>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-mono font-medium truncate">{tc.case_code || tc.title}</p>
+                        <p className="text-[10px] text-[var(--text-tertiary)] truncate">
+                          {tc.environment_name && <Badge variant="neutral">{tc.environment_name}</Badge>}
+                          {tc.module_name || "General"} · {tc.priority} · {tc.status}
+                        </p>
                       </div>
                     </div>
                   ))}

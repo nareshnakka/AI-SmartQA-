@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import {
   Play, Loader2, CheckCircle2, XCircle, Video, Download, History,
   LayoutDashboard, CheckSquare, Square, Server, BarChart3, Clock, Bug,
@@ -10,13 +10,15 @@ import { AppShell } from "@/components/shell/AppShell";
 import { PageHeader, Badge, MetricCard } from "@/components/ui";
 import { apiFetch, executionVideoUrl, executionExportUrl } from "@/lib/api";
 import { useActiveProject } from "@/context/ProjectContext";
-import { bulkTestCaseAction, isAutomationEnabled } from "@/lib/test-cases";
+import { bulkTestCaseAction, isAutomationEnabled, fetchTestCases } from "@/lib/test-cases";
+import { useWorkspaceScope } from "@/lib/workspace";
 import {
   TestCaseFlowView, buildFlowSteps, applyDebugFlowSteps, type FlowStep,
 } from "@/components/flow/TestCaseFlowView";
 
 interface TestCase {
-  id: string; title: string; priority: string; status: string;
+  id: string; title: string; case_code?: string | null; module_id?: string | null; module_name?: string | null;
+  priority: string; status: string;
   steps: string[]; expected_results: string[];
 }
 interface TestStep { order: number; description: string; status: string; expected?: string }
@@ -84,7 +86,7 @@ export default function ExecutionsPage() {
   const [running, setRunning] = useState(false);
   const [sprint, setSprint] = useState("Sprint 1");
   const [release, setRelease] = useState("Release 1.0");
-  const [baseUrl, setBaseUrl] = useState("https://opensource-demo.orangehrmlive.com");
+  const [baseUrl, setBaseUrl] = useState("");
   const [runType, setRunType] = useState("automation");
   const [framework, setFramework] = useState("playwright");
   const [frameworks, setFrameworks] = useState<Framework[]>([]);
@@ -97,6 +99,7 @@ export default function ExecutionsPage() {
   const [debugTestCaseId, setDebugTestCaseId] = useState<string | null>(null);
   const [animTick, setAnimTick] = useState(0);
   const [managing, setManaging] = useState(false);
+  const { moduleQueryIds, environmentQueryIds } = useWorkspaceScope(projectId);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const animRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -107,7 +110,7 @@ export default function ExecutionsPage() {
 
   const loadProjectData = useCallback(async (pid: string) => {
     const [cases, runList, dash, ag, assets, perf] = await Promise.allSettled([
-      apiFetch<TestCase[]>(`/api/v1/projects/${pid}/test-cases`),
+      fetchTestCases(pid, { moduleIds: moduleQueryIds, environmentIds: environmentQueryIds }),
       apiFetch<ExecutionRun[]>(`/api/v1/projects/${pid}/executions`),
       apiFetch<Dashboard>(`/api/v1/projects/${pid}/executions/dashboard${filterSprint ? `?sprint=${filterSprint}` : ""}`),
       apiFetch<RunnerAgent>(`/api/v1/projects/${pid}/executions/runner-agent`),
@@ -120,7 +123,7 @@ export default function ExecutionsPage() {
     if (ag.status === "fulfilled") setAgent(ag.value);
     if (assets.status === "fulfilled") setAutomationAssets(assets.value);
     if (perf.status === "fulfilled") setPerfAssets(perf.value);
-  }, [filterSprint]);
+  }, [filterSprint, moduleQueryIds, environmentQueryIds]);
 
   const filteredAssets = automationAssets.filter((a) => a.framework === framework);
   const fwCap = agent?.framework_capabilities?.[framework];
@@ -173,7 +176,9 @@ export default function ExecutionsPage() {
     });
     setFlowPreviewId(id);
   };
-  const selectAll = () => setSelected(new Set(testCases.filter(isAutomationEnabled).map((t) => t.id)));
+  const filteredTestCases = testCases;
+
+  const selectAll = () => setSelected(new Set(filteredTestCases.filter(isAutomationEnabled).map((t) => t.id)));
 
   const runSelectedCount = Array.from(selected).filter((id) => {
     const tc = testCases.find((t) => t.id === id);
@@ -270,6 +275,10 @@ export default function ExecutionsPage() {
 
   const batchRun = async () => {
     if (!projectId) return;
+    if (runType === "automation" && !assetId) {
+      alert("Select an automation asset. Live Playwright runs real scripts from the asset — not auto-generated stubs.");
+      return;
+    }
     const runnableIds = Array.from(selected).filter((id) => {
       const tc = testCases.find((t) => t.id === id);
       return tc && isAutomationEnabled(tc);
@@ -347,10 +356,10 @@ export default function ExecutionsPage() {
             <div className="ds-card">
               <div className="ds-card-header flex flex-wrap justify-between gap-2 items-center">
                 <h2 className="text-sm font-semibold">
-                  Automation Test Cases ({testCases.length})
-                  {testCases.some((t) => !isAutomationEnabled(t)) && (
+                  Automation Test Cases ({filteredTestCases.length})
+                  {filteredTestCases.some((t) => !isAutomationEnabled(t)) && (
                     <span className="text-[var(--text-tertiary)] font-normal ml-1">
-                      · {testCases.filter(isAutomationEnabled).length} active
+                      · {filteredTestCases.filter(isAutomationEnabled).length} active
                     </span>
                   )}
                 </h2>
@@ -372,7 +381,7 @@ export default function ExecutionsPage() {
                 </div>
               </div>
               <div className="ds-card-body pt-0 max-h-[280px] overflow-auto space-y-1">
-                {testCases.map((tc) => {
+                {filteredTestCases.map((tc) => {
                   const disabled = !isAutomationEnabled(tc);
                   return (
                   <div key={tc.id}
@@ -380,7 +389,12 @@ export default function ExecutionsPage() {
                     onClick={() => toggle(tc.id)}>
                     {selected.has(tc.id) ? <CheckSquare className="w-4 h-4 text-brand-700 shrink-0" /> : <Square className="w-4 h-4 text-gray-400 shrink-0" />}
                     <div className="flex-1 min-w-0">
-                      <p className={`text-sm font-medium truncate ${disabled ? "line-through" : ""}`}>{tc.title}</p>
+                      <p className={`text-sm font-medium truncate ${disabled ? "line-through" : ""}`}>
+                        {tc.case_code || tc.title}
+                      </p>
+                      {tc.module_name && (
+                        <p className="text-[10px] text-[var(--text-tertiary)]">{tc.module_name}</p>
+                      )}
                       <p className="text-xs text-[var(--text-tertiary)]">{tc.steps?.length ?? 0} steps · {tc.priority}</p>
                     </div>
                     {!disabled && (
@@ -396,7 +410,7 @@ export default function ExecutionsPage() {
                     <Badge variant={disabled ? "warning" : "neutral"}>{tc.status}</Badge>
                   </div>
                 );})}
-                {testCases.length === 0 && <p className="text-sm text-[var(--text-tertiary)] py-8 text-center">No test cases — create via Discovery or Projects</p>}
+                {filteredTestCases.length === 0 && <p className="text-sm text-[var(--text-tertiary)] py-8 text-center">No test cases — create via Discovery or Projects</p>}
               </div>
             </div>
 

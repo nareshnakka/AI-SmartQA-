@@ -1,5 +1,6 @@
 """Functional test suite for QEOS platform APIs + OrangeHRM project."""
 import json
+import os
 import subprocess
 import sys
 import time
@@ -152,7 +153,7 @@ def run_platform_tests() -> Suite:
             "mode": "live",
             "background": True,
             "framework": "playwright",
-            "base_url": "https://opensource-demo.orangehrmlive.com",
+            "base_url": os.environ.get("BASE_URL", "https://example.com"),
             "run_name": "Functional test — debug flow",
         }
         if asset_id:

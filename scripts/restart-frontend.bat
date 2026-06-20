@@ -3,14 +3,13 @@ setlocal EnableExtensions
 title QEOS Frontend (port 3000)
 
 set "ROOT=%~dp0.."
+set "SCRIPTS=%~dp0"
 set "PORT=3000"
 
 echo.
-echo [%date% %time%] Stopping processes on port %PORT%...
-for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":%PORT%" ^| findstr "LISTENING"') do (
-  taskkill /F /PID %%P >nul 2>&1
-)
-timeout /t 2 /nobreak >nul
+echo [%date% %time%] Restarting frontend on port %PORT%...
+call "%SCRIPTS%lib\kill-port.bat" %PORT%
+ping 127.0.0.1 -n 2 >nul
 
 cd /d "%ROOT%\frontend"
 if not exist "package.json" (
@@ -29,8 +28,9 @@ if not exist "node_modules" (
   )
 )
 
+echo.
 echo Starting frontend at http://localhost:%PORT%
-echo Press Ctrl+C to stop.
+echo Press Ctrl+C to stop this window.
 echo.
 
 call npm run dev -- -p %PORT%

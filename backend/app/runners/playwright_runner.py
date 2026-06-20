@@ -1,22 +1,28 @@
 """Materialize automation assets and run Playwright tests via Node with video capture."""
 
-import asyncio
 import json
 import re
 import shutil
+import sys
 import tempfile
 import uuid
+import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 ProgressCallback = Callable[[str, str], Awaitable[None]]
+StepProgressCallback = Callable[[dict], Awaitable[None]]
 
 import structlog
 
 from app.config import settings
 from app.runners.capabilities import node_available
+from app.runners.subprocess_runner import playwright_cli, run_subprocess
+from app.runners.setup_status import _playwright_browsers_on_disk
 
 logger = structlog.get_logger()
+
+RUNNERS_TOOLS = Path(__file__).resolve().parents[3] / "runners-tools"
 
 DEFAULT_CONFIG = """import {{ defineConfig }} from '@playwright/test';
 export default defineConfig({{
@@ -51,12 +57,13 @@ def prepare_workspace(files: list[dict], framework: str) -> Path:
 
     if framework == "playwright" and not has_config:
         config = DEFAULT_CONFIG.format(
-            timeout=settings.playwright_timeout_ms,
+            timeout=settings.playwright_test_timeout_ms,
             headless="true" if settings.playwright_headless else "false",
         )
         (workspace / "playwright.config.ts").write_text(config, encoding="utf-8")
     elif framework == "playwright" and has_config:
         _ensure_video_in_config(workspace, files)
+        _bump_playwright_test_timeout(workspace, files)
 
     if not (workspace / "package.json").exists():
         (workspace / "package.json").write_text(
@@ -69,7 +76,66 @@ def prepare_workspace(files: list[dict], framework: str) -> Path:
             encoding="utf-8",
         )
 
+    _bootstrap_runners_node_modules(workspace)
     return workspace
+
+
+def _configure_playwright_workspace(workspace: Path, *, headed: bool = False) -> None:
+    """Force video recording and optionally open a visible browser for debug runs."""
+    for path in workspace.glob("playwright.config.*"):
+        text = path.read_text(encoding="utf-8")
+        if re.search(r"video:\s*['\"]", text):
+            text = re.sub(r"video:\s*['\"][^'\"]*['\"]", "video: 'on'", text, count=1)
+        elif "use:" in text:
+            text = text.replace("use: {", "use: { video: 'on',", 1)
+        if headed:
+            if re.search(r"headless:\s*\w+", text):
+                text = re.sub(r"headless:\s*\w+", "headless: false", text, count=1)
+            elif "use:" in text:
+                text = text.replace("use: {", "use: { headless: false,", 1)
+        if "viewport:" not in text and "use:" in text:
+            text = text.replace(
+                "use: {",
+                "use: { viewport: { width: 1280, height: 720 },",
+                1,
+            )
+        path.write_text(text, encoding="utf-8")
+
+
+def _bootstrap_runners_node_modules(workspace: Path) -> bool:
+    """Use pre-installed runners-tools/node_modules to avoid npm install failures on fresh machines."""
+    src = RUNNERS_TOOLS / "node_modules"
+    if not src.is_dir() or not (src / "@playwright").is_dir():
+        return False
+    dst = workspace / "node_modules"
+    if dst.exists():
+        return True
+    pkg_src = RUNNERS_TOOLS / "package.json"
+    if pkg_src.exists() and not (workspace / "package.json").exists():
+        (workspace / "package.json").write_text(pkg_src.read_text(encoding="utf-8"), encoding="utf-8")
+    try:
+        if sys.platform == "win32":
+            import subprocess
+
+            r = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(dst), str(src)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode == 0:
+                logger.info("bootstrap_node_modules_junction", workspace=str(workspace))
+                return True
+        dst.symlink_to(src, target_is_directory=True)
+        return True
+    except Exception as exc:
+        logger.warning("bootstrap_node_modules_link_failed", error=str(exc))
+    try:
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+        return True
+    except Exception as exc:
+        logger.warning("bootstrap_node_modules_copy_failed", error=str(exc))
+        return False
 
 
 def _ensure_video_in_config(workspace: Path, files: list[dict]) -> None:
@@ -87,16 +153,62 @@ def _ensure_video_in_config(workspace: Path, files: list[dict]) -> None:
                 path.write_text(text, encoding="utf-8")
 
 
+def _bump_playwright_test_timeout(workspace: Path, files: list[dict]) -> None:
+    """Raise per-test timeout so full navigation walkthroughs can finish."""
+    min_ms = settings.playwright_test_timeout_ms
+    for f in files:
+        if "playwright.config" not in f.get("path", ""):
+            continue
+        path = workspace / f["path"]
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        match = re.search(r"timeout:\s*([\d_]+)", text)
+        if not match:
+            continue
+        current = int(match.group(1).replace("_", ""))
+        if current >= min_ms:
+            continue
+        text = re.sub(r"timeout:\s*[\d_]+", f"timeout: {min_ms}", text, count=1)
+        path.write_text(text, encoding="utf-8")
+
+
 async def run_playwright(
     workspace: Path,
     timeout_sec: int | None = None,
     on_progress: ProgressCallback | None = None,
+    *,
+    test_glob: str | None = None,
+    headed: bool = False,
+    embed_live: bool = False,
+    progress_path: Path | None = None,
+    live_frame_path: Path | None = None,
+    total_steps: int = 15,
+    on_step_progress: StepProgressCallback | None = None,
+    cancel_run_id: str | None = None,
 ) -> dict:
     timeout_sec = timeout_sec or settings.execution_timeout_sec
 
     async def progress(phase: str, detail: str) -> None:
         if on_progress:
             await on_progress(phase, detail)
+
+    use_headed = headed and not embed_live
+    _configure_playwright_workspace(workspace, headed=use_headed)
+
+    if cancel_run_id:
+        from app.services.execution_worker import is_run_cancel_requested
+
+        if is_run_cancel_requested(cancel_run_id):
+            return {
+                "available": True,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Cancelled by user",
+                "logs": "Cancelled before Playwright run",
+                "results": [],
+                "cancelled": True,
+            }
 
     if not node_available():
         return {
@@ -109,56 +221,113 @@ async def run_playwright(
         }
 
     logs: list[str] = []
-    npx = shutil.which("npx") or "npx"
     npm = shutil.which("npm") or "npm"
+    pw_cli = playwright_cli(workspace)
+    has_modules = (workspace / "node_modules" / "@playwright").is_dir()
 
-    await progress("npm_install", "Installing npm dependencies…")
-    deps = await _run_cmd(
-        [npm, "install", "--no-audit", "--no-fund"],
-        workspace,
-        min(timeout_sec, 240),
-    )
-    logs.append(f"npm install: exit {deps['exit_code']}")
-    if deps["exit_code"] != 0:
-        return {
-            "available": True,
-            "exit_code": deps["exit_code"],
-            "stdout": deps["stdout"],
-            "stderr": deps["stderr"],
-            "logs": "\n".join(logs),
-            "results": [{
-                "file": "",
-                "title": "Dependency install",
-                "status": "failed",
-                "error": (deps["stderr"] or deps["stdout"] or "npm install failed")[:500],
-            }],
-            "summary": _summarize([], deps["exit_code"]),
-            "workspace": str(workspace),
-        }
+    if not has_modules:
+        await progress("npm_install", "Installing npm dependencies…")
+        deps = await run_subprocess(
+            [npm, "install", "--no-audit", "--no-fund"],
+            workspace,
+            min(timeout_sec, 240),
+            cancel_run_id=cancel_run_id,
+        )
+        logs.append(f"npm install: exit {deps['exit_code']}")
+        if deps["exit_code"] != 0:
+            return {
+                "available": True,
+                "exit_code": deps["exit_code"],
+                "stdout": deps["stdout"],
+                "stderr": deps["stderr"],
+                "logs": "\n".join(logs),
+                "results": [{
+                    "file": "",
+                    "title": "Dependency install",
+                    "status": "failed",
+                    "error": (deps["stderr"] or deps["stdout"] or "npm install failed")[:500],
+                }],
+                "summary": _summarize([], deps["exit_code"]),
+                "workspace": str(workspace),
+            }
+    else:
+        logs.append("Using pre-installed runners-tools node_modules (skipped npm install)")
 
-    await progress("playwright_install", "Installing Playwright Chromium browser…")
-    install = await _run_cmd(
-        [npx, "playwright", "install", "chromium"],
-        workspace,
-        min(timeout_sec, 240),
-    )
-    logs.append(f"playwright install: exit {install['exit_code']}")
+    browsers_ready, _ = _playwright_browsers_on_disk()
+    if not browsers_ready:
+        await progress("playwright_install", "Installing Playwright Chromium browser…")
+        install = await run_subprocess(
+            [*pw_cli, "install", "chromium"],
+            workspace,
+            min(timeout_sec, 240),
+            cancel_run_id=cancel_run_id,
+        )
+        logs.append(f"playwright install: exit {install['exit_code']}")
+        if install["exit_code"] != 0:
+            logs.append((install["stderr"] or install["stdout"] or "playwright install failed")[:400])
+    else:
+        logs.append("Playwright Chromium already installed (skipped browser download)")
 
-    await progress("playwright_test", "Running Playwright tests in browser…")
-    test = await _run_cmd(
-        [npx, "playwright", "test"],
-        workspace,
-        timeout_sec,
-    )
+    test_args = [*pw_cli, "test", "--reporter=line,json"]
+    if test_glob:
+        test_args.append(test_glob)
+    if use_headed:
+        test_args.append("--headed")
+
+    extra_env: dict[str, str] = {}
+    if progress_path:
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        extra_env["QEOS_PROGRESS_FILE"] = str(progress_path)
+    if live_frame_path:
+        live_frame_path.parent.mkdir(parents=True, exist_ok=True)
+        extra_env["QEOS_LIVE_FRAME"] = str(live_frame_path.resolve())
+    if total_steps:
+        extra_env["QEOS_TOTAL_STEPS"] = str(total_steps)
+
+    if embed_live:
+        await progress("playwright_test", "Running Playwright — live view in Studio…")
+    elif use_headed:
+        await progress("playwright_test", "Running Playwright in visible browser…")
+    else:
+        await progress("playwright_test", "Running Playwright tests in browser…")
+
+    stop_poll = asyncio.Event()
+
+    async def _poll_step_progress() -> None:
+        last_ts = 0.0
+        while not stop_poll.is_set():
+            if progress_path and progress_path.exists() and on_step_progress:
+                try:
+                    data = json.loads(progress_path.read_text(encoding="utf-8"))
+                    ts = float(data.get("ts") or 0)
+                    if ts > last_ts:
+                        last_ts = ts
+                        await on_step_progress(data)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.35)
+
+    poll_task = asyncio.create_task(_poll_step_progress()) if on_step_progress and progress_path else None
+    try:
+        test = await run_subprocess(test_args, workspace, timeout_sec, extra_env or None, cancel_run_id=cancel_run_id)
+    finally:
+        stop_poll.set()
+        if poll_task:
+            poll_task.cancel()
+            try:
+                await poll_task
+            except asyncio.CancelledError:
+                pass
+
+    cancelled = bool(test.get("cancelled"))
+    if not cancelled and cancel_run_id:
+        from app.services.execution_worker import is_run_cancel_requested
+
+        cancelled = is_run_cancel_requested(cancel_run_id)
     logs.extend([test["stdout"], test["stderr"]])
 
     parsed = _parse_results(workspace, test["stdout"], test["stderr"])
-    video_paths = _discover_videos(workspace)
-    for i, result in enumerate(parsed):
-        if not result.get("video_path") and i < len(video_paths):
-            result["video_path"] = str(video_paths[i])
-        elif result.get("video_path"):
-            result["video_path"] = str(Path(result["video_path"]).resolve())
+    _assign_videos_to_results(workspace, parsed)
 
     return {
         "available": True,
@@ -169,6 +338,7 @@ async def run_playwright(
         "results": parsed,
         "summary": _summarize(parsed, test["exit_code"]),
         "workspace": str(workspace),
+        "cancelled": cancelled,
     }
 
 
@@ -180,11 +350,17 @@ def persist_videos(
 ) -> list[dict]:
     base = Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id)
     base.mkdir(parents=True, exist_ok=True)
+    discovered = _discover_videos(workspace)
 
     enriched: list[dict] = []
     for idx, result in enumerate(results):
         entry = dict(result)
         src = result.get("video_path")
+        if (not src or not Path(src).exists()) and discovered:
+            file_slug = Path(result.get("file", "")).stem.lower()
+            matching = [v for v in discovered if file_slug and file_slug in str(v).lower()]
+            pick = matching[-1] if matching else (discovered[idx] if idx < len(discovered) else discovered[-1])
+            src = str(pick)
         if src and Path(src).exists():
             ext = Path(src).suffix or ".webm"
             dest = base / f"test_{idx}{ext}"
@@ -199,6 +375,17 @@ def persist_videos(
     return enriched
 
 
+def get_live_frame_path(project_id: uuid.UUID, run_id: uuid.UUID) -> Path | None:
+    path = Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id) / "live.jpg"
+    return path if path.exists() else None
+
+
+def run_artifact_dir(project_id: uuid.UUID, run_id: uuid.UUID) -> Path:
+    base = Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id)
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 def get_video_path(project_id: uuid.UUID, run_id: uuid.UUID, video_id: int) -> Path | None:
     base = Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id)
     for ext in (".webm", ".mp4"):
@@ -209,37 +396,36 @@ def get_video_path(project_id: uuid.UUID, run_id: uuid.UUID, video_id: int) -> P
 
 
 async def _run_cmd(cmd: list[str], cwd: Path, timeout_sec: int) -> dict:
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
-        rc = proc.returncode
-        if rc is None:
-            rc = -1
-        return {
-            "exit_code": rc,
-            "stdout": stdout_b.decode(errors="replace"),
-            "stderr": stderr_b.decode(errors="replace"),
-        }
-    except asyncio.TimeoutError:
-        return {"exit_code": -2, "stdout": "", "stderr": f"Command timed out after {timeout_sec}s"}
-    except Exception as e:
-        return {"exit_code": -1, "stdout": "", "stderr": str(e)}
+    return await run_subprocess(cmd, cwd, timeout_sec)
 
 
 def _discover_videos(workspace: Path) -> list[Path]:
     test_results = workspace / "test-results"
     if not test_results.exists():
         return []
-    return sorted(test_results.rglob("video.webm"))
+    return sorted(test_results.rglob("video.webm"), key=lambda p: p.stat().st_mtime)
+
+
+def _assign_videos_to_results(workspace: Path, parsed: list[dict]) -> None:
+    videos = _discover_videos(workspace)
+    for i, result in enumerate(parsed):
+        if result.get("video_path"):
+            result["video_path"] = str(Path(result["video_path"]).resolve())
+            continue
+        file_slug = Path(result.get("file", "")).stem.lower()
+        matching = [v for v in videos if file_slug and file_slug in str(v).lower()]
+        if matching:
+            result["video_path"] = str(matching[-1].resolve())
+        elif len(parsed) == 1 and videos:
+            result["video_path"] = str(videos[-1].resolve())
+        elif i < len(videos):
+            result["video_path"] = str(videos[i].resolve())
 
 
 def _parse_results(workspace: Path, stdout: str, stderr: str) -> list[dict]:
     json_path = workspace / "results.json"
+    if not json_path.exists():
+        json_path = workspace / "test-results" / "results.json"
     payloads: list[dict] = []
 
     if json_path.exists():
@@ -316,7 +502,7 @@ def _flatten_suite(suite: dict, workspace: Path, parent_title: str = "") -> list
             out.append({
                 "file": spec.get("file", ""),
                 "title": full_title or spec.get("file", ""),
-                "status": "passed" if status in ("expected", "passed") else "failed",
+                "status": "passed" if status in ("expected", "passed", "flaky") else "failed",
                 "error": _first_error(test),
                 "video_path": video_path,
             })
@@ -324,10 +510,14 @@ def _flatten_suite(suite: dict, workspace: Path, parent_title: str = "") -> list
 
 
 def _first_error(test: dict) -> str | None:
-    for result in test.get("results", []):
+    from app.runners.playwright_output import strip_ansi
+
+    for result in reversed(test.get("results", [])):
         err = result.get("error")
         if err:
-            return err.get("message", str(err))[:500]
+            msg = strip_ansi(err.get("message", str(err)) if isinstance(err, dict) else str(err))
+            if msg and "NO_COLOR" not in msg:
+                return msg[:800]
     return None
 
 

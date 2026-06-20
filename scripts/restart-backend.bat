@@ -1,33 +1,43 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 title QEOS Backend (port 8000)
 
 set "ROOT=%~dp0.."
+set "SCRIPTS=%~dp0"
 set "PORT=8000"
 
 echo.
-echo [%date% %time%] Stopping processes on port %PORT%...
-call "%~dp0stop-servers.bat" >nul 2>&1
-for /L %%R in (1,1,2) do (
-  for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":%PORT%" ^| findstr "LISTENING"') do (
-    taskkill /F /PID %%P >nul 2>&1
+echo [%date% %time%] Restarting backend on port %PORT%...
+call "%SCRIPTS%stop-servers.bat"
+
+for /L %%R in (1,1,5) do (
+  call "%SCRIPTS%lib\kill-port.bat" %PORT%
+  call "%SCRIPTS%lib\port-in-use.bat" %PORT%
+  if errorlevel 1 (
+    ping 127.0.0.1 -n 2 >nul
+  ) else (
+    goto :port_free
   )
-  timeout /t 1 /nobreak >nul
+)
+
+:port_free
+call "%SCRIPTS%lib\port-in-use.bat" %PORT%
+if not errorlevel 1 (
+  echo WARNING: Port %PORT% may still be in use. Starting backend anyway...
 )
 
 cd /d "%ROOT%\backend"
 if not exist ".venv\Scripts\uvicorn.exe" (
-  echo ERROR: Backend venv not found. Run: cd backend ^& python -m venv .venv ^& .venv\Scripts\pip install -r requirements.txt
+  echo ERROR: Backend venv not found. Run setup-and-run.bat first.
   pause
   exit /b 1
 )
 
+echo.
 echo Starting backend at http://127.0.0.1:%PORT%
-echo Debug flow requires execution_executor=asset_live_v2 on /health
-echo Press Ctrl+C to stop.
+echo Press Ctrl+C to stop this window.
 echo.
 
-call ".venv\Scripts\activate.bat"
-uvicorn app.main:app --reload --host 127.0.0.1 --port %PORT%
+call ".venv\Scripts\uvicorn.exe" app.main:app --host 127.0.0.1 --port %PORT%
 
 endlocal

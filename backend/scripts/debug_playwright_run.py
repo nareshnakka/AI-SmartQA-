@@ -1,5 +1,6 @@
 """Debug script for Playwright execution failures."""
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -15,7 +16,7 @@ async def main() -> None:
         "steps": ["Open login page", "Enter credentials"],
         "expected_results": ["User logged in"],
     }]
-    base_url = "https://opensource-demo.orangehrmlive.com"
+    base_url = os.environ.get("BASE_URL", "https://example.com")
     ws = build_workspace_for_test_cases(tc, base_url, "playwright")
     print("Workspace:", ws)
     try:

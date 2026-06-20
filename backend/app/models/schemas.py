@@ -97,6 +97,10 @@ class HealthResponse(BaseModel):
     version: str
     timestamp: datetime
     execution_executor: str = "asset_live_v2"
+    playwright_python: bool = False
+    playwright_browsers: bool = False
+    playwright_hint: str | None = None
+    runners_ready: dict | None = None
 
 
 class ProjectCreate(BaseModel):

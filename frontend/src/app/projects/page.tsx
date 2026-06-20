@@ -6,6 +6,7 @@ import { Plus, FolderKanban, ArrowRight, AlertCircle, RefreshCw } from "lucide-r
 import { AppShell } from "@/components/shell/AppShell";
 import { PageHeader, Badge, EmptyState } from "@/components/ui";
 import { apiFetch } from "@/lib/api";
+import { invalidateProjectsCache } from "@/lib/projects";
 import { useProjects } from "@/components/ProjectSelector";
 
 interface Project {
@@ -32,6 +33,7 @@ export default function ProjectsPage() {
         method: "POST",
         body: JSON.stringify({ name, description: description || null }),
       });
+      invalidateProjectsCache();
       setName("");
       setDescription("");
       setShowCreate(false);

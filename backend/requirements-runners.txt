@@ -1,0 +1,5 @@
+# Extra Python packages for live automation / performance runners (installed by setup)
+robotframework>=7.0
+robotframework-browser>=18.0
+Appium-Python-Client>=4.0
+locust>=2.32.0

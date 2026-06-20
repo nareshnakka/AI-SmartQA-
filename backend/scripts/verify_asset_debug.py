@@ -1,5 +1,6 @@
 """Verify debug batch-run uses automation asset scripts."""
 import json
+import os
 import time
 import urllib.request
 
@@ -18,7 +19,7 @@ def main() -> None:
         "mode": "live",
         "background": False,
         "framework": asset["framework"],
-        "base_url": "https://opensource-demo.orangehrmlive.com",
+        "base_url": os.environ.get("BASE_URL", "https://example.com"),
         "asset_id": asset["id"],
     }).encode()
     req = urllib.request.Request(

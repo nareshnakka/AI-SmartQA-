@@ -10,11 +10,31 @@ from app.db.session import AsyncSessionLocal
 logger = structlog.get_logger()
 
 _running: set[uuid.UUID] = set()
+_cancel_requested: set[uuid.UUID] = set()
 _execution_lock = asyncio.Lock()
 
 
 def is_run_active(run_id: uuid.UUID) -> bool:
     return run_id in _running
+
+
+def is_run_cancel_requested(run_id: uuid.UUID | str) -> bool:
+    try:
+        rid = run_id if isinstance(run_id, uuid.UUID) else uuid.UUID(str(run_id))
+    except ValueError:
+        return False
+    return rid in _cancel_requested
+
+
+def request_cancel_run(run_id: uuid.UUID) -> bool:
+    _cancel_requested.add(run_id)
+    from app.runners.subprocess_runner import kill_run_subprocess
+
+    return kill_run_subprocess(str(run_id))
+
+
+def clear_cancel_state(run_id: uuid.UUID) -> None:
+    _cancel_requested.discard(run_id)
 
 
 def enqueue_execution(
@@ -42,12 +62,14 @@ def enqueue_batch_execution(
     run_type: str,
     performance_asset_id: uuid.UUID | None,
     framework: str = "playwright",
+    headed: bool = False,
+    embed_live: bool = False,
 ) -> None:
     _running.add(run_id)
     asyncio.create_task(
         _execute_batch(
             run_id, project_id, test_case_ids, asset_id, mode, apply_healing,
-            base_url, run_type, performance_asset_id, framework,
+            base_url, run_type, performance_asset_id, framework, headed, embed_live,
         ),
         name=f"qeos-batch-{run_id}",
     )
@@ -73,6 +95,7 @@ async def _execute(
         await _fail_run(run_id, e)
     finally:
         _running.discard(run_id)
+        clear_cancel_state(run_id)
 
 
 async def _execute_batch(
@@ -86,6 +109,8 @@ async def _execute_batch(
     run_type: str,
     performance_asset_id: uuid.UUID | None,
     framework: str = "playwright",
+    headed: bool = False,
+    embed_live: bool = False,
 ) -> None:
     from app.services.execution import ExecutionService
 
@@ -96,6 +121,7 @@ async def _execute_batch(
                 await svc.execute_batch_run(
                     run_id, project_id, test_case_ids, asset_id, mode, apply_healing,
                     base_url, run_type, performance_asset_id, framework,
+                    headed=headed, embed_live=embed_live,
                 )
                 await db.commit()
     except Exception as e:
@@ -103,6 +129,7 @@ async def _execute_batch(
         await _fail_run(run_id, e)
     finally:
         _running.discard(run_id)
+        clear_cancel_state(run_id)
 
 
 async def _fail_run(run_id: uuid.UUID, error: Exception) -> None:

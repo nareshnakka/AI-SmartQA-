@@ -2,6 +2,7 @@
 
 import { useRef, useEffect } from "react";
 import clsx from "clsx";
+import { CheckSquare, Square } from "lucide-react";
 
 interface CodeEditorProps {
   value: string;
@@ -61,10 +62,12 @@ export function CodeEditor({ value, onChange, language = "typescript", readOnly,
 interface FileTreeProps {
   files: { path: string; type?: string }[];
   activeFile: string | null;
+  selectedPaths?: Set<string>;
   onSelect: (path: string) => void;
+  onToggleSelect?: (path: string) => void;
 }
 
-export function FileTree({ files, activeFile, onSelect }: FileTreeProps) {
+export function FileTree({ files, activeFile, selectedPaths, onSelect, onToggleSelect }: FileTreeProps) {
   const grouped: Record<string, { path: string; type?: string }[]> = {};
   for (const f of files) {
     const parts = f.path.split("/");
@@ -83,23 +86,46 @@ export function FileTree({ files, activeFile, onSelect }: FileTreeProps) {
           {dirFiles.map((f) => {
             const name = f.path.split("/").pop()!;
             const isActive = f.path === activeFile;
+            const isSelected = selectedPaths?.has(f.path) ?? false;
             return (
-              <button
+              <div
                 key={f.path}
-                onClick={() => onSelect(f.path)}
                 className={clsx(
-                  "w-full text-left px-3 py-1.5 flex items-center gap-2 transition-colors",
+                  "flex items-center gap-0.5 transition-colors",
                   isActive
                     ? "bg-brand-50 text-brand-800 border-r-2 border-brand-700"
                     : "text-[var(--text-secondary)] hover:bg-[var(--surface-sunken)]"
                 )}
               >
-                <span className={clsx(
-                  "w-1.5 h-1.5 rounded-full",
-                  f.type === "page_object" ? "bg-purple-400" : "bg-emerald-400"
-                )} />
-                {name}
-              </button>
+                {onToggleSelect && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onToggleSelect(f.path);
+                    }}
+                    className="p-1.5 shrink-0 opacity-70 hover:opacity-100"
+                    title={isSelected ? "Deselect file" : "Select file"}
+                  >
+                    {isSelected ? (
+                      <CheckSquare className="w-3.5 h-3.5 text-brand-700" />
+                    ) : (
+                      <Square className="w-3.5 h-3.5 text-gray-400" />
+                    )}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => onSelect(f.path)}
+                  className="flex-1 text-left py-1.5 pr-3 flex items-center gap-2 min-w-0"
+                >
+                  <span className={clsx(
+                    "w-1.5 h-1.5 rounded-full shrink-0",
+                    f.type === "page_object" ? "bg-purple-400" : "bg-emerald-400"
+                  )} />
+                  <span className="truncate">{name}</span>
+                </button>
+              </div>
             );
           })}
         </div>

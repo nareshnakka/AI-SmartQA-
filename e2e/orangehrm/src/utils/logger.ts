@@ -1,3 +1,5 @@
+import { reportFromLogStep } from './qeosProgress';
+
 export type StepLog = {
   step: string;
   status: 'pass' | 'fail' | 'info';
@@ -12,6 +14,7 @@ export function logStep(step: string, status: StepLog['status'], detail?: string
   logs.push(entry);
   const prefix = status === 'pass' ? '✓' : status === 'fail' ? '✗' : '→';
   console.log(`${prefix} ${step}${detail ? ` — ${detail}` : ''}${durationMs != null ? ` (${durationMs}ms)` : ''}`);
+  reportFromLogStep(step, status);
 }
 
 export function getExecutionLog(): StepLog[] {

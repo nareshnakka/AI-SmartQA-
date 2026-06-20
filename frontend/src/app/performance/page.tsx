@@ -11,6 +11,7 @@ import { CodeEditor, FileTree } from "@/components/studio/CodeEditor";
 import { PerfRunDashboard, RunDetail } from "@/components/performance/PerfRunDashboard";
 import { useActiveProject } from "@/context/ProjectContext";
 import { apiFetch, performanceExportUrl } from "@/lib/api";
+import { useWorkspaceScope } from "@/lib/workspace";
 
 interface PerfAsset {
   id: string; name: string; tool: string; version?: number; status?: string;
@@ -53,10 +54,11 @@ function OverviewPie({ passed, failed, running }: { passed: number; failed: numb
 
 export default function PerformancePage() {
   const { projectId } = useActiveProject();
+  const { moduleQueryIds } = useWorkspaceScope(projectId);
   const [mainTab, setMainTab] = useState<"studio" | "dashboard" | "history">("studio");
   const [tool, setTool] = useState("k6");
   const [profile, setProfile] = useState("load");
-  const [baseUrl, setBaseUrl] = useState("https://opensource-demo.orangehrmlive.com");
+  const [baseUrl, setBaseUrl] = useState("");
   const [discoverySessionId, setDiscoverySessionId] = useState("");
   const [discoverySessions, setDiscoverySessions] = useState<DiscoverySession[]>([]);
   const [profiles, setProfiles] = useState<WorkloadProfile[]>([]);
@@ -164,6 +166,7 @@ export default function PerformancePage() {
         try { body.har_content = JSON.parse(harJson); } catch { setMessage("Invalid HAR JSON"); return; }
       }
       if (discoverySessionId) body.discovery_session_id = discoverySessionId;
+      if (moduleQueryIds?.length) body.module_ids = moduleQueryIds;
       const asset = await apiFetch<PerfAsset>(`/api/v1/projects/${projectId}/performance/generate`, {
         method: "POST", body: JSON.stringify(body),
       });

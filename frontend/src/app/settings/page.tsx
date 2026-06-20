@@ -1,11 +1,19 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import clsx from "clsx";
 import { AppShell } from "@/components/shell/AppShell";
 import { PageHeader, Badge, StatusDot } from "@/components/ui";
+import { WorkspaceHierarchyPanel } from "@/components/settings/WorkspaceHierarchyPanel";
+import { NamingPatternsPanel } from "@/components/settings/NamingPatternsPanel";
+import { useActiveProject } from "@/context/ProjectContext";
 import { apiFetch } from "@/lib/api";
 
+type SettingsTab = "platform" | "workspace" | "naming";
+
 export default function SettingsPage() {
+  const { projectId, activeProject, ready } = useActiveProject();
+  const [tab, setTab] = useState<SettingsTab>("platform");
   const [providers, setProviders] = useState<{ name: string; available: boolean; models: string[] }[]>([]);
   const [manifest, setManifest] = useState<{ version: string; extensions: { id: string; point: string; name: string }[] } | null>(null);
   const [capabilities, setCapabilities] = useState<Record<string, boolean>>({});
@@ -25,16 +33,63 @@ export default function SettingsPage() {
     });
   }, []);
 
+  const tabs: { id: SettingsTab; label: string }[] = [
+    { id: "platform", label: "Platform" },
+    { id: "workspace", label: "Environments & Modules" },
+    { id: "naming", label: "Test Case Naming" },
+  ];
+
   return (
     <AppShell title="Settings">
       <PageHeader
-        title="Platform Settings"
-        subtitle="Intelligence engine, providers, and extension configuration"
+        title="Settings"
+        subtitle={
+          tab === "platform"
+            ? "Intelligence engine, providers, and extension configuration"
+            : tab === "workspace"
+              ? `Project → Environment → Module${activeProject ? ` — ${activeProject.name}` : ""}`
+              : `Naming patterns${activeProject ? ` — ${activeProject.name}` : ""}`
+        }
         breadcrumbs={[{ label: "Platform" }, { label: "Settings" }]}
       />
 
+      <div className="flex gap-2 mb-6 border-b border-[var(--border-default)]">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setTab(t.id)}
+            suppressHydrationWarning
+            className={clsx(
+              "px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors",
+              tab === t.id
+                ? "border-brand-700 text-brand-700"
+                : "border-transparent text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "workspace" && (
+        !ready || !projectId ? (
+          <p className="text-sm text-[var(--text-tertiary)]">Select a project to configure the hierarchy.</p>
+        ) : (
+          <WorkspaceHierarchyPanel projectId={projectId} />
+        )
+      )}
+
+      {tab === "naming" && (
+        !ready || !projectId ? (
+          <p className="text-sm text-[var(--text-tertiary)]">Select a project to configure naming patterns.</p>
+        ) : (
+          <NamingPatternsPanel projectId={projectId} />
+        )
+      )}
+
+      {tab === "platform" && (
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Intelligence */}
         <div className="ds-card">
           <div className="ds-card-header">
             <h2 className="text-sm font-semibold">Intelligence Engine</h2>
@@ -55,18 +110,9 @@ export default function SettingsPage() {
               </div>
               <Badge variant="success">Enabled</Badge>
             </div>
-            <div className="ds-divider" />
-            <div className="flex items-center justify-between py-2">
-              <div>
-                <p className="text-sm font-medium">Hybrid Mode</p>
-                <p className="text-xs text-[var(--text-tertiary)]">Native + Ollama neural enhancement</p>
-              </div>
-              <Badge variant="neutral">Optional</Badge>
-            </div>
           </div>
         </div>
 
-        {/* Runners & Auth */}
         <div className="ds-card">
           <div className="ds-card-header">
             <h2 className="text-sm font-semibold">Phase 5 Runners</h2>
@@ -89,19 +135,9 @@ export default function SettingsPage() {
                 {authStatus?.auth_enabled ? "Enforced" : "Open (dev)"}
               </Badge>
             </div>
-            {authStatus?.default_admin && (
-              <p className="text-xs text-[var(--text-tertiary)]">Default admin: {authStatus.default_admin}</p>
-            )}
-            <div className="flex items-center justify-between py-1">
-              <span className="text-sm text-[var(--text-secondary)]">SSO (OIDC)</span>
-              <Badge variant={authStatus?.sso_configured ? "success" : "neutral"}>
-                {authStatus?.sso_configured ? "Configured" : "Not configured"}
-              </Badge>
-            </div>
           </div>
         </div>
 
-        {/* Providers */}
         <div className="ds-card">
           <div className="ds-card-header">
             <h2 className="text-sm font-semibold">LLM Providers</h2>
@@ -124,7 +160,6 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        {/* Extensions */}
         <div className="ds-card lg:col-span-2">
           <div className="ds-card-header">
             <div>
@@ -156,6 +191,7 @@ export default function SettingsPage() {
           </div>
         </div>
       </div>
+      )}
     </AppShell>
   );
 }

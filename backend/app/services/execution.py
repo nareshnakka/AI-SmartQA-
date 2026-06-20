@@ -29,6 +29,7 @@ from app.services.e2e_bundle import (
     dedupe_files,
     is_placeholder_playwright_asset,
     load_orangehrm_e2e_files,
+    materialize_batch_playwright_specs,
 )
 
 
@@ -93,6 +94,8 @@ class ExecutionService:
         mode: str = "live",
         apply_healing: bool = False,
         background: bool = True,
+        headed: bool = False,
+        embed_live: bool = False,
         run_name: str | None = None,
         sprint: str | None = None,
         release: str | None = None,
@@ -132,7 +135,7 @@ class ExecutionService:
             release=release,
             agent_id=agent_id,
             progress={"total": max(len(test_case_ids), 1 if run_type == "performance" else 0), "completed": 0, "current": None, "percent": 0},
-            summary={"run_type": run_type, "agent": agent.name, "framework": framework},
+            summary={"run_type": run_type, "agent": agent.name, "framework": framework, "headed": headed, "embed_live": embed_live},
         )
         self.db.add(run)
         await self.db.flush()
@@ -143,13 +146,13 @@ class ExecutionService:
             await self.db.commit()
             enqueue_batch_execution(
                 run.id, project_id, test_case_ids, asset_id, mode, apply_healing,
-                base_url, run_type, performance_asset_id, framework,
+                base_url, run_type, performance_asset_id, framework, headed, embed_live,
             )
             return run
 
         await self.execute_batch_run(
             run.id, project_id, test_case_ids, asset_id, mode, apply_healing,
-            base_url, run_type, performance_asset_id, framework,
+            base_url, run_type, performance_asset_id, framework, headed=headed, embed_live=embed_live,
         )
         return run
 
@@ -165,12 +168,16 @@ class ExecutionService:
         run_type: str,
         performance_asset_id: uuid.UUID | None,
         framework: str = "playwright",
+        headed: bool = False,
+        embed_live: bool = False,
     ) -> None:
         run = await self.db.get(ExecutionRunModel, run_id)
         if not run:
             return
 
         framework = (run.summary or {}).get("framework", framework)
+        headed = headed or bool((run.summary or {}).get("headed", False))
+        embed_live = embed_live or bool((run.summary or {}).get("embed_live", False))
 
         if run_type == "performance" and performance_asset_id:
             await self._run_performance_batch(run, project_id, performance_asset_id, test_case_ids)
@@ -184,6 +191,16 @@ class ExecutionService:
             run.status = "failed"
             run.logs = "No test cases found"
             run.completed_at = datetime.now(timezone.utc)
+            return
+
+        if mode == "live" and run_type == "automation" and not asset_id:
+            run.status = "failed"
+            run.logs = (
+                "Live Playwright execution requires an automation asset with real scripts. "
+                "Select an asset in Executions or Studio — stub goto tests are not used in live mode."
+            )
+            run.completed_at = datetime.now(timezone.utc)
+            await self.db.flush()
             return
 
         # When an automation asset is linked, run the saved scripts — not generated goto stubs.
@@ -200,10 +217,18 @@ class ExecutionService:
                     f"Executor: asset_live_v2",
                 ]
                 passed, failed = await self._execute_batch_with_asset(
-                    run, cases, asset, apply_healing, base_url, results, logs
+                    run, cases, asset, apply_healing, base_url, results, logs,
+                    headed=headed, embed_live=embed_live,
                 )
                 run.progress = {"total": len(cases), "completed": len(cases), "current": None, "percent": 100, "phase": "done"}
-                run.status = "failed" if failed else "completed"
+                from app.services.execution_worker import is_run_cancel_requested
+
+                if is_run_cancel_requested(run.id):
+                    run.status = "cancelled"
+                elif failed:
+                    run.status = "failed"
+                else:
+                    run.status = "completed"
                 run.summary = {
                     **(run.summary or {}),
                     "passed": passed,
@@ -389,6 +414,21 @@ class ExecutionService:
         await self.db.commit()
 
     @staticmethod
+    def _apply_live_step_progress(results: list[dict], tc_index: int, step_index: int, status: str) -> None:
+        if tc_index >= len(results):
+            return
+        entry = results[tc_index]
+        steps = entry.get("steps") or []
+        for i, step in enumerate(steps):
+            if i < step_index:
+                step["status"] = "passed"
+            elif i == step_index:
+                step["status"] = status
+            elif step.get("status") not in ("passed", "failed"):
+                step["status"] = "pending"
+        entry["steps"] = steps
+
+    @staticmethod
     def _prepare_asset_files(files: list[dict], base_url: str) -> list[dict]:
         """Copy asset files and inject the configured base URL."""
         prepared: list[dict] = []
@@ -406,15 +446,23 @@ class ExecutionService:
         return prepared
 
     @staticmethod
-    def _match_playwright_result(raw_results: list[dict], title: str) -> dict | None:
+    def _match_playwright_result(
+        raw_results: list[dict], title: str, test_case_id: str | None = None
+    ) -> dict | None:
         if not raw_results:
             return None
+        if test_case_id:
+            short = test_case_id.replace("-", "")[:8]
+            for r in raw_results:
+                blob = f"{r.get('file', '')} {r.get('title', '')}"
+                if f"tc_{short}" in blob:
+                    return r
         title_lower = title.lower()
         for r in raw_results:
             blob = f"{r.get('title', '')} {r.get('file', '')}".lower()
             if title_lower in blob or any(part in blob for part in title_lower.split() if len(part) > 3):
                 return r
-        return raw_results[0]
+        return raw_results[0] if len(raw_results) == 1 else None
 
     async def _execute_batch_with_asset(
         self,
@@ -425,6 +473,8 @@ class ExecutionService:
         base_url: str,
         results: list[dict],
         logs: list[str],
+        headed: bool = False,
+        embed_live: bool = False,
     ) -> tuple[int, int]:
         framework = asset.framework
         files = dedupe_files(self._prepare_asset_files(asset.files or [], base_url))
@@ -438,6 +488,27 @@ class ExecutionService:
                 await self.db.flush()
             except FileNotFoundError as exc:
                 logs.append(f"ERROR: {exc}")
+
+        if framework == "playwright" and (embed_live or headed):
+            try:
+                bundle = load_orangehrm_e2e_files(base_url)
+                refresh_prefixes = ("utils/", "pages/", "fixtures/")
+                refresh_paths = {
+                    f.get("path", "").replace("\\", "/")
+                    for f in bundle
+                    if f.get("path", "").replace("\\", "/").startswith(refresh_prefixes)
+                }
+                files = [f for f in files if f.get("path", "").replace("\\", "/") not in refresh_paths]
+                files.extend(f for f in bundle if f.get("path", "").replace("\\", "/") in refresh_paths)
+                files = dedupe_files(files)
+                logs.append("Refreshed page objects and progress hooks for live debug sync")
+            except FileNotFoundError:
+                pass
+
+        if framework == "playwright" and cases:
+            files = materialize_batch_playwright_specs(files, cases, base_url)
+            logs.append(f"Generated {len(cases)} per-test Playwright spec(s) with real page objects")
+
         test_files = [f for f in files if f.get("type") == "test" or "spec" in f.get("path", "").lower() or f.get("path", "").endswith((".cy.js", ".test.js", ".robot"))]
         logs.append(f"Materialized {len(files)} file(s), {len(test_files)} test file(s)")
 
@@ -470,8 +541,28 @@ class ExecutionService:
         passed = failed = 0
         workspace = prepare_framework_workspace(files, framework)
         logs.append(f"Workspace: {workspace}")
+        batch_specs = any(
+            f.get("path", "").replace("\\", "/").startswith("tests/batch/")
+            for f in files
+        )
+        test_glob = "tests/batch" if batch_specs else None
+        if embed_live:
+            logs.append("Debug mode: live browser view in Studio (embedded) + video recording")
+        elif headed:
+            logs.append("Debug mode: visible browser window (headed) + video recording enabled")
+        if test_glob:
+            logs.append(f"Running Playwright target: {test_glob}")
         run_id = run.id
+        project_id = run.project_id
+        from app.runners.playwright_runner import run_artifact_dir
+
+        artifact_dir = run_artifact_dir(project_id, run_id)
+        progress_path = artifact_dir / "progress.json"
+        live_frame_path = artifact_dir / "live.jpg"
+        total_steps = max(len(cases[0].steps or []), 1) if cases else 15
+
         await self._publish_run_progress(run, phase="prepare", detail="Preparing Playwright workspace…", logs=logs)
+        await self.db.commit()
 
         async def on_progress(phase: str, detail: str) -> None:
             run_row = await self.db.get(ExecutionRunModel, run_id)
@@ -479,11 +570,72 @@ class ExecutionService:
                 return
             await self._publish_run_progress(run_row, phase=phase, detail=detail, logs=logs + [detail])
 
+        async def on_step_progress(data: dict) -> None:
+            run_row = await self.db.get(ExecutionRunModel, run_id)
+            if not run_row or not run_row.results:
+                return
+            step_index = int(data.get("step_index") or 0)
+            status = str(data.get("status") or "running")
+            mapped = "running" if status == "running" else ("passed" if status == "passed" else "failed")
+            live_results = list(run_row.results)
+            ExecutionService._apply_live_step_progress(live_results, 0, step_index, mapped)
+            run_row.results = live_results
+            flag_modified(run_row, "results")
+            prog = dict(run_row.progress or {})
+            prog["current_step_index"] = step_index
+            prog["phase"] = "playwright_test"
+            prog["detail"] = str(data.get("description") or f"Step {step_index + 1}")
+            run_row.progress = prog
+            flag_modified(run_row, "progress")
+            await self.db.flush()
+            await self.db.commit()
+
         try:
-            outcome = await run_framework(workspace, framework, on_progress=on_progress)
+            outcome = await run_framework(
+                workspace,
+                framework,
+                on_progress=on_progress,
+                test_glob=test_glob,
+                headed=headed,
+                embed_live=embed_live,
+                progress_path=progress_path,
+                live_frame_path=live_frame_path,
+                total_steps=total_steps,
+                on_step_progress=on_step_progress if (embed_live or headed) else None,
+                cancel_run_id=str(run_id),
+            )
             raw_results = outcome.get("results", [])
             exit_code = outcome.get("exit_code", 1)
             logs.append(outcome.get("logs", ""))
+
+            from app.services.execution_worker import is_run_cancel_requested
+
+            if outcome.get("cancelled") or is_run_cancel_requested(run_id):
+                logs.append("Run cancelled by user")
+                for idx, tc in enumerate(cases):
+                    tc_dict = {
+                        "id": str(tc.id),
+                        "title": tc.title,
+                        "steps": tc.steps or [],
+                        "expected_results": tc.expected_results or [],
+                    }
+                    steps = map_steps_from_test_case(tc_dict, "pending")
+                    for step in steps:
+                        if step.get("status") == "pending":
+                            step["status"] = "skipped"
+                    results[idx] = {
+                        "test_case_id": str(tc.id),
+                        "title": tc.title,
+                        "status": "cancelled",
+                        "steps": steps,
+                        "error": "Cancelled by user",
+                        "has_video": False,
+                        "video_id": str(idx),
+                    }
+                run.results = list(results)
+                flag_modified(run, "results")
+                run.logs = "\n".join(logs)
+                return passed, failed
             if outcome.get("stdout"):
                 logs.append(outcome.get("stdout", "")[-2000:])
             if outcome.get("stderr"):
@@ -520,25 +672,40 @@ class ExecutionService:
                     "steps": tc.steps or [],
                     "expected_results": tc.expected_results or [],
                 }
-                matched = self._match_playwright_result(persisted, tc.title)
+                matched = self._match_playwright_result(persisted, tc.title, str(tc.id))
                 if matched:
                     status = matched.get("status", "failed")
                     if status not in ("passed", "passed_with_warnings"):
                         status = "failed"
                     step_results = parse_framework_steps([matched], tc_dict, exit_code if status == "failed" else 0)
                     entry = matched
-                elif exit_code == 0 and persisted:
-                    status = "passed"
-                    step_results = parse_framework_steps(persisted[:1], tc_dict, 0)
-                    entry = persisted[0]
+                elif exit_code == 0 and len(persisted) == len(cases) and idx < len(persisted):
+                    entry = persisted[idx]
+                    status = entry.get("status", "failed")
+                    if status not in ("passed", "passed_with_warnings"):
+                        status = "failed"
+                    step_results = parse_framework_steps([entry], tc_dict, 0 if status == "passed" else 1)
                 else:
                     status = "failed"
                     step_results = map_steps_from_test_case(tc_dict, "failed")
                     entry = {}
+                    if not persisted:
+                        err_msg = (outcome.get("stderr") or outcome.get("stdout") or "")[:500]
+                        entry = {"error": err_msg or "No Playwright result for this test case"}
 
                 err_msg = entry.get("error")
+                if err_msg:
+                    from app.runners.playwright_output import strip_ansi, strip_node_warnings
+
+                    err_msg = strip_node_warnings(strip_ansi(str(err_msg)))
                 if not err_msg and status == "failed":
-                    err_msg = (outcome.get("stderr") or outcome.get("stdout") or "")[:500] or "Playwright test failed"
+                    from app.runners.playwright_output import extract_playwright_failure
+
+                    err_msg = extract_playwright_failure(
+                        outcome.get("stdout", ""),
+                        outcome.get("stderr", ""),
+                        raw_results,
+                    ) or "Playwright test failed"
 
                 result_entry = {
                     "test_case_id": str(tc.id),
@@ -750,7 +917,7 @@ class ExecutionService:
         self, run: ExecutionRunModel, asset: AutomationAssetModel, apply_healing: bool
     ) -> None:
         framework = asset.framework
-        base_url = "https://opensource-demo.orangehrmlive.com"
+        base_url = (run.summary or {}).get("base_url") or "https://example.com"
         files = dedupe_files(self._prepare_asset_files(asset.files or [], base_url))
         if framework == "playwright" and is_placeholder_playwright_asset(files):
             try:
@@ -933,6 +1100,52 @@ class ExecutionService:
             .order_by(ExecutionRunModel.created_at.desc())
         )
         return list(result.scalars().all())
+
+    async def cancel_run(self, project_id: uuid.UUID, run_id: uuid.UUID) -> ExecutionRunModel:
+        run = await self.get_run(run_id)
+        if not run or run.project_id != project_id:
+            raise ValueError("Execution run not found")
+        if run.status != "running":
+            return run
+
+        from app.services.execution_worker import is_run_active, request_cancel_run
+
+        request_cancel_run(run_id)
+
+        run.status = "cancelled"
+        run.completed_at = datetime.now(timezone.utc)
+        run.logs = (run.logs or "") + "\nCancelled by user"
+        prog = dict(run.progress or {})
+        prog["phase"] = "done"
+        prog["detail"] = "Cancelled by user"
+        prog["percent"] = 100
+        run.progress = prog
+        flag_modified(run, "progress")
+
+        if run.results:
+            updated = []
+            for entry in run.results:
+                item = dict(entry)
+                if item.get("status") == "running":
+                    item["status"] = "cancelled"
+                    item["error"] = "Cancelled by user"
+                    steps = item.get("steps") or []
+                    for step in steps:
+                        if step.get("status") in ("pending", "running"):
+                            step["status"] = "skipped"
+                    item["steps"] = steps
+                updated.append(item)
+            run.results = updated
+            flag_modified(run, "results")
+
+        if is_run_active(run_id):
+            summary = dict(run.summary or {})
+            summary["cancelled"] = True
+            run.summary = summary
+            flag_modified(run, "summary")
+
+        await self.db.flush()
+        return run
 
     async def get_run(self, run_id: uuid.UUID) -> ExecutionRunModel | None:
         return await self.db.get(ExecutionRunModel, run_id)

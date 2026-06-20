@@ -1,5 +1,6 @@
 """Replace placeholder Playwright asset with bundled OrangeHRM E2E suite."""
 import asyncio
+import os
 import uuid
 
 from app.db.session import AsyncSessionLocal
@@ -9,7 +10,7 @@ from app.services.e2e_bundle import load_orangehrm_e2e_files
 
 async def main() -> None:
     project_id = uuid.UUID("be157118-6293-48b2-a3c4-5a982d833b27")
-    base_url = "https://opensource-demo.orangehrmlive.com"
+    base_url = os.environ.get("BASE_URL", "https://example.com")
 
     async with AsyncSessionLocal() as db:
         svc = AutomationService(db)

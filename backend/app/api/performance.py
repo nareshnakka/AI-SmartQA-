@@ -20,6 +20,7 @@ class GeneratePerformanceRequest(BaseModel):
     har_content: dict | str | None = None
     openapi_content: dict | str | None = None
     discovery_session_id: UUID | None = None
+    module_ids: list[UUID] | None = None
 
 
 class UpdateFileRequest(BaseModel):
@@ -92,6 +93,7 @@ async def generate_performance(
             body.workload_profile, body.base_url, body.har_content,
             body.openapi_content, body.throughput_config,
             discovery_session_id=body.discovery_session_id,
+            module_ids=body.module_ids,
         )
         await svc.seed_local_agent(project_id)
         return svc.to_dict(asset)

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import {
@@ -11,6 +11,8 @@ import { AppShell } from "@/components/shell/AppShell";
 import { PageHeader, MetricCard, Badge, Tabs } from "@/components/ui";
 import { TestCaseFlowView, buildFlowSteps } from "@/components/flow/TestCaseFlowView";
 import { apiFetch, apiUpload, exportUrl } from "@/lib/api";
+import { fetchTestCases } from "@/lib/test-cases";
+import { useWorkspaceScope } from "@/lib/workspace";
 
 interface Project {
   id: string;
@@ -32,6 +34,9 @@ interface Requirement {
 interface TestCase {
   id: string;
   title: string;
+  case_code?: string | null;
+  module_id?: string | null;
+  module_name?: string | null;
   description: string;
   steps: string[];
   expected_results: string[];
@@ -59,6 +64,7 @@ export default function ProjectDetailPage() {
   const params = useParams();
   const projectId = params.id as string;
   const fileRef = useRef<HTMLInputElement>(null);
+  const { moduleQueryIds, environmentQueryIds } = useWorkspaceScope(projectId);
 
   const [project, setProject] = useState<Project | null>(null);
   const [requirements, setRequirements] = useState<Requirement[]>([]);
@@ -76,7 +82,7 @@ export default function ProjectDetailPage() {
     const [p, reqs, cases, cov, suiteList] = await Promise.all([
       apiFetch<Project>(`/api/v1/projects/${projectId}`),
       apiFetch<Requirement[]>(`/api/v1/projects/${projectId}/requirements`),
-      apiFetch<TestCase[]>(`/api/v1/projects/${projectId}/test-cases`),
+      fetchTestCases(projectId, { moduleIds: moduleQueryIds, environmentIds: environmentQueryIds }),
       apiFetch<Coverage>(`/api/v1/projects/${projectId}/coverage`),
       apiFetch<{ id: string; name: string; suite_type: string; test_case_ids: string[] }[]>(
         `/api/v1/projects/${projectId}/test-suites`
@@ -87,7 +93,9 @@ export default function ProjectDetailPage() {
     setTestCases(cases);
     setCoverage(cov);
     setSuites(suiteList);
-  }, [projectId]);
+  }, [projectId, moduleQueryIds, environmentQueryIds]);
+
+  const filteredTestCases = testCases;
 
   useEffect(() => { load().catch(() => setMessage("Failed to load project")); }, [load]);
 
@@ -298,12 +306,15 @@ export default function ProjectDetailPage() {
       {/* Test cases tab */}
       {tab === "test-cases" && (
         <div className="space-y-2">
-          {testCases.length === 0 ? (
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xs text-[var(--text-tertiary)]">{filteredTestCases.length} case(s)</span>
+          </div>
+          {filteredTestCases.length === 0 ? (
             <div className="ds-card p-12 text-center text-sm text-[var(--text-tertiary)]">
-              No test cases yet. Generate from requirements to create test cases.
+              No test cases for this module filter.
             </div>
           ) : (
-            testCases.map((tc) => (
+            filteredTestCases.map((tc) => (
               <div key={tc.id} className="ds-card">
                 <button
                   className="w-full px-5 py-4 flex items-center gap-3 text-left"
@@ -314,7 +325,8 @@ export default function ProjectDetailPage() {
                     : <ChevronRight className="w-4 h-4 text-[var(--text-tertiary)]" />}
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium">{tc.title}</span>
+                      <span className="text-sm font-medium font-mono">{tc.case_code || tc.title}</span>
+                      {tc.module_name && <Badge variant="neutral">{tc.module_name}</Badge>}
                       <Badge variant={priorityVariant(tc.priority)}>{tc.priority}</Badge>
                       <Badge variant="neutral">{tc.status}</Badge>
                     </div>

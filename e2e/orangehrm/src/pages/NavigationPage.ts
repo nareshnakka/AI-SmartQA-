@@ -1,5 +1,5 @@
 import { Page, expect } from '@playwright/test';
-import { waitForPageLoad, retryAction, expectHeaderContains, timed } from '../utils/helpers';
+import { waitForPageLoad, retryAction, expectHeaderContains, timed, publishLiveFrame } from '../utils/helpers';
 import { captureScreenshot } from '../utils/screenshotHelper';
 import { logStep } from '../utils/logger';
 
@@ -20,6 +20,7 @@ export class NavigationPage {
       await item.click({ timeout: 5_000 });
     }, `click menu ${label}`, 15_000);
     await waitForPageLoad(this.page);
+    await publishLiveFrame(this.page);
   }
 
   async navigateAndValidate(
@@ -35,6 +36,7 @@ export class NavigationPage {
       await expectHeaderContains(this.page, header);
       if (extra) await extra();
       await captureScreenshot(this.page, screenshotName);
+      await publishLiveFrame(this.page);
     });
     logStep(`Navigate ${label}`, 'pass', `header=${header}`, durationMs);
   }
@@ -44,6 +46,7 @@ export class NavigationPage {
     await expectHeaderContains(this.page, 'Dashboard');
     await expect(this.page.locator('.orangehrm-dashboard-widget').first()).toBeVisible({ timeout: 10_000 });
     await captureScreenshot(this.page, 'dashboard');
+    await publishLiveFrame(this.page);
     logStep('Dashboard validation', 'pass');
   }
 

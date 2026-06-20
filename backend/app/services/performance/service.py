@@ -36,6 +36,7 @@ class PerformanceService:
         throughput_config: dict | None = None,
         discovery_session_id: uuid.UUID | None = None,
         flows: list[dict] | None = None,
+        module_ids: list[uuid.UUID] | None = None,
     ) -> PerformanceAssetModel:
         navigation_log: list | None = None
         proposed_test_cases: list | None = None
@@ -54,6 +55,9 @@ class PerformanceService:
                 select(TestCaseModel).where(TestCaseModel.project_id == project_id)
             )
             cases = list(result.scalars().all())
+            if module_ids:
+                mid_set = set(module_ids)
+                cases = [c for c in cases if c.module_id and c.module_id in mid_set]
             test_case_dicts = [
                 {"title": c.title, "steps": c.steps or [], "expected_results": c.expected_results or []}
                 for c in cases
@@ -88,9 +92,15 @@ class PerformanceService:
         )
 
         replay_label = output.get("replay_source", "test_cases")
+        from app.services.test_case_naming import next_case_code
+
+        default_name = f"{tool.upper()} — {WORKLOAD_PROFILES.get(workload_profile, {}).get('name', workload_profile)} (from {replay_label})"
+        if tool == "jmeter" and not name:
+            default_name = await next_case_code(self.db, project_id, None, "jmeter")
+
         asset = PerformanceAssetModel(
             project_id=project_id,
-            name=name or f"{tool.upper()} — {WORKLOAD_PROFILES.get(workload_profile, {}).get('name', workload_profile)} (from {replay_label})",
+            name=name or default_name,
             tool=tool,
             workload_model=output.get("workload_model"),
             throughput_config=output.get("throughput_config"),

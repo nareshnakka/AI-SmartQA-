@@ -9,6 +9,32 @@ from app.db.session import AsyncSessionLocal
 logger = structlog.get_logger()
 
 _running: set[uuid.UUID] = set()
+_cancel_requested: set[uuid.UUID] = set()
+_nav_clear_requested: set[uuid.UUID] = set()
+
+
+def is_discovery_cancel_requested(session_id: uuid.UUID) -> bool:
+    return session_id in _cancel_requested
+
+
+def request_cancel_discovery(session_id: uuid.UUID) -> None:
+    _cancel_requested.add(session_id)
+
+
+def clear_cancel_discovery(session_id: uuid.UUID) -> None:
+    _cancel_requested.discard(session_id)
+
+
+def is_nav_clear_requested(session_id: uuid.UUID) -> bool:
+    return session_id in _nav_clear_requested
+
+
+def request_nav_clear(session_id: uuid.UUID) -> None:
+    _nav_clear_requested.add(session_id)
+
+
+def clear_nav_clear_request(session_id: uuid.UUID) -> None:
+    _nav_clear_requested.discard(session_id)
 
 
 def enqueue_discovery(
@@ -76,3 +102,5 @@ async def _run(
             pass
     finally:
         _running.discard(session_id)
+        clear_cancel_discovery(session_id)
+        clear_nav_clear_request(session_id)

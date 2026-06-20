@@ -2,16 +2,9 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { useActiveProject } from "@/context/ProjectContext";
-import { apiFetch } from "@/lib/api";
+import { fetchProjects, type ProjectListItem } from "@/lib/projects";
 
-interface Project {
-  id: string;
-  name: string;
-  description?: string | null;
-  requirement_count?: number;
-  test_case_count?: number;
-  created_at?: string;
-}
+type Project = ProjectListItem;
 
 interface ProjectSelectorProps {
   value: string;
@@ -29,7 +22,12 @@ export function ProjectSelector({
   const { projects } = useProjectsList();
 
   return (
-    <select className={className} value={value} onChange={(e) => onChange(e.target.value)}>
+    <select
+      className={className}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      suppressHydrationWarning
+    >
       <option value="">Select project...</option>
       {projects.map((p) => (
         <option key={p.id} value={p.id}>
@@ -52,7 +50,11 @@ export function ActiveProjectSelector({
   const { projectId, setProjectId, projects, loading, activeProject } = useActiveProject();
 
   if (loading && !projects.length) {
-    return <select className={className} disabled><option>Loading projects…</option></select>;
+    return (
+      <select className={className} disabled suppressHydrationWarning>
+        <option>Loading projects…</option>
+      </select>
+    );
   }
 
   return (
@@ -61,6 +63,7 @@ export function ActiveProjectSelector({
       value={projectId}
       onChange={(e) => setProjectId(e.target.value)}
       title={activeProject?.name ?? "Active project"}
+      suppressHydrationWarning
     >
       {projects.length === 0 && <option value="">No projects</option>}
       {projects.map((p) => (
@@ -79,7 +82,7 @@ function useProjectsList() {
 
   useEffect(() => {
     if (projects.length) return;
-    apiFetch<Project[]>("/api/v1/projects").then(setLocal).catch(() => setLocal([]));
+    fetchProjects().then(setLocal).catch(() => setLocal([]));
   }, [projects.length]);
 
   return { projects: projects.length ? projects : local, loading };
@@ -90,17 +93,17 @@ export function useProjects() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const reload = useCallback(() => {
+  const reload = useCallback((refresh = true) => {
     setLoading(true);
     setError(null);
-    apiFetch<Project[]>("/api/v1/projects")
+    fetchProjects({ refresh })
       .then(setProjects)
       .catch((e: Error) => setError(e.message || "Failed to load projects"))
       .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
-    reload();
+    reload(false);
   }, [reload]);
 
   return { projects, loading, error, reload };

@@ -1,8 +1,14 @@
 """Runtime capability detection for runners."""
 
+import asyncio
 import shutil
-import subprocess
-import sys
+
+from app.runners.setup_status import (
+    _check_playwright_python,
+    _playwright_browsers_on_disk,
+    check_playwright_async,
+    collect_runner_status,
+)
 
 
 def node_available() -> bool:
@@ -12,47 +18,35 @@ def node_available() -> bool:
 def playwright_python_available() -> bool:
     try:
         import playwright  # noqa: F401
+
         return True
     except ImportError:
         return False
 
 
 def playwright_browsers_installed() -> bool:
-    if not playwright_python_available():
-        return False
+    ok, _ = _playwright_browsers_on_disk()
+    return ok
+
+
+async def check_playwright_ready_async() -> tuple[bool, str]:
+    """Playwright readiness for API routes — disk check first, then async launch."""
+    return await check_playwright_async()
+
+
+def check_playwright_ready() -> tuple[bool, str]:
+    """Sync readiness probe; avoids sync Playwright inside a running event loop."""
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            browser.close()
-        return True
-    except Exception:
-        return False
+        asyncio.get_running_loop()
+        return _playwright_browsers_on_disk()
+    except RuntimeError:
+        return _check_playwright_python()
 
 
 def get_runner_capabilities() -> dict:
-    fw = get_framework_capabilities()
-    any_live = any(c.get("live") for c in fw.values())
-    return {
-        "node_available": node_available(),
-        "playwright_python": playwright_python_available(),
-        "playwright_browsers": playwright_browsers_installed(),
-        "k6_available": shutil.which("k6") is not None,
-        "live_execution": any_live,
-        "browser_discovery": playwright_python_available(),
-        "frameworks": fw,
-    }
+    return collect_runner_status()
 
 
 def get_framework_capabilities() -> dict[str, dict]:
-    node = node_available()
-    return {
-        "playwright": {"live": node, "video": True, "hint": "Node.js + npx playwright"},
-        "cypress": {"live": node, "video": True, "hint": "Node.js + npx cypress"},
-        "puppeteer": {"live": node, "video": False, "hint": "Node.js + puppeteer"},
-        "testcafe": {"live": node, "video": True, "hint": "Node.js + testcafe"},
-        "webdriverio": {"live": node, "video": False, "hint": "Node.js + WebdriverIO"},
-        "selenium": {"live": shutil.which("mvn") is not None, "video": False, "hint": "Java + Maven for live runs"},
-        "robot_framework": {"live": shutil.which("robot") is not None, "video": False, "hint": "pip install robotframework robotframework-browser"},
-        "appium": {"live": shutil.which("pytest") is not None, "video": False, "hint": "pip install Appium-Python-Client pytest"},
-    }
+    status = collect_runner_status()
+    return status.get("frameworks", {})

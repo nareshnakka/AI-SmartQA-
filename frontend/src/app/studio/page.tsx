@@ -1,10 +1,10 @@
 "use client";
 
-import { Suspense, useEffect, useState, useCallback, useRef } from "react";
+import { Suspense, useEffect, useState, useCallback, useRef, useMemo } from "react";
 import {
   Play, Save, GitCompare, CheckCircle2, Loader2, Sparkles,
   ChevronDown, AlertCircle, Download, PlayCircle, Upload, Bug, GitBranch,
-  CheckSquare, Square, Trash2, Ban, RotateCcw,
+  CheckSquare, Square, Trash2, Ban, RotateCcw, Video,
 } from "lucide-react";
 import { AppShell } from "@/components/shell/AppShell";
 import { PageHeader, Badge, Tabs } from "@/components/ui";
@@ -13,8 +13,9 @@ import {
   TestCaseFlowView, buildFlowSteps, parseStepsFromScript, applyDebugFlowSteps, type FlowStep,
 } from "@/components/flow/TestCaseFlowView";
 import { useActiveProject } from "@/context/ProjectContext";
-import { apiFetch, automationExportUrl } from "@/lib/api";
-import { bulkTestCaseAction, isAutomationEnabled } from "@/lib/test-cases";
+import { apiFetch, automationExportUrl, checkBackendHealth, executionLiveFrameUrl, executionVideoUrl } from "@/lib/api";
+import { bulkTestCaseAction, fetchTestCases, isAutomationEnabled, isStepDisabled, stepDescription, updateTestCase, type TestCaseStep } from "@/lib/test-cases";
+import { useWorkspaceScope } from "@/lib/workspace";
 import Link from "next/link";
 
 interface AutomationAsset {
@@ -25,11 +26,13 @@ interface AutomationAsset {
 }
 interface Framework { id: string; name: string; language: string }
 interface TestCaseItem {
-  id: string; title: string; steps: string[]; expected_results: string[]; priority: string; status: string;
+  id: string; title: string; case_code?: string | null; module_id?: string | null; module_name?: string | null;
+  steps: TestCaseStep[]; expected_results: string[]; priority: string; status: string;
 }
 
 function StudioPageContent() {
   const { projectId } = useActiveProject();
+  const { moduleQueryIds, environmentQueryIds } = useWorkspaceScope(projectId);
   const prevProjectRef = useRef(projectId);
   const [frameworks, setFrameworks] = useState<Framework[]>([]);
   const [framework, setFramework] = useState("playwright");
@@ -59,7 +62,7 @@ function StudioPageContent() {
   const [inputSources, setInputSources] = useState<{ id: string; name: string; description: string }[]>([]);
   const [testCases, setTestCases] = useState<TestCaseItem[]>([]);
   const [selectedTestCaseId, setSelectedTestCaseId] = useState<string | null>(null);
-  const [baseUrl, setBaseUrl] = useState("https://opensource-demo.orangehrmlive.com");
+  const [baseUrl, setBaseUrl] = useState("");
 
   type DebugRunState = {
     id: string; status: string;
@@ -68,13 +71,22 @@ function StudioPageContent() {
       phase?: string; detail?: string; executor?: string;
     };
     logs?: string;
-    summary?: { executor?: string };
-    results?: { test_case_id?: string; title: string; status: string; error?: string; steps?: { order: number; description: string; status: string; expected?: string }[] }[];
+    summary?: { executor?: string; headed?: boolean; embed_live?: boolean };
+    results?: {
+      test_case_id?: string; title: string; status: string; error?: string;
+      has_video?: boolean; video_id?: string; video_url?: string;
+      steps?: { order: number; description: string; status: string; expected?: string }[];
+    }[];
   };
   const [debugRun, setDebugRun] = useState<DebugRunState | null>(null);
-  const [animTick, setAnimTick] = useState(0);
+  const [liveFrameTick, setLiveFrameTick] = useState(0);
+  const debugPollStoppedRef = useRef(false);
   const [selectedCaseIds, setSelectedCaseIds] = useState<Set<string>>(new Set());
+  const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(new Set());
+  const [deletingFiles, setDeletingFiles] = useState(false);
   const [managingCases, setManagingCases] = useState(false);
+  const [selectedFlowStepIndex, setSelectedFlowStepIndex] = useState<number | null>(null);
+  const [savingStep, setSavingStep] = useState(false);
 
   useEffect(() => {
     apiFetch<{ sources: { id: string; name: string; description: string }[] }>(
@@ -106,15 +118,15 @@ function StudioPageContent() {
 
   useEffect(() => {
     if (!projectId) return;
-    apiFetch<TestCaseItem[]>(`/api/v1/projects/${projectId}/test-cases`)
+    fetchTestCases(projectId, { moduleIds: moduleQueryIds, environmentIds: environmentQueryIds })
       .then(setTestCases).catch(() => setTestCases([]));
-  }, [projectId]);
+  }, [projectId, moduleQueryIds, environmentQueryIds]);
 
   const reloadTestCases = useCallback(async () => {
     if (!projectId) return;
-    const list = await apiFetch<TestCaseItem[]>(`/api/v1/projects/${projectId}/test-cases`);
+    const list = await fetchTestCases(projectId, { moduleIds: moduleQueryIds, environmentIds: environmentQueryIds });
     setTestCases(list);
-  }, [projectId]);
+  }, [projectId, moduleQueryIds, environmentQueryIds]);
 
   const toggleCaseSelect = (id: string) => {
     setSelectedCaseIds((prev) => {
@@ -138,13 +150,80 @@ function StudioPageContent() {
     }
   };
 
-  useEffect(() => {
-    if (debugRun?.status === "running") {
-      const t = setInterval(() => setAnimTick((n) => n + 1), 600);
-      return () => clearInterval(t);
+  const toggleFileSelect = (path: string) => {
+    setSelectedFilePaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const selectAllFiles = () => {
+    if (!activeAsset?.files.length) return;
+    setSelectedFilePaths(new Set(activeAsset.files.map((f) => f.path)));
+  };
+
+  const applyAssetUpdate = (updated: AutomationAsset) => {
+    setActiveAsset(updated);
+    setAssets((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
+  };
+
+  const deleteSelectedFiles = async () => {
+    if (!projectId || !activeAsset || selectedFilePaths.size === 0) return;
+    const paths = Array.from(selectedFilePaths);
+    const summary =
+      paths.length === 1
+        ? `"${paths[0].split("/").pop()}"`
+        : `${paths.length} files`;
+    if (
+      !window.confirm(
+        `Are you sure you want to delete ${summary}?\n\nThis cannot be undone. Deleted files cannot be restored.`
+      )
+    ) {
+      return;
     }
-    setAnimTick(0);
-  }, [debugRun?.status, debugRun?.id]);
+    setDeletingFiles(true);
+    setMessage("");
+    const deletedActive = activeFile !== null && paths.includes(activeFile);
+    try {
+      const updated = await apiFetch<AutomationAsset>(
+        `/api/v1/projects/${projectId}/automation/assets/${activeAsset.id}/files/delete`,
+        { method: "POST", body: JSON.stringify({ paths, save_version: false }) }
+      );
+      applyAssetUpdate(updated);
+      setSelectedFilePaths(new Set());
+      if (deletedActive) {
+        const first = updated.files[0];
+        if (first) {
+          setActiveFile(first.path);
+          setFileContent(first.content);
+        } else {
+          setActiveFile(null);
+          setFileContent("");
+        }
+      }
+      setMessage(`Deleted ${paths.length} file(s) permanently`);
+    } catch (e) {
+      const err = String(e);
+      setMessage(
+        err.includes("Not Found")
+          ? "Delete failed — restart the backend (scripts\\restart-all-auto.bat) so file delete is available, then try again."
+          : err
+      );
+    } finally {
+      setDeletingFiles(false);
+    }
+  };
+
+  useEffect(() => {
+    if (debugRun?.status !== "running" || !projectId || !debugRun.id) {
+      setLiveFrameTick(0);
+      return;
+    }
+    const t = setInterval(() => setLiveFrameTick((n) => n + 1), 350);
+    return () => clearInterval(t);
+  }, [debugRun?.status, debugRun?.id, projectId]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -155,10 +234,14 @@ function StudioPageContent() {
 
   const selectAsset = (asset: AutomationAsset) => {
     setActiveAsset(asset);
+    setSelectedFilePaths(new Set());
     const first = asset.files[0];
     if (first) {
       setActiveFile(first.path);
       setFileContent(first.content);
+    } else {
+      setActiveFile(null);
+      setFileContent("");
     }
     setValidation(null);
   };
@@ -175,7 +258,9 @@ function StudioPageContent() {
     }
   };
 
-  const linkedTestCases = testCases.filter(
+  const filteredTestCases = testCases;
+
+  const linkedTestCases = filteredTestCases.filter(
     (tc) => !activeAsset?.test_case_ids?.length || activeAsset.test_case_ids.includes(tc.id)
   );
   const selectedTestCase = testCases.find((tc) => tc.id === selectedTestCaseId) ?? linkedTestCases[0] ?? null;
@@ -187,16 +272,93 @@ function StudioPageContent() {
     return buildFlowSteps(selectedTestCase.steps ?? [], selectedTestCase.expected_results ?? []);
   };
 
+  const debugResult = selectedTestCase && debugRun?.results
+    ? debugRun.results.find((r) => r.test_case_id === selectedTestCase.id) ?? debugRun.results[0]
+    : null;
+
   const debugFlowState = selectedTestCase
     ? applyDebugFlowSteps(flowStepsForSelected(), {
         runStatus: debugRun?.status,
         progress: debugRun?.progress,
         testCaseTitle: selectedTestCase.title,
         testCaseId: selectedTestCase.id,
-        animTick,
         resultSteps: debugRun?.results?.find((r) => r.test_case_id === selectedTestCase.id)?.steps,
       })
     : { steps: scriptFlowSteps, activeStepIndex: null };
+
+  const stopDebugRun = async () => {
+    if (!projectId || !debugRun?.id || debugRun.status !== "running") return;
+    debugPollStoppedRef.current = true;
+    setExecuting(false);
+    setExecMessage("Stopping debug…");
+    try {
+      const updated = await apiFetch<DebugRunState>(
+        `/api/v1/projects/${projectId}/executions/${debugRun.id}/cancel`,
+        { method: "POST" }
+      );
+      setDebugRun(updated);
+      setExecMessage("Debug stopped.");
+    } catch (e) {
+      setExecMessage(`Stop failed: ${e}`);
+    }
+  };
+
+  useEffect(() => {
+    setSelectedFlowStepIndex(null);
+  }, [selectedTestCaseId]);
+
+  const saveTestCaseSteps = async (steps: TestCaseStep[], expectedResults: string[]) => {
+    if (!projectId || !selectedTestCase) return;
+    setSavingStep(true);
+    try {
+      const updated = await updateTestCase(projectId, selectedTestCase.id, {
+        steps,
+        expected_results: expectedResults,
+      });
+      setTestCases((prev) => prev.map((tc) => (tc.id === updated.id ? { ...tc, ...updated } : tc)));
+      setMessage(`Updated steps for "${updated.title}"`);
+    } catch (e) {
+      setExecMessage(String(e));
+    } finally {
+      setSavingStep(false);
+    }
+  };
+
+  const disableSelectedFlowStep = async () => {
+    if (!selectedTestCase || selectedFlowStepIndex == null) return;
+    const steps = [...(selectedTestCase.steps ?? [])];
+    const expected = [...(selectedTestCase.expected_results ?? [])];
+    const raw = steps[selectedFlowStepIndex];
+    if (!raw || isStepDisabled(raw)) return;
+    steps[selectedFlowStepIndex] = { description: stepDescription(raw), disabled: true };
+    await saveTestCaseSteps(steps, expected);
+  };
+
+  const enableSelectedFlowStep = async () => {
+    if (!selectedTestCase || selectedFlowStepIndex == null) return;
+    const steps = [...(selectedTestCase.steps ?? [])];
+    const expected = [...(selectedTestCase.expected_results ?? [])];
+    const raw = steps[selectedFlowStepIndex];
+    if (!raw || !isStepDisabled(raw)) return;
+    steps[selectedFlowStepIndex] = stepDescription(raw);
+    await saveTestCaseSteps(steps, expected);
+  };
+
+  const deleteSelectedFlowStep = async () => {
+    if (!selectedTestCase || selectedFlowStepIndex == null) return;
+    const steps = [...(selectedTestCase.steps ?? [])];
+    const expected = [...(selectedTestCase.expected_results ?? [])];
+    const desc = stepDescription(steps[selectedFlowStepIndex] ?? "");
+    if (!window.confirm(`Delete step ${selectedFlowStepIndex + 1}: "${desc.slice(0, 80)}"?`)) return;
+    steps.splice(selectedFlowStepIndex, 1);
+    expected.splice(selectedFlowStepIndex, 1);
+    setSelectedFlowStepIndex(null);
+    await saveTestCaseSteps(steps, expected);
+  };
+
+  const selectedFlowStep = selectedTestCase && selectedFlowStepIndex != null
+    ? flowStepsForSelected()[selectedFlowStepIndex]
+    : null;
 
   const debugTestCase = async (testCaseId: string) => {
     if (!projectId) return;
@@ -212,13 +374,14 @@ function StudioPageContent() {
     setSelectedTestCaseId(testCaseId);
     setSideTab("flow");
     setExecuting(true);
-    setExecMessage(`Starting live Playwright — asset "${activeAsset.name}" (may take 1–3 min)…`);
+    setExecMessage(`Starting debug — live browser in Studio + video recording (asset "${activeAsset.name}")…`);
     setDebugRun(null);
-    setAnimTick(0);
+    setLiveFrameTick(0);
+    debugPollStoppedRef.current = false;
     try {
-      const health = await apiFetch<{ execution_executor?: string }>("/health").catch(() => ({}));
-      if (health.execution_executor !== "asset_live_v2") {
-        setExecMessage("Backend is outdated — restart the API server on port 8000 (run scripts\\stop-servers.bat then scripts\\restart-backend.bat), then debug again.");
+      const health = await checkBackendHealth();
+      if (!health.ok) {
+        setExecMessage(health.message ?? "Backend unavailable — start scripts\\restart-backend.bat");
         setExecuting(false);
         return;
       }
@@ -230,6 +393,8 @@ function StudioPageContent() {
           body: JSON.stringify({
             test_case_ids: [testCaseId],
             mode: "live",
+            embed_live: true,
+            headed: false,
             background: true,
             framework: activeAsset.framework,
             base_url: baseUrl,
@@ -242,10 +407,12 @@ function StudioPageContent() {
       setExecRunId(run.id);
 
       const poll = async () => {
+        if (debugPollStoppedRef.current) return;
         try {
           const updated = await apiFetch<DebugRunState & { logs?: string; summary?: { executor?: string } }>(
             `/api/v1/projects/${projectId}/executions/${run.id}`
           );
+          if (debugPollStoppedRef.current) return;
           setDebugRun(updated);
           if (updated.status === "running") {
             const phase = updated.progress?.detail ?? updated.progress?.phase ?? "Running Playwright…";
@@ -253,22 +420,30 @@ function StudioPageContent() {
             if (executor && executor !== "asset_live_v2") {
               setExecMessage("Stale backend detected — restart port 8000. Running stub executor, not real Playwright.");
             } else {
-              setExecMessage(`Live: ${phase}`);
+              const live = updated.summary?.embed_live ? " (live view in panel)" : updated.summary?.headed ? " (visible browser)" : "";
+              setExecMessage(`Live: ${phase}${live}`);
             }
-            setTimeout(poll, 400);
+            setTimeout(poll, 300);
             return;
           }
           const logs = updated.logs ?? "";
           const usedAsset = logs.includes("automation asset") || logs.includes("asset_live_v2");
           const result = updated.results?.find((r) => r.test_case_id === testCaseId) ?? updated.results?.[0];
           const label = result?.status ?? updated.status;
-          const err = result?.error ? `\n${result.error}` : "";
+          const errText = (result?.error ?? "").trim();
+          const err = errText ? `\n${errText.slice(0, 600)}` : "";
+          const videos = updated.results?.filter((r) => r.has_video).length ?? 0;
+          const videoNote = videos > 0 ? " Replay video is ready below." : "";
           if (!usedAsset) {
             setExecMessage(
-              `Debug finished (${label}) but did NOT run saved scripts — restart backend on port 8000.${err}${logs ? `\n${logs.slice(-400)}` : ""}`
+              `Debug finished (${label}) but did NOT run saved scripts — restart backend on port 8000.${err}`
             );
+          } else if (updated.status === "cancelled") {
+            setExecMessage("Debug stopped.");
+          } else if (label === "failed" && errText) {
+            setExecMessage(`Debug complete — failed${videoNote}${err}`);
           } else {
-            setExecMessage(`Debug complete — ${label}${err}${logs ? `\n${logs.slice(-400)}` : ""}`);
+            setExecMessage(`Debug complete — ${label}${videoNote}${err}`);
           }
         } catch (e) {
           setExecMessage(String(e));
@@ -310,9 +485,11 @@ function StudioPageContent() {
     setGenerating(true);
     setMessage("");
     try {
+      const body: Record<string, unknown> = { framework };
+      if (moduleQueryIds?.length) body.module_ids = moduleQueryIds;
       const asset = await apiFetch<AutomationAsset>(`/api/v1/projects/${projectId}/automation/generate`, {
         method: "POST",
-        body: JSON.stringify({ framework }),
+        body: JSON.stringify(body),
       });
       setAssets((prev) => [asset, ...prev]);
       selectAsset(asset);
@@ -618,7 +795,40 @@ function StudioPageContent() {
                 />
               </div>
               {sideTab === "files" && (
-                <FileTree files={activeAsset.files} activeFile={activeFile} onSelect={selectFile} />
+                <>
+                  <div className="px-2 pb-2 flex flex-wrap items-center gap-1 border-b border-[var(--border-default)]">
+                    <button
+                      type="button"
+                      onClick={selectAllFiles}
+                      className="text-[10px] text-brand-700 px-1"
+                      disabled={!activeAsset.files.length}
+                    >
+                      Select all
+                    </button>
+                    {selectedFilePaths.size > 0 && (
+                      <button
+                        type="button"
+                        onClick={deleteSelectedFiles}
+                        disabled={deletingFiles}
+                        className="text-[10px] ds-btn-secondary py-0.5 px-1.5 text-red-700 inline-flex items-center gap-1"
+                      >
+                        {deletingFiles ? (
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="w-2.5 h-2.5" />
+                        )}
+                        Delete ({selectedFilePaths.size})
+                      </button>
+                    )}
+                  </div>
+                  <FileTree
+                    files={activeAsset.files}
+                    activeFile={activeFile}
+                    selectedPaths={selectedFilePaths}
+                    onSelect={selectFile}
+                    onToggleSelect={toggleFileSelect}
+                  />
+                </>
               )}
               {sideTab === "flow" && (
                 <div className="py-2 px-1 max-h-[420px] overflow-auto space-y-1">
@@ -648,8 +858,8 @@ function StudioPageContent() {
                         onClick={() => setSelectedTestCaseId(tc.id)}
                         className={`flex-1 text-left px-1 py-2 rounded text-xs ${selectedTestCaseId === tc.id ? "bg-brand-50 ring-1 ring-brand-200" : "hover:bg-[var(--surface-sunken)]"}`}
                       >
-                        <span className={`font-medium block truncate ${disabled ? "line-through" : ""}`}>{tc.title}</span>
-                        <span className="text-[var(--text-tertiary)]">{tc.steps?.length ?? 0} steps · {tc.status}</span>
+                        <span className={`font-medium block truncate ${disabled ? "line-through" : ""}`}>{tc.case_code || tc.title}</span>
+                        <span className="text-[var(--text-tertiary)]">{tc.module_name ? `${tc.module_name} · ` : ""}{tc.steps?.length ?? 0} steps · {tc.status}</span>
                       </button>
                       {!disabled && (
                         <button type="button" onClick={() => debugTestCase(tc.id)} disabled={executing} className="ds-btn-ghost p-1 shrink-0" title="Debug">
@@ -711,30 +921,122 @@ function StudioPageContent() {
                       {selectedTestCase?.title ?? activeFile ?? "Test flow"}
                     </span>
                     {selectedTestCase && (
-                      <button
-                        onClick={() => debugTestCase(selectedTestCase.id)}
-                        disabled={executing}
-                        className="ds-btn-secondary text-xs py-1"
-                      >
-                        {executing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Bug className="w-3 h-3" />}
-                        Debug flow
-                      </button>
+                      <div className="flex items-center gap-2">
+                        {debugRun?.status === "running" && (
+                          <button
+                            type="button"
+                            onClick={stopDebugRun}
+                            className="ds-btn-secondary text-xs py-1 border-red-200 text-red-700 hover:bg-red-50"
+                          >
+                            <Square className="w-3 h-3 fill-current" />
+                            Stop
+                          </button>
+                        )}
+                        <button
+                          onClick={() => debugTestCase(selectedTestCase.id)}
+                          disabled={executing}
+                          className="ds-btn-secondary text-xs py-1"
+                        >
+                          {executing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Bug className="w-3 h-3" />}
+                          Debug flow
+                        </button>
+                      </div>
                     )}
                   </div>
                   <div className="flex-1 overflow-auto p-4">
                     {debugRun?.status === "running" && (
-                      <div className="mb-3 rounded-lg border border-brand-200 bg-brand-50 px-3 py-2 text-xs text-brand-900">
-                        <p className="font-semibold flex items-center gap-2">
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          Live Playwright execution
+                      <div className="mb-4 rounded-xl border-2 border-brand-300 bg-black/95 shadow-lg overflow-hidden">
+                        <div className="px-3 py-2 bg-brand-900/90 flex items-center justify-between">
+                          <p className="text-xs font-semibold text-white flex items-center gap-2">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            Live browser
+                          </p>
+                          <span className="text-[10px] text-brand-200">
+                            {debugRun.progress?.detail ?? "Syncing with Playwright…"}
+                          </span>
+                        </div>
+                        {projectId && debugRun.id && (
+                          <img
+                            alt="Live browser view"
+                            className="w-full min-h-[280px] max-h-[420px] object-contain bg-slate-950"
+                            src={executionLiveFrameUrl(projectId, debugRun.id, liveFrameTick)}
+                            onLoad={(e) => { (e.target as HTMLImageElement).style.opacity = "1"; }}
+                            onError={(e) => { (e.target as HTMLImageElement).style.opacity = "0.85"; }}
+                          />
+                        )}
+                        <p className="px-3 py-1.5 text-[10px] text-brand-200/80 border-t border-brand-800">
+                          Step highlight updates as each action runs in the browser.
                         </p>
-                        <p className="mt-1 text-brand-800">{debugRun.progress?.detail ?? "Starting…"}</p>
+                      </div>
+                    )}
+                    {debugResult?.has_video && projectId && debugRun?.id && (
+                      <div className="mb-4 rounded-lg border border-[var(--border-default)] bg-[var(--surface-sunken)]/30 p-3">
+                        <p className="text-xs font-semibold mb-2 flex items-center gap-1.5 text-[var(--text-secondary)]">
+                          <Video className="w-3.5 h-3.5" />
+                          Debug replay
+                        </p>
+                        <video
+                          key={`${debugRun.id}-${debugResult.video_id ?? "0"}`}
+                          controls
+                          className="w-full max-h-80 rounded-lg border border-[var(--border-default)] bg-black"
+                          src={executionVideoUrl(projectId, debugRun.id, debugResult.video_id ?? "0")}
+                          preload="metadata"
+                        />
+                        <p className="mt-2 text-[10px] text-[var(--text-tertiary)]">
+                          Also available on{" "}
+                          <Link href="/executions" className="text-brand-700 hover:underline">Executions</Link>
+                        </p>
+                      </div>
+                    )}
+                    {selectedTestCase && debugRun?.status !== "running" && (
+                      <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-[var(--border-default)] bg-[var(--surface-sunken)]/40 px-3 py-2">
+                        <span className="text-xs text-[var(--text-secondary)] mr-auto">
+                          {selectedFlowStepIndex != null
+                            ? `Step ${selectedFlowStepIndex + 1} selected`
+                            : "Select a step to disable or delete"}
+                        </span>
+                        {selectedFlowStepIndex != null && (
+                          <>
+                            {!selectedFlowStep?.disabled && (
+                              <button
+                                type="button"
+                                disabled={savingStep}
+                                onClick={disableSelectedFlowStep}
+                                className="ds-btn-secondary text-xs py-1"
+                              >
+                                <Ban className="w-3 h-3 inline" /> Disable step
+                              </button>
+                            )}
+                            {selectedFlowStep?.disabled && (
+                              <button
+                                type="button"
+                                disabled={savingStep}
+                                onClick={enableSelectedFlowStep}
+                                className="ds-btn-secondary text-xs py-1"
+                              >
+                                <RotateCcw className="w-3 h-3 inline" /> Enable step
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              disabled={savingStep}
+                              onClick={deleteSelectedFlowStep}
+                              className="ds-btn-secondary text-xs py-1 text-red-700 border-red-200"
+                            >
+                              <Trash2 className="w-3 h-3 inline" /> Delete step
+                            </button>
+                          </>
+                        )}
+                        {savingStep && <Loader2 className="w-3.5 h-3.5 animate-spin text-brand-700" />}
                       </div>
                     )}
                     <TestCaseFlowView
                       title={selectedTestCase?.title ?? (activeFile ? `Script: ${activeFile}` : undefined)}
-                      steps={debugFlowState.steps}
-                      activeStepIndex={debugFlowState.activeStepIndex}
+                      steps={debugRun?.status === "running" ? debugFlowState.steps : flowStepsForSelected()}
+                      activeStepIndex={debugRun?.status === "running" ? debugFlowState.activeStepIndex : null}
+                      selectedStepIndex={debugRun?.status === "running" ? null : selectedFlowStepIndex}
+                      editable={Boolean(selectedTestCase && debugRun?.status !== "running")}
+                      onSelectStep={(index) => setSelectedFlowStepIndex(index)}
                     />
                   </div>
                 </div>

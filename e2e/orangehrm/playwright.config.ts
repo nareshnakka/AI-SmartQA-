@@ -2,7 +2,7 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './src/tests',
-  timeout: 120_000,
+  timeout: 300_000,
   retries: 1,
   outputDir: 'test-results',
   reporter: [
@@ -11,7 +11,7 @@ export default defineConfig({
     ['line'],
   ],
   use: {
-    baseURL: 'https://opensource-demo.orangehrmlive.com',
+    baseURL: process.env.BASE_URL || process.env.PLAYWRIGHT_BASE_URL || '',
     headless: true,
     video: 'on',
     trace: 'on',

@@ -11,16 +11,10 @@ import {
   Suspense,
 } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { apiFetch } from "@/lib/api";
+import { fetchProjects, type ProjectListItem } from "@/lib/projects";
 import { getStoredProjectId, setStoredProjectId } from "@/lib/active-project";
 
-export interface ActiveProject {
-  id: string;
-  name: string;
-  description?: string | null;
-  requirement_count?: number;
-  test_case_count?: number;
-}
+export type ActiveProject = ProjectListItem;
 
 interface ProjectContextValue {
   projectId: string;
@@ -54,7 +48,7 @@ function ProjectProviderInner({ children }: { children: ReactNode }) {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    apiFetch<ActiveProject[]>("/api/v1/projects")
+    fetchProjects()
       .then((list) => {
         if (cancelled) return;
         setProjects(list);
@@ -74,8 +68,19 @@ function ProjectProviderInner({ children }: { children: ReactNode }) {
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
-    return () => { cancelled = true; };
-  }, [searchParams]);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const fromUrl = searchParams.get("project");
+    if (!fromUrl || !projects.length) return;
+    if (projects.some((p) => p.id === fromUrl)) {
+      setProjectIdState((prev) => (prev === fromUrl ? prev : fromUrl));
+      setStoredProjectId(fromUrl);
+    }
+  }, [searchParams, projects]);
 
   const setProjectId = useCallback(
     (id: string) => {

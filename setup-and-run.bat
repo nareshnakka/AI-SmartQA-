@@ -20,15 +20,15 @@ echo   One-click setup: install dependencies, start, open app
 echo ============================================================
 echo.
 
-call :banner "Step 1/6 - Checking Python"
+call :banner "Step 1/7 - Checking Python"
 call :ensure_python
 if errorlevel 1 goto :fail
 
-call :banner "Step 2/6 - Checking Node.js and npm"
+call :banner "Step 2/7 - Checking Node.js and npm"
 call :ensure_node
 if errorlevel 1 goto :fail
 
-call :banner "Step 3/6 - Environment file"
+call :banner "Step 3/7 - Environment file"
 if not exist "%ROOT%\.env" (
   if exist "%ROOT%\.env.example" (
     copy /Y "%ROOT%\.env.example" "%ROOT%\.env" >nul
@@ -44,18 +44,19 @@ if not exist "%BACKEND%\.env" if exist "%ROOT%\.env" (
   echo Synced .env to backend folder.
 )
 
-call :banner "Step 4/6 - Backend (Python venv + packages)"
+call :banner "Step 4/7 - Backend (Python venv + core packages)"
 call :setup_backend
 if errorlevel 1 goto :fail
 
-call :banner "Step 5/6 - Playwright browser (for live debug / automation)"
-call :setup_playwright
+call :banner "Step 5/7 - Automation and performance runners"
+call :setup_runners
 if errorlevel 1 goto :fail
 
-call :banner "Step 6/6 - Frontend (npm packages)"
+call :banner "Step 6/7 - Frontend (npm packages)"
 call :setup_frontend
 if errorlevel 1 goto :fail
 
+call :banner "Step 7/7 - Starting servers"
 echo.
 echo ============================================================
 echo   Setup complete. Starting servers...
@@ -85,6 +86,8 @@ echo   API:     http://127.0.0.1:%BACKEND_PORT%
 echo   API docs: http://127.0.0.1:%BACKEND_PORT%/docs
 echo.
 echo   Two terminal windows were opened (backend + frontend).
+echo   IMPORTANT: Keep the BACKEND window open — closing it causes "Failed to fetch".
+echo   Verify API: http://127.0.0.1:%BACKEND_PORT%/health
 echo   Close those windows to stop the servers, or run:
 echo     scripts\stop-servers.bat
 echo ============================================================
@@ -114,6 +117,10 @@ set "PATH=%PATH%;%ProgramFiles%\Python313;%ProgramFiles%\Python313\Scripts"
 set "PATH=%PATH%;%ProgramFiles%\Python312;%ProgramFiles%\Python312\Scripts"
 set "PATH=%PATH%;%ProgramFiles%\Python311;%ProgramFiles%\Python311\Scripts"
 set "PATH=%PATH%;%ProgramFiles%\nodejs"
+set "PATH=%PATH%;%ProgramFiles%\k6"
+set "PATH=%PATH%;%ProgramFiles%\Apache\maven\bin"
+set "PATH=%PATH%;%ProgramFiles%\Microsoft\jdk-17\bin"
+set "PATH=%PATH%;%ProgramFiles%\Eclipse Adoptium\jdk-17\bin"
 exit /b 0
 
 :find_python
@@ -232,17 +239,37 @@ if errorlevel 1 (
   echo pip install failed.
   exit /b 1
 )
-echo Backend packages installed.
-exit /b 0
+echo Backend core packages installed.
 
-:setup_playwright
-cd /d "%BACKEND%"
-echo Installing Playwright Chromium (used for Studio debug / live runs)...
+echo.
+echo Installing Playwright Chromium browsers ^(required for Discovery and Studio debug^)...
+echo This downloads ~300MB on first run — do not skip this step.
 call ".venv\Scripts\python.exe" -m playwright install chromium
 if errorlevel 1 (
-  echo Playwright browser install failed - debug runs may not work until you run:
-  echo   cd backend ^& .venv\Scripts\python.exe -m playwright install chromium
-  rem Non-fatal - app still runs
+  echo.
+  echo ERROR: Playwright browser download failed.
+  echo Retry: scripts\install-playwright.bat
+  echo Or manually: cd backend ^&^& .venv\Scripts\python.exe -m playwright install chromium
+  exit /b 1
+)
+call ".venv\Scripts\python.exe" scripts\verify_playwright.py
+if errorlevel 1 (
+  echo Playwright verification failed after browser install.
+  exit /b 1
+)
+echo Playwright Chromium ready.
+exit /b 0
+
+:setup_runners
+cd /d "%BACKEND%"
+echo Installing Playwright, Cypress, WDIO, Robot, k6, Locust, JMeter helpers...
+echo This may take 15-30 minutes on first run.
+call ".venv\Scripts\python.exe" scripts\install_all_runners.py
+if errorlevel 1 (
+  echo.
+  echo ERROR: Runner setup failed.
+  echo Retry: scripts\install-all-runners.bat
+  exit /b 1
 )
 exit /b 0
 

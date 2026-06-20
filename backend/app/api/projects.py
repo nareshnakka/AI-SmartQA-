@@ -18,13 +18,29 @@ router = APIRouter(prefix="/projects", tags=["Projects"])
 
 
 async def _project_counts(db: AsyncSession, project_id: uuid.UUID) -> tuple[int, int]:
-    req_count = await db.scalar(
-        select(func.count()).select_from(RequirementModel).where(RequirementModel.project_id == project_id)
+    counts = await _batch_project_counts(db, [project_id])
+    return counts.get(project_id, (0, 0))
+
+
+async def _batch_project_counts(
+    db: AsyncSession, project_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, tuple[int, int]]:
+    if not project_ids:
+        return {}
+
+    req_rows = await db.execute(
+        select(RequirementModel.project_id, func.count())
+        .where(RequirementModel.project_id.in_(project_ids))
+        .group_by(RequirementModel.project_id)
     )
-    case_count = await db.scalar(
-        select(func.count()).select_from(TestCaseModel).where(TestCaseModel.project_id == project_id)
+    case_rows = await db.execute(
+        select(TestCaseModel.project_id, func.count())
+        .where(TestCaseModel.project_id.in_(project_ids))
+        .group_by(TestCaseModel.project_id)
     )
-    return req_count or 0, case_count or 0
+    req_map = {row[0]: int(row[1]) for row in req_rows.all()}
+    case_map = {row[0]: int(row[1]) for row in case_rows.all()}
+    return {pid: (req_map.get(pid, 0), case_map.get(pid, 0)) for pid in project_ids}
 
 
 def _to_response(project: ProjectModel, req_count: int, case_count: int) -> ProjectResponse:
@@ -43,11 +59,8 @@ def _to_response(project: ProjectModel, req_count: int, case_count: int) -> Proj
 async def list_projects(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ProjectModel).order_by(ProjectModel.created_at.desc()))
     projects = result.scalars().all()
-    out = []
-    for p in projects:
-        rc, cc = await _project_counts(db, p.id)
-        out.append(_to_response(p, rc, cc))
-    return out
+    counts = await _batch_project_counts(db, [p.id for p in projects])
+    return [_to_response(p, *counts.get(p.id, (0, 0))) for p in projects]
 
 
 @router.post("", response_model=ProjectResponse, status_code=201)

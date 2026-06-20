@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useState, useMemo } from "react";
 import Link from "next/link";
 import {
   Sparkles, Loader2, PlayCircle, Zap, GitBranch, FileText, Rocket,
@@ -10,6 +10,8 @@ import { AppShell } from "@/components/shell/AppShell";
 import { PageHeader, Badge, Tabs } from "@/components/ui";
 import { apiFetch } from "@/lib/api";
 import { useActiveProject } from "@/context/ProjectContext";
+import { fetchTestCases } from "@/lib/test-cases";
+import { useWorkspaceScope } from "@/lib/workspace";
 
 interface LlmProvider { name: string; models: string[]; available: boolean }
 interface StudioOverview {
@@ -21,13 +23,14 @@ interface StudioOverview {
 }
 interface Sprint { id: string; name: string; goal?: string; status: string; test_case_ids: string[] }
 interface Release { id: string; name: string; version: string; status: string; sprint_ids: string[] }
-interface TestCase { id: string; title: string; steps?: string[] }
+interface TestCase { id: string; title: string; case_code?: string | null; module_id?: string | null; module_name?: string | null; steps?: string[] }
 
 const WORKLOADS = ["smoke", "load", "stress", "soak", "spike"];
 const FRAMEWORKS = ["playwright", "cypress", "selenium", "webdriverio"];
 
 function QualityStudioContent() {
   const { projectId, activeProject } = useActiveProject();
+  const { moduleQueryIds, environmentQueryIds, activeEnvironment } = useWorkspaceScope(projectId);
   const [overview, setOverview] = useState<StudioOverview | null>(null);
   const [tab, setTab] = useState("overview");
   const [llmProvider, setLlmProvider] = useState("qeos-native");
@@ -40,7 +43,7 @@ function QualityStudioContent() {
   const [autoInput, setAutoInput] = useState("");
   const [autoType, setAutoType] = useState("prompt");
   const [framework, setFramework] = useState("playwright");
-  const [baseUrl, setBaseUrl] = useState("https://opensource-demo.orangehrmlive.com");
+  const [baseUrl, setBaseUrl] = useState("");
 
   const [perfInput, setPerfInput] = useState("");
   const [perfType, setPerfType] = useState("prompt");
@@ -61,14 +64,22 @@ function QualityStudioContent() {
       apiFetch<StudioOverview>(`/api/v1/projects/${projectId}/quality-studio/overview`),
       apiFetch<Sprint[]>(`/api/v1/projects/${projectId}/quality-studio/sprints`),
       apiFetch<Release[]>(`/api/v1/projects/${projectId}/quality-studio/releases`),
-      apiFetch<TestCase[]>(`/api/v1/projects/${projectId}/test-cases`),
+      fetchTestCases(projectId, { moduleIds: moduleQueryIds, environmentIds: environmentQueryIds }),
     ]);
     setOverview(ov);
     setLlmProvider(ov.default_llm_provider || "qeos-native");
     setSprints(sp);
     setReleases(rel);
     setTestCases(tc);
-  }, [projectId]);
+  }, [projectId, moduleQueryIds, environmentQueryIds]);
+
+  const filteredTestCases = testCases;
+
+  useEffect(() => {
+    if (activeEnvironment?.base_url && !baseUrl) {
+      setBaseUrl(activeEnvironment.base_url);
+    }
+  }, [activeEnvironment, baseUrl]);
 
   useEffect(() => { loadStudio().catch(() => {}); }, [loadStudio]);
 
@@ -337,9 +348,8 @@ function QualityStudioContent() {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <div className="ds-card p-5 space-y-4">
               <h2 className="text-sm font-semibold flex items-center gap-2"><GitBranch className="w-4 h-4" /> Sprints</h2>
-              <input className="ds-input text-sm" placeholder="Sprint name" value={newSprintName} onChange={(e) => setNewSprintName(e.target.value)} />
-              <div className="max-h-48 overflow-auto space-y-1 border rounded-md p-2">
-                {testCases.map((tc) => (
+              <input className="ds-input text-sm" placeholder="Sprint name" value={newSprintName} onChange={(e) => setNewSprintName(e.target.value)} /><div className="max-h-48 overflow-auto space-y-1 border rounded-md p-2">
+                {filteredTestCases.map((tc) => (
                   <label key={tc.id} className="flex items-center gap-2 text-xs cursor-pointer">
                     <input
                       type="checkbox"
@@ -352,10 +362,11 @@ function QualityStudioContent() {
                         });
                       }}
                     />
-                    <span className="truncate">{tc.title}</span>
+                    <span className="truncate font-mono">{tc.case_code || tc.title}</span>
+                    {tc.module_name && <span className="text-[var(--text-tertiary)] shrink-0">({tc.module_name})</span>}
                   </label>
                 ))}
-                {testCases.length === 0 && <p className="text-xs text-[var(--text-tertiary)]">Generate test cases first</p>}
+                {filteredTestCases.length === 0 && <p className="text-xs text-[var(--text-tertiary)]">No test cases for this module filter</p>}
               </div>
               <button onClick={createSprint} disabled={busy} className="ds-btn-primary text-sm">Create Sprint</button>
               <ul className="space-y-2">

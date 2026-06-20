@@ -27,6 +27,8 @@ class BatchRunRequest(BaseModel):
     mode: str = "live"
     apply_healing: bool = False
     background: bool = True
+    headed: bool = False
+    embed_live: bool = False
     run_name: str | None = None
     sprint: str | None = None
     release: str | None = None
@@ -62,6 +64,8 @@ async def batch_run(project_id: UUID, body: BatchRunRequest, db: AsyncSession = 
             mode=body.mode,
             apply_healing=body.apply_healing,
             background=body.background,
+            headed=body.headed,
+            embed_live=body.embed_live,
             run_name=body.run_name,
             sprint=body.sprint,
             release=body.release,
@@ -150,4 +154,51 @@ async def get_execution_video(
         media_type=media_type,
         filename=path.name,
         headers={"Accept-Ranges": "bytes"},
+    )
+
+
+@router.post("/{run_id}/cancel")
+async def cancel_execution(project_id: UUID, run_id: UUID, db: AsyncSession = Depends(get_db)):
+    svc = ExecutionService(db)
+    try:
+        run = await svc.cancel_run(project_id, run_id)
+        return svc.to_dict(run)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.get("/{run_id}/live-frame")
+async def get_execution_live_frame(
+    project_id: UUID,
+    run_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    from fastapi.responses import FileResponse, Response
+
+    from app.runners.playwright_runner import get_live_frame_path
+
+    svc = ExecutionService(db)
+    run = await svc.get_run(run_id)
+    if not run or run.project_id != project_id:
+        raise HTTPException(404, "Execution run not found")
+
+    path = get_live_frame_path(project_id, run_id)
+    if path and path.stat().st_size > 256:
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        )
+
+    detail = (run.progress or {}).get("detail") or "Starting browser…"
+    phase = (run.progress or {}).get("phase") or "prepare"
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720">
+  <rect width="100%" height="100%" fill="#0f172a"/>
+  <text x="50%" y="46%" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="22" text-anchor="middle">Live browser</text>
+  <text x="50%" y="54%" fill="#64748b" font-family="system-ui,sans-serif" font-size="14" text-anchor="middle">{phase}: {detail}</text>
+</svg>"""
+    return Response(
+        content=svg.encode("utf-8"),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )

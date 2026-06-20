@@ -5,7 +5,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import agents, audit, auth, automation, copilot, discovery, environments, executions, integrations, intelligence, llm, monitoring, performance, pipelines, platform, projects, quality_studio, reports, test_generation
+from app.api import agents, audit, auth, automation, copilot, discovery, environments, executions, integrations, intelligence, llm, modules, monitoring, naming_patterns, performance, pipelines, platform, projects, quality_studio, reports, test_generation
 from app.config import settings
 from app.core.security import AuthMiddleware
 from app.db.session import init_db
@@ -59,6 +59,8 @@ app.add_middleware(AuthMiddleware)
 app.include_router(projects.router, prefix="/api/v1")
 app.include_router(quality_studio.router, prefix="/api/v1")
 app.include_router(test_generation.router, prefix="/api/v1")
+app.include_router(modules.router, prefix="/api/v1")
+app.include_router(naming_patterns.router, prefix="/api/v1")
 app.include_router(automation.router, prefix="/api/v1")
 app.include_router(performance.router, prefix="/api/v1")
 app.include_router(pipelines.router, prefix="/api/v1")
@@ -79,11 +81,24 @@ app.include_router(platform.router, prefix="/api/v1")
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
+    from app.runners.capabilities import get_runner_capabilities, playwright_python_available
+    from app.runners.setup_status import _playwright_browsers_on_disk
+
+    # Fast on-disk check — never use sync Playwright on the uvicorn event loop.
+    pw_ok, pw_hint = _playwright_browsers_on_disk()
+    caps = get_runner_capabilities()
     return HealthResponse(
         status="healthy",
         version="2.1.0",
         timestamp=datetime.now(timezone.utc),
         execution_executor="asset_live_v2",
+        playwright_python=playwright_python_available(),
+        playwright_browsers=pw_ok,
+        playwright_hint=pw_hint if not pw_ok else None,
+        runners_ready={
+            "automation": {k: v["ready"] for k, v in caps.get("automation", {}).items()},
+            "performance": {k: v["ready"] for k, v in caps.get("performance", {}).items()},
+        },
     )
 
 

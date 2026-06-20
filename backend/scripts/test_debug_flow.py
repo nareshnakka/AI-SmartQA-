@@ -1,5 +1,6 @@
 """Test debug flow batch execution."""
 import json
+import os
 import time
 import urllib.request
 
@@ -37,7 +38,7 @@ def main() -> None:
             "mode": "live",
             "background": True,
             "framework": "playwright",
-            "base_url": "https://opensource-demo.orangehrmlive.com",
+            "base_url": os.environ.get("BASE_URL", "https://example.com"),
         },
     )
     run_id = run["id"]

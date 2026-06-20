@@ -270,11 +270,32 @@ async def run_framework(
     framework: str,
     timeout_sec: int | None = None,
     on_progress: Callable[[str, str], Awaitable[None]] | None = None,
+    *,
+    test_glob: str | None = None,
+    headed: bool = False,
+    embed_live: bool = False,
+    progress_path: Path | None = None,
+    live_frame_path: Path | None = None,
+    total_steps: int = 15,
+    on_step_progress: Callable[[dict], Awaitable[None]] | None = None,
+    cancel_run_id: str | None = None,
 ) -> dict:
     timeout_sec = timeout_sec or settings.execution_timeout_sec
 
     if framework == "playwright":
-        return await run_playwright(workspace, timeout_sec, on_progress=on_progress)
+        return await run_playwright(
+            workspace,
+            timeout_sec,
+            on_progress=on_progress,
+            test_glob=test_glob,
+            headed=headed,
+            embed_live=embed_live,
+            progress_path=progress_path,
+            live_frame_path=live_frame_path,
+            total_steps=total_steps,
+            on_step_progress=on_step_progress,
+            cancel_run_id=cancel_run_id,
+        )
 
     if not node_available() and framework in ("cypress", "puppeteer", "testcafe", "webdriverio"):
         return _structured_dry_run(workspace, framework, "Node.js required for live execution")

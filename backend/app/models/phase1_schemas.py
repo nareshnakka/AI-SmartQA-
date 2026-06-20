@@ -2,6 +2,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -59,9 +61,14 @@ class RequirementResponse(BaseModel):
 class TestCaseResponse(BaseModel):
     id: UUID
     project_id: UUID
+    module_id: UUID | None = None
+    module_name: str | None = None
+    environment_id: UUID | None = None
+    environment_name: str | None = None
+    case_code: str | None = None
     title: str
     description: str
-    steps: list[str]
+    steps: list[str | dict[str, Any]]
     expected_results: list[str]
     priority: str
     tags: list[str]
@@ -72,13 +79,26 @@ class TestCaseResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class TestCaseCreate(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    steps: list[str | dict[str, Any]] = Field(default_factory=list)
+    expected_results: list[str] = Field(default_factory=list)
+    priority: str = "medium"
+    module_id: UUID | None = None
+    module_name: str | None = None
+    environment_id: UUID | None = None
+
+
 class TestCaseUpdate(BaseModel):
     title: str | None = None
     description: str | None = None
-    steps: list[str] | None = None
+    steps: list[str | dict[str, Any]] | None = None
     expected_results: list[str] | None = None
     priority: str | None = None
     status: str | None = None
+    module_id: UUID | None = None
+    environment_id: UUID | None = None
 
 
 class TestCaseBulkAction(BaseModel):

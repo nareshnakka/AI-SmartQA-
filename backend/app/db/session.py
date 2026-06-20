@@ -36,9 +36,11 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_sqlite)
     async with AsyncSessionLocal() as session:
         from app.services.auth import seed_default_admin
+        from app.services.modules import backfill_module_environments
         from app.services.runner_agent import ensure_localhost_agent
         await seed_default_admin(session)
         await ensure_localhost_agent(session)
+        await backfill_module_environments(session)
         await session.commit()
 
 
@@ -63,6 +65,11 @@ def _migrate_sqlite(conn) -> None:
         ("execution_runs", "release", "VARCHAR(100)"),
         ("execution_runs", "agent_id", "VARCHAR(36)"),
         ("execution_runs", "progress", "JSON"),
+        ("test_cases", "module_id", "CHAR(36)"),
+        ("test_cases", "environment_id", "CHAR(36)"),
+        ("project_modules", "environment_id", "CHAR(36)"),
+        ("projects", "naming_patterns", "JSON"),
+        ("test_cases", "case_code", "VARCHAR(120)"),
     ]
     for table, column, col_type in migrations:
         try:

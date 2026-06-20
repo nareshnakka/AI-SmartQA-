@@ -16,12 +16,18 @@ router = APIRouter(prefix="/projects/{project_id}/automation", tags=["Phase 2 â€
 class GenerateAutomationRequest(BaseModel):
     framework: str = "playwright"
     test_case_ids: list[str] | None = None
+    module_ids: list[UUID] | None = None
     name: str | None = None
 
 
 class UpdateFileRequest(BaseModel):
     path: str
     content: str
+    save_version: bool = True
+
+
+class DeleteFilesRequest(BaseModel):
+    paths: list[str]
     save_version: bool = True
 
 
@@ -55,7 +61,9 @@ async def generate_automation(
 ):
     svc = AutomationService(db)
     try:
-        asset = await svc.generate(project_id, body.framework, body.test_case_ids, body.name)
+        asset = await svc.generate(
+            project_id, body.framework, body.test_case_ids, body.name, body.module_ids
+        )
         return svc.to_dict(asset)
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -147,6 +155,20 @@ async def update_file(
         return svc.to_dict(asset)
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+
+@router.post("/assets/{asset_id}/files/delete")
+async def delete_files(
+    project_id: UUID, asset_id: UUID, body: DeleteFilesRequest, db: AsyncSession = Depends(get_db)
+):
+    svc = AutomationService(db)
+    try:
+        asset = await svc.delete_files(asset_id, body.paths, body.save_version)
+        if asset.project_id != project_id:
+            raise HTTPException(404)
+        return svc.to_dict(asset)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.get("/assets/{asset_id}/versions")

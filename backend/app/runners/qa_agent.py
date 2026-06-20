@@ -46,11 +46,25 @@ async def navigate_as_qa_user(
     use_isolated = sys.platform == "win32"
 
     async def _run(on_event_cb) -> dict:
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
+        from app.runners.setup_status import _playwright_browsers_on_disk
+
+        pw_ok, pw_hint = _playwright_browsers_on_disk()
+        if not pw_ok:
             return await _fallback_http_agent(
-                *_agent_urls(base_url), max_pages or settings.discovery_max_pages, on_event_cb
+                *_agent_urls(base_url),
+                max_pages or settings.discovery_max_pages,
+                on_event_cb,
+                reason=pw_hint,
+            )
+
+        try:
+            from playwright.async_api import async_playwright  # noqa: F401
+        except ImportError as exc:
+            return await _fallback_http_agent(
+                *_agent_urls(base_url),
+                max_pages or settings.discovery_max_pages,
+                on_event_cb,
+                reason=str(exc) or "playwright package not installed",
             )
 
         try:
@@ -60,13 +74,23 @@ async def navigate_as_qa_user(
         except NotImplementedError:
             logger.warning("playwright_subprocess_unsupported", platform=sys.platform)
             return await _fallback_http_agent(
-                *_agent_urls(base_url), max_pages or settings.discovery_max_pages, on_event_cb
+                *_agent_urls(base_url),
+                max_pages or settings.discovery_max_pages,
+                on_event_cb,
+                reason="Playwright subprocess not supported on this platform",
             )
         except Exception as e:
             err = str(e) or type(e).__name__
             logger.warning("playwright_agent_failed", error=err)
+            from app.runners.setup_status import _playwright_browsers_on_disk
+
+            _, hint = _playwright_browsers_on_disk()
+            reason = hint or err[:300]
             return await _fallback_http_agent(
-                *_agent_urls(base_url), max_pages or settings.discovery_max_pages, on_event_cb
+                *_agent_urls(base_url),
+                max_pages or settings.discovery_max_pages,
+                on_event_cb,
+                reason=reason,
             )
 
     if use_isolated:
@@ -541,6 +565,7 @@ async def _probe_form(page, page_title: str, emit) -> dict | None:
         "priority": "high",
         "source": "qa_agent",
         "risk": "high",
+        "module": (page_title or "General").split()[0][:40],
         "screen": page_title,
         "steps": steps,
         "expected_results": [
@@ -559,6 +584,7 @@ def _menu_module_test(module_name: str, url: str, title: str) -> dict:
         "priority": "high",
         "source": "qa_agent",
         "risk": "high",
+        "module": module_name,
         "screen": title or module_name,
         "steps": [
             {"order": 1, "action": "navigate", "description": "Login and reach application dashboard", "url": url},
@@ -582,6 +608,7 @@ def _page_smoke_test(url: str, title: str, info: dict) -> dict:
         "priority": "medium",
         "source": "qa_agent",
         "risk": "medium",
+        "module": (title or "General").split()[0][:40] if title else "General",
         "screen": title,
         "steps": [
             {"order": 1, "action": "navigate", "description": f"Open {url}", "url": url},
@@ -604,6 +631,7 @@ def _link_navigation_test(from_url: str, from_title: str, link: dict) -> dict:
         "priority": "medium",
         "source": "qa_agent",
         "risk": "medium",
+        "module": (from_title or "General").split()[0][:40] if from_title else "General",
         "screen": from_title,
         "steps": [
             {"order": 1, "action": "navigate", "description": f"Start at {from_title or from_url}", "url": from_url},
@@ -717,7 +745,9 @@ def _same_origin(origin: str, url: str) -> bool:
         return False
 
 
-async def _fallback_http_agent(start_url: str, origin: str, max_pages: int, emit) -> dict:
+async def _fallback_http_agent(
+    start_url: str, origin: str, max_pages: int, emit, *, reason: str | None = None
+) -> dict:
     from app.runners.browser_discovery import crawl_application
 
     nav: list[dict] = []
@@ -727,7 +757,16 @@ async def _fallback_http_agent(start_url: str, origin: str, max_pages: int, emit
         nav.append(event)
         await emit(event)
 
-    await log_event({"type": "agent_start", "message": "Playwright unavailable — using HTTP crawl fallback"})
+    detail = reason or "browser automation not available"
+    await log_event({
+        "type": "agent_start",
+        "message": f"Playwright unavailable ({detail}) — using HTTP crawl fallback",
+    })
+    if reason and "install" in reason.lower():
+        await log_event({
+            "type": "warning",
+            "message": "Fix: run scripts\\install-playwright.bat from the project root, then restart the backend.",
+        })
     crawled = await crawl_application(start_url, max_pages=max_pages)
     for p in crawled.get("pages", []):
         await log_event({"type": "navigate", "message": f"Fetched {p.get('title') or p['url']}", "url": p["url"], "title": p.get("title")})

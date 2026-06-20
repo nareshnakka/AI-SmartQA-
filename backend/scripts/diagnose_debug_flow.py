@@ -1,5 +1,6 @@
 """Diagnose debug flow for End-to-end session walkthrough."""
 import json
+import os
 import time
 import urllib.request
 import urllib.error
@@ -37,7 +38,7 @@ def main():
         "mode": "live",
         "background": False,
         "framework": asset["framework"],
-        "base_url": "https://opensource-demo.orangehrmlive.com",
+        "base_url": os.environ.get("BASE_URL", "https://example.com"),
         "asset_id": asset["id"],
         "run_name": "Debug diagnose",
     }

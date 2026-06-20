@@ -42,12 +42,41 @@ This script will:
 
 - Install **Python 3.11+** and **Node.js LTS** via `winget` if they are missing
 - Create `backend\.venv` and install Python packages
-- Install Playwright Chromium (for live debug / automation runs)
+- Install **all automation & performance runners** (see table below)
 - Run `npm ci` in `frontend`
 - Start backend (`http://127.0.0.1:8000`) and frontend (`http://localhost:3000`)
 - Open the app in your default browser
 
-**First run can take 10–20 minutes** depending on network speed.
+**First run can take 20–40 minutes** depending on network speed (browser binaries and Node runner cache are large).
+
+### What gets installed
+
+| Category | Tool | Installed by setup |
+|----------|------|-------------------|
+| **Functional** | Playwright (Python + Node) | Yes — required |
+| | Cypress, Puppeteer, TestCafe, WebdriverIO | Yes — `runners-tools/` npm cache |
+| | Robot Framework + Browser library | Yes — pip + `rfbrowser init` |
+| | Selenium (Java/Maven) | Yes — via winget when available |
+| | Appium (Python client) | Yes — pip; Appium server is separate |
+| **Performance** | k6 (live runs) | Yes — via winget when available |
+| | Locust | Yes — pip |
+| | JMeter | Best-effort — winget |
+| | Gatling | Scripts generated for export; needs Gatling CLI to run |
+
+Re-run only runner setup anytime:
+
+```bat
+scripts\install-all-runners.bat
+```
+
+Check status:
+
+```bat
+cd backend
+.venv\Scripts\python.exe scripts\verify_all_runners.py
+```
+
+Or open `http://127.0.0.1:8000/api/v1/platform/capabilities` after the backend is running.
 
 If Python or Node was just installed, close the terminal, open a new one, and run `setup-and-run.bat` again so PATH is refreshed.
 
@@ -82,7 +111,11 @@ source .venv/bin/activate
 
 pip install --upgrade pip
 pip install -r requirements.txt
-python -m playwright install chromium
+pip install -r requirements-runners.txt
+python scripts/install_all_runners.py --skip-winget
+
+# Or on Windows after venv + requirements.txt:
+# scripts\install-all-runners.bat
 
 # 3. Frontend
 cd ../frontend
@@ -173,9 +206,11 @@ Use a [Personal Access Token](https://github.com/settings/tokens) or `gh auth lo
 
 | Issue | Fix |
 |-------|-----|
-| Port 8000 or 3000 already in use | Run `scripts\stop-servers.bat`, then restart |
+| `TypeError: Failed to fetch` in Studio / Executions | Backend not running. Run `scripts\restart-backend.bat` and keep that window open. Verify `http://127.0.0.1:8000/health` in a browser. |
 | Debug finishes in ~2s, no real browser | Stale backend — restart with `scripts\restart-all.bat` |
 | `npm` or `python` not found after winget install | Open a **new** terminal and run setup again |
-| Playwright debug fails | `cd backend && .venv\Scripts\python -m playwright install chromium` |
+| Runners missing (Discovery, debug, k6, Cypress, …) | `scripts\install-all-runners.bat` then `scripts\restart-backend.bat` |
+| Discovery HTTP crawl only | Same as above; verify `playwright_browsers: true` on `/health` |
+| Performance simulates instead of live k6 | `winget install GrafanaLabs.k6`, new terminal, `scripts\install-all-runners.bat` |
 
 For architecture and features, see [README.md](../README.md) and [docs/](.).

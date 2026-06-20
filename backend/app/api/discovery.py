@@ -61,6 +61,38 @@ async def get_session(project_id: UUID, session_id: UUID, db: AsyncSession = Dep
 
 class CommitTestsRequest(BaseModel):
     test_ids: list[str]
+    module_id: UUID | None = None
+    environment_id: UUID | None = None
+
+
+@router.post("/sessions/{session_id}/clear-navigation")
+async def clear_session_navigation(
+    project_id: UUID,
+    session_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    svc = DiscoveryService(db)
+    try:
+        session = await svc.clear_navigation_log(project_id, session_id)
+        await db.commit()
+        return svc.to_dict(session)
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_discovery_session(
+    project_id: UUID,
+    session_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    svc = DiscoveryService(db)
+    try:
+        await svc.delete_session(project_id, session_id)
+        await db.commit()
+        return {"deleted": True, "session_id": str(session_id)}
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from e
 
 
 @router.post("/sessions/{session_id}/commit-tests")
@@ -73,7 +105,28 @@ async def commit_proposed_tests(
 ):
     svc = DiscoveryService(db)
     try:
-        return await svc.commit_proposed_tests(project_id, session_id, body.test_ids)
+        result = await svc.commit_proposed_tests(project_id, session_id, body.test_ids, body.module_id, body.environment_id)
+        await db.commit()
+        session = await svc.get_session(session_id)
+        return {**result, "session": svc.to_dict(session) if session else None}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/sessions/{session_id}/dismiss-tests")
+async def dismiss_proposed_tests(
+    project_id: UUID,
+    session_id: UUID,
+    body: CommitTestsRequest,
+    db: AsyncSession = Depends(get_db),
+    _user: AuthUser = Depends(require_project("tester")),
+):
+    svc = DiscoveryService(db)
+    try:
+        result = await svc.dismiss_proposed_tests(project_id, session_id, body.test_ids)
+        await db.commit()
+        session = await svc.get_session(session_id)
+        return {**result, "session": svc.to_dict(session) if session else None}
     except ValueError as e:
         raise HTTPException(400, str(e))
 

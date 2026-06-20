@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     playwright_enabled: bool = True
     playwright_headless: bool = True
     playwright_timeout_ms: int = 30000
+    playwright_test_timeout_ms: int = 300_000
     discovery_max_pages: int = 15
     discovery_max_steps: int = 80
     discovery_agent_enabled: bool = True
