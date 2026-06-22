@@ -107,8 +107,11 @@ class EnvironmentService:
                 fields["env_type"] = slug_from_name(new_name)
 
         for key, value in fields.items():
-            if value is not None and hasattr(env, key):
-                setattr(env, key, value)
+            if key in fields and hasattr(env, key):
+                if key in ("base_url", "secrets_hint") and value == "":
+                    setattr(env, key, None)
+                elif value is not None:
+                    setattr(env, key, value)
         if fields.get("is_default"):
             for other in await self.list_environments(project_id):
                 if other.id != env_id:

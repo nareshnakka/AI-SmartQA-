@@ -10,22 +10,21 @@ from app.runners.playwright_runner import cleanup_workspace, persist_videos
 
 def map_steps_from_test_case(tc: dict, overall_status: str) -> list[dict]:
     """Map test case steps to statuses. Without real Playwright step data, do not fake passes."""
-    steps = tc.get("steps") or []
+    from app.services.test_steps import normalize_test_steps
+
+    steps = normalize_test_steps(tc.get("steps") or [])
     expected = tc.get("expected_results") or []
     mapped = []
     for i, step in enumerate(steps):
-        if isinstance(step, dict):
-            desc = step.get("description") or str(step)
-            if step.get("disabled"):
-                mapped.append({
-                    "order": i + 1,
-                    "description": desc,
-                    "status": "skipped",
-                    "expected": expected[i] if i < len(expected) else None,
-                })
-                continue
-        else:
-            desc = step if isinstance(step, str) else step.get("description", str(step))
+        desc = step.get("description") or str(step)
+        if step.get("disabled"):
+            mapped.append({
+                "order": i + 1,
+                "description": desc,
+                "status": "skipped",
+                "expected": expected[i] if i < len(expected) else None,
+            })
+            continue
         if overall_status == "passed":
             st = "passed"
         elif overall_status in ("failed", "passed_with_warnings"):

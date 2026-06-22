@@ -186,8 +186,14 @@ async def run_playwright(
     total_steps: int = 15,
     on_step_progress: StepProgressCallback | None = None,
     cancel_run_id: str | None = None,
+    base_url: str | None = None,
+    login_env: dict[str, str] | None = None,
 ) -> dict:
     timeout_sec = timeout_sec or settings.execution_timeout_sec
+
+    from app.runners.setup_status import configure_playwright_browsers_env
+
+    configure_playwright_browsers_env()
 
     async def progress(phase: str, detail: str) -> None:
         if on_progress:
@@ -275,6 +281,13 @@ async def run_playwright(
         test_args.append("--headed")
 
     extra_env: dict[str, str] = {}
+    if base_url:
+        from app.services.e2e_bundle import normalize_base_url
+
+        resolved = normalize_base_url(base_url)
+        if resolved:
+            extra_env["BASE_URL"] = resolved
+            extra_env["PLAYWRIGHT_BASE_URL"] = resolved
     if progress_path:
         progress_path.parent.mkdir(parents=True, exist_ok=True)
         extra_env["QEOS_PROGRESS_FILE"] = str(progress_path)
@@ -283,6 +296,8 @@ async def run_playwright(
         extra_env["QEOS_LIVE_FRAME"] = str(live_frame_path.resolve())
     if total_steps:
         extra_env["QEOS_TOTAL_STEPS"] = str(total_steps)
+    if login_env:
+        extra_env.update(login_env)
 
     if embed_live:
         await progress("playwright_test", "Running Playwright — live view in Studio…")

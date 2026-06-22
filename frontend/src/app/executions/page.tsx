@@ -19,7 +19,8 @@ import {
 interface TestCase {
   id: string; title: string; case_code?: string | null; module_id?: string | null; module_name?: string | null;
   priority: string; status: string;
-  steps: string[]; expected_results: string[];
+  steps: (string | { description?: string; action?: string; url?: string; order?: number; disabled?: boolean })[];
+  expected_results: string[];
 }
 interface TestStep { order: number; description: string; status: string; expected?: string }
 interface ExecutionResult {
@@ -78,9 +79,11 @@ export default function ExecutionsPage() {
   const { projectId } = useActiveProject();
   const [tab, setTab] = useState<"run" | "dashboard" | "history">("run");
   const [testCases, setTestCases] = useState<TestCase[]>([]);
+  const [testCasesById, setTestCasesById] = useState<Map<string, TestCase>>(new Map());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [runs, setRuns] = useState<ExecutionRun[]>([]);
   const [active, setActive] = useState<ExecutionRun | null>(null);
+  const [loadingRunDetail, setLoadingRunDetail] = useState(false);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [agent, setAgent] = useState<RunnerAgent | null>(null);
   const [running, setRunning] = useState(false);
@@ -99,9 +102,31 @@ export default function ExecutionsPage() {
   const [debugTestCaseId, setDebugTestCaseId] = useState<string | null>(null);
   const [animTick, setAnimTick] = useState(0);
   const [managing, setManaging] = useState(false);
-  const { moduleQueryIds, environmentQueryIds } = useWorkspaceScope(projectId);
+  const { moduleQueryIds, environmentQueryIds, activeEnvironment } = useWorkspaceScope(projectId);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const animRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
+
+  const selectRun = useCallback(async (runId: string) => {
+    if (!projectId) return;
+    activeRunIdRef.current = runId;
+    setLoadingRunDetail(true);
+    try {
+      const run = await apiFetch<ExecutionRun>(`/api/v1/projects/${projectId}/executions/${runId}`);
+      setActive(run);
+      setRuns((prev) => prev.map((r) => (r.id === runId ? run : r)));
+    } catch {
+      setActive(null);
+    } finally {
+      setLoadingRunDetail(false);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (activeEnvironment?.base_url) {
+      setBaseUrl(activeEnvironment.base_url);
+    }
+  }, [activeEnvironment?.id, activeEnvironment?.base_url]);
 
   useEffect(() => {
     apiFetch<{ frameworks: Framework[] }>("/api/v1/projects/x/automation/frameworks")
@@ -109,21 +134,36 @@ export default function ExecutionsPage() {
   }, []);
 
   const loadProjectData = useCallback(async (pid: string) => {
-    const [cases, runList, dash, ag, assets, perf] = await Promise.allSettled([
+    const [cases, allCases, runList, dash, ag, assets, perf] = await Promise.allSettled([
       fetchTestCases(pid, { moduleIds: moduleQueryIds, environmentIds: environmentQueryIds }),
+      fetchTestCases(pid, { environmentIds: environmentQueryIds }),
       apiFetch<ExecutionRun[]>(`/api/v1/projects/${pid}/executions`),
       apiFetch<Dashboard>(`/api/v1/projects/${pid}/executions/dashboard${filterSprint ? `?sprint=${filterSprint}` : ""}`),
       apiFetch<RunnerAgent>(`/api/v1/projects/${pid}/executions/runner-agent`),
       apiFetch<AutomationAsset[]>(`/api/v1/projects/${pid}/automation/assets`),
       apiFetch<PerfAsset[]>(`/api/v1/projects/${pid}/performance/assets`),
     ]);
-    if (cases.status === "fulfilled") setTestCases(cases.value);
-    if (runList.status === "fulfilled") { setRuns(runList.value); if (runList.value[0]) setActive(runList.value[0]); }
+    if (cases.status === "fulfilled") setTestCases(cases.value as TestCase[]);
+    if (allCases.status === "fulfilled") {
+      setTestCasesById(new Map((allCases.value as TestCase[]).map((tc) => [tc.id, tc])));
+    }
+    if (runList.status === "fulfilled") {
+      setRuns(runList.value);
+      const keepId = activeRunIdRef.current;
+      const targetId = keepId && runList.value.some((r) => r.id === keepId)
+        ? keepId
+        : runList.value[0]?.id;
+      if (targetId) {
+        await selectRun(targetId);
+      } else {
+        setActive(null);
+      }
+    }
     if (dash.status === "fulfilled") setDashboard(dash.value);
     if (ag.status === "fulfilled") setAgent(ag.value);
     if (assets.status === "fulfilled") setAutomationAssets(assets.value);
     if (perf.status === "fulfilled") setPerfAssets(perf.value);
-  }, [filterSprint, moduleQueryIds, environmentQueryIds]);
+  }, [filterSprint, moduleQueryIds, environmentQueryIds, selectRun]);
 
   const filteredAssets = automationAssets.filter((a) => a.framework === framework);
   const fwCap = agent?.framework_capabilities?.[framework];
@@ -133,11 +173,26 @@ export default function ExecutionsPage() {
     loadProjectData(projectId).catch(() => {});
   }, [projectId, loadProjectData]);
 
+  useEffect(() => {
+    if (tab === "history" && projectId && activeRunIdRef.current) {
+      selectRun(activeRunIdRef.current).catch(() => {});
+    }
+  }, [tab, projectId, selectRun]);
+
+  const lookupTestCase = useCallback(
+    (testCaseId?: string) => {
+      if (!testCaseId) return undefined;
+      return testCasesById.get(testCaseId) ?? testCases.find((t) => t.id === testCaseId);
+    },
+    [testCasesById, testCases]
+  );
+
   const pollRun = useCallback((pid: string, runId: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
       try {
         const run = await apiFetch<ExecutionRun>(`/api/v1/projects/${pid}/executions/${runId}`);
+        activeRunIdRef.current = runId;
         setActive(run);
         setRuns((prev) => prev.map((r) => (r.id === runId ? run : r)));
         if (run.status !== "running") {
@@ -203,13 +258,7 @@ export default function ExecutionsPage() {
     if (!projectId) return;
     const tc = testCases.find((t) => t.id === testCaseId);
     if (!tc || !isAutomationEnabled(tc)) return;
-    const matchedAsset = assetId
-      ? automationAssets.find((a) => a.id === assetId)
-      : automationAssets.find((a) => a.framework === framework);
-    if (!matchedAsset) {
-      alert("Select an automation asset first. Debug runs saved Playwright scripts — not step stubs.");
-      return;
-    }
+    const matchedAsset = assetId ? automationAssets.find((a) => a.id === assetId) : undefined;
     setDebugTestCaseId(testCaseId);
     setFlowPreviewId(testCaseId);
     setRunning(true);
@@ -222,15 +271,17 @@ export default function ExecutionsPage() {
           test_case_ids: [testCaseId],
           mode: "live",
           background: true,
-          framework: matchedAsset.framework,
+          framework: matchedAsset?.framework ?? framework,
           base_url: baseUrl,
           run_type: "automation",
-          asset_id: matchedAsset.id,
+          ...(matchedAsset ? { asset_id: matchedAsset.id } : {}),
           run_name: `Debug — ${tc.title}`,
         }),
       });
       setRuns((prev) => [run, ...prev]);
+      activeRunIdRef.current = run.id;
       setActive(run);
+      setTab("history");
       pollRun(projectId, run.id);
     } catch {
       setRunning(false);
@@ -275,10 +326,6 @@ export default function ExecutionsPage() {
 
   const batchRun = async () => {
     if (!projectId) return;
-    if (runType === "automation" && !assetId) {
-      alert("Select an automation asset. Live Playwright runs real scripts from the asset — not auto-generated stubs.");
-      return;
-    }
     const runnableIds = Array.from(selected).filter((id) => {
       const tc = testCases.find((t) => t.id === id);
       return tc && isAutomationEnabled(tc);
@@ -298,18 +345,24 @@ export default function ExecutionsPage() {
           base_url: baseUrl,
           run_type: runType,
           framework: runType === "automation" ? framework : undefined,
-          asset_id: runType === "automation" && assetId ? assetId : undefined,
+          ...(runType === "automation" && assetId ? { asset_id: assetId } : {}),
           performance_asset_id: runType === "performance" ? perfAssetId : undefined,
           run_name: `${runType === "performance" ? "Performance" : frameworks.find((f) => f.id === framework)?.name ?? framework} — ${runType === "performance" ? "load test" : `${runnableIds.length} tests`}`,
         }),
       });
       setRuns((prev) => [run, ...prev]);
+      activeRunIdRef.current = run.id;
       setActive(run);
       setTab("history");
       pollRun(projectId, run.id);
     } catch {
       setRunning(false);
     }
+  };
+
+  const openRunInHistory = (runId: string) => {
+    setTab("history");
+    selectRun(runId).catch(() => {});
   };
 
   return (
@@ -460,13 +513,18 @@ export default function ExecutionsPage() {
                         </>
                       )}
                     </select>
-                    {filteredAssets.length > 0 && (
+                    {runType === "automation" && (
                       <select className="ds-input text-sm" value={assetId} onChange={(e) => setAssetId(e.target.value)}>
-                        <option value="">Generated specs (from test cases)</option>
+                        <option value="">Replay test case steps (default — after Discovery import)</option>
                         {filteredAssets.map((a) => (
-                          <option key={a.id} value={a.id}>{a.name}</option>
+                          <option key={a.id} value={a.id}>{a.name} — saved scripts</option>
                         ))}
                       </select>
+                    )}
+                    {runType === "automation" && !assetId && (
+                      <p className="text-xs text-[var(--text-secondary)] bg-[var(--surface-sunken)] p-2 rounded-md">
+                        Runs Playwright against your stored test steps and Base URL. Generate an asset in Automation IDE only if you need custom saved scripts.
+                      </p>
                     )}
                     {fwCap && !fwCap.live && (
                       <p className="text-xs text-amber-700 bg-amber-50 p-2 rounded-md">{fwCap.hint}</p>
@@ -545,7 +603,7 @@ export default function ExecutionsPage() {
               <thead><tr><th>Run</th><th>Status</th><th>Passed</th><th>Failed</th><th>Sprint</th><th>Release</th><th>Started</th><th>Ended</th></tr></thead>
               <tbody>
                 {dashboard.timeline.map((t) => (
-                  <tr key={t.id} className="text-xs cursor-pointer hover:bg-brand-50" onClick={() => { setActive(runs.find(r => r.id === t.id) || null); setTab("history"); }}>
+                  <tr key={t.id} className="text-xs cursor-pointer hover:bg-brand-50" onClick={() => openRunInHistory(t.id)}>
                     <td>{t.name}</td>
                     <td><Badge variant={t.status === "completed" ? "success" : t.status === "failed" ? "error" : "neutral"}>{t.status}</Badge></td>
                     <td>{t.passed}</td>
@@ -567,8 +625,11 @@ export default function ExecutionsPage() {
           <div className="ds-card">
             <div className="ds-card-header"><h2 className="text-sm font-semibold">Run History</h2></div>
             <div className="ds-card-body space-y-1 pt-0 max-h-[520px] overflow-auto">
+              {runs.length === 0 && (
+                <p className="text-xs text-[var(--text-tertiary)] py-6 text-center">No runs yet — execute tests from the Run Tests tab.</p>
+              )}
               {runs.map((r) => (
-                <button key={r.id} onClick={() => setActive(r)}
+                <button key={r.id} onClick={() => openRunInHistory(r.id)}
                   className={`w-full text-left px-3 py-2 rounded-md text-xs ${active?.id === r.id ? "bg-brand-50" : "hover:bg-[var(--surface-sunken)]"}`}>
                   <span className="font-medium flex items-center gap-1">
                     {r.status === "running" && <Loader2 className="w-3 h-3 animate-spin" />}
@@ -596,8 +657,29 @@ export default function ExecutionsPage() {
               </div>
             )}
 
-            {active && (
+            {loadingRunDetail && (
+              <div className="flex items-center gap-2 text-sm text-[var(--text-tertiary)] py-8 justify-center">
+                <Loader2 className="w-4 h-4 animate-spin" /> Loading run details…
+              </div>
+            )}
+
+            {!loadingRunDetail && active && (
               <>
+                <div className="ds-card px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="text-sm font-semibold">{active.run_name || active.mode}</h2>
+                    <p className="text-xs text-[var(--text-tertiary)] mt-0.5">
+                      {active.summary?.framework ? `${active.summary.framework} · ` : ""}
+                      {active.sprint ? `${active.sprint} · ` : ""}
+                      {active.release ? `${active.release} · ` : ""}
+                      Status: {active.status}
+                    </p>
+                  </div>
+                  <Badge variant={active.status === "completed" ? "success" : active.status === "failed" ? "error" : active.status === "running" ? "neutral" : "warning"}>
+                    {active.status}
+                  </Badge>
+                </div>
+
                 <div className="flex flex-wrap gap-2 items-center justify-between">
                   <div className="flex gap-2 text-xs">
                     <Clock className="w-4 h-4" />
@@ -621,7 +703,7 @@ export default function ExecutionsPage() {
                 </div>
 
                 {(active.results ?? []).map((r, i) => {
-                  const tc = testCases.find((t) => t.id === r.test_case_id);
+                  const tc = lookupTestCase(r.test_case_id);
                   const flow = resultFlowState(r, tc);
                   const isDebugging = debugTestCaseId === r.test_case_id && active.status === "running";
 
@@ -654,9 +736,33 @@ export default function ExecutionsPage() {
                   </div>
                   );
                 })}
+
+                {(active.results ?? []).length === 0 && (
+                  <div className="ds-card p-4 text-sm text-[var(--text-secondary)]">
+                    No per-test result rows were saved for this run.
+                    {active.status === "failed" || active.status === "cancelled"
+                      ? " Check the execution log below for the failure reason."
+                      : active.status === "running"
+                        ? " Results will appear as each test completes."
+                        : ""}
+                  </div>
+                )}
+
+                {active.logs?.trim() && (
+                  <div className="ds-card">
+                    <div className="ds-card-header">
+                      <h3 className="text-sm font-semibold">Execution log</h3>
+                    </div>
+                    <pre className="ds-card-body pt-0 text-xs font-mono whitespace-pre-wrap break-words max-h-64 overflow-auto text-[var(--text-secondary)]">
+                      {active.logs.trim()}
+                    </pre>
+                  </div>
+                )}
               </>
             )}
-            {!active && <p className="text-sm text-[var(--text-tertiary)] text-center py-16">Select a run from history</p>}
+            {!loadingRunDetail && !active && (
+              <p className="text-sm text-[var(--text-tertiary)] text-center py-16">Select a run from history</p>
+            )}
           </div>
         </div>
       )}

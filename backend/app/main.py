@@ -23,6 +23,18 @@ structlog.configure(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.runners.setup_status import configure_playwright_browsers_env
+
+    pw_ok, pw_hint = configure_playwright_browsers_env()
+    if not pw_ok:
+        structlog.get_logger().warning("playwright_browsers_not_ready", hint=pw_hint)
+    else:
+        import os
+        structlog.get_logger().info(
+            "playwright_browsers_configured",
+            path=os.environ.get("PLAYWRIGHT_BROWSERS_PATH"),
+        )
+
     await init_db()
     count = discover_plugins()
     integrations_loaded = await hydrate_integration_manager()

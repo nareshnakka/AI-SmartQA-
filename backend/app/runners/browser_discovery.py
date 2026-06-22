@@ -76,7 +76,10 @@ async def _crawl_playwright(
     username: str | None,
     password: str | None,
 ) -> dict:
+    from app.runners.setup_status import configure_playwright_browsers_env
     from playwright.async_api import async_playwright
+
+    configure_playwright_browsers_env()
 
     pages: list[dict] = []
     visited: set[str] = set()

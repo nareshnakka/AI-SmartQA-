@@ -1,6 +1,7 @@
 "use client";
 
 import { Suspense, useEffect, useState, useCallback, useRef, useMemo } from "react";
+import { usePathname } from "next/navigation";
 import {
   Play, Save, GitCompare, CheckCircle2, Loader2, Sparkles,
   ChevronDown, AlertCircle, Download, PlayCircle, Upload, Bug, GitBranch,
@@ -14,8 +15,11 @@ import {
 } from "@/components/flow/TestCaseFlowView";
 import { useActiveProject } from "@/context/ProjectContext";
 import { apiFetch, automationExportUrl, checkBackendHealth, executionLiveFrameUrl, executionVideoUrl } from "@/lib/api";
-import { bulkTestCaseAction, fetchTestCases, isAutomationEnabled, isStepDisabled, stepDescription, updateTestCase, type TestCaseStep } from "@/lib/test-cases";
+import { authHeaders } from "@/lib/auth";
+import { bulkTestCaseAction, fetchTestCases, isAutomationEnabled, isStepDisabled, stepDescription, updateTestCase, type TestCaseStep, type TestCasesUpdatedDetail } from "@/lib/test-cases";
+import { moduleFilterLabel } from "@/lib/modules";
 import { useWorkspaceScope } from "@/lib/workspace";
+import { WorkspaceFilters } from "@/components/workspace/WorkspaceFilters";
 import Link from "next/link";
 
 interface AutomationAsset {
@@ -31,8 +35,23 @@ interface TestCaseItem {
 }
 
 function StudioPageContent() {
+  const pathname = usePathname();
   const { projectId } = useActiveProject();
-  const { moduleQueryIds, environmentQueryIds } = useWorkspaceScope(projectId);
+  const ws = useWorkspaceScope(projectId);
+  const {
+    environments,
+    modules,
+    activeModuleId,
+    setActiveModuleId,
+    activeEnvironmentId,
+    setActiveEnvironmentId,
+    moduleQueryIds,
+    environmentQueryIds,
+    activeEnvironment,
+    activeModule,
+    reloadHierarchy,
+    reloadModules,
+  } = ws;
   const prevProjectRef = useRef(projectId);
   const [frameworks, setFrameworks] = useState<Framework[]>([]);
   const [framework, setFramework] = useState("playwright");
@@ -80,6 +99,8 @@ function StudioPageContent() {
   };
   const [debugRun, setDebugRun] = useState<DebugRunState | null>(null);
   const [liveFrameTick, setLiveFrameTick] = useState(0);
+  const [liveFrameSrc, setLiveFrameSrc] = useState<string | null>(null);
+  const liveFrameObjectUrlRef = useRef<string | null>(null);
   const debugPollStoppedRef = useRef(false);
   const [selectedCaseIds, setSelectedCaseIds] = useState<Set<string>>(new Set());
   const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(new Set());
@@ -117,16 +138,85 @@ function StudioPageContent() {
   useEffect(() => { loadAssets().catch(() => {}); }, [loadAssets]);
 
   useEffect(() => {
+    if (activeEnvironment?.base_url) {
+      setBaseUrl(activeEnvironment.base_url);
+    }
+  }, [activeEnvironment?.id, activeEnvironment?.base_url]);
+
+  useEffect(() => {
     if (!projectId) return;
     fetchTestCases(projectId, { moduleIds: moduleQueryIds, environmentIds: environmentQueryIds })
       .then(setTestCases).catch(() => setTestCases([]));
   }, [projectId, moduleQueryIds, environmentQueryIds]);
 
+  useEffect(() => {
+    if (!selectedTestCaseId) return;
+    if (!testCases.some((tc) => tc.id === selectedTestCaseId)) {
+      setSelectedTestCaseId(testCases[0]?.id ?? null);
+    }
+  }, [testCases, selectedTestCaseId]);
+
   const reloadTestCases = useCallback(async () => {
     if (!projectId) return;
     const list = await fetchTestCases(projectId, { moduleIds: moduleQueryIds, environmentIds: environmentQueryIds });
     setTestCases(list);
+    return list;
   }, [projectId, moduleQueryIds, environmentQueryIds]);
+
+  useEffect(() => {
+    if (!projectId || pathname !== "/studio") return;
+    reloadTestCases().catch(() => setTestCases([]));
+    reloadModules().catch(() => {});
+  }, [pathname, projectId, reloadTestCases, reloadModules]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    const onVisible = () => {
+      if (document.visibilityState !== "visible" || pathname !== "/studio") return;
+      reloadTestCases().catch(() => {});
+      reloadModules().catch(() => {});
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [projectId, pathname, reloadTestCases, reloadModules]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    const onTestCasesUpdated = async (e: Event) => {
+      const detail = (e as CustomEvent<TestCasesUpdatedDetail>).detail;
+      if (detail?.projectId !== projectId) return;
+
+      if (detail.environmentId && detail.environmentId !== activeEnvironmentId) {
+        setActiveEnvironmentId(detail.environmentId);
+      }
+      if (detail.moduleIds?.length === 1) {
+        setActiveModuleId(detail.moduleIds[0]!);
+      } else if (detail.caseIds?.length) {
+        setActiveModuleId(null);
+      }
+
+      await reloadHierarchy().catch(() => {});
+      const list = await fetchTestCases(projectId, {
+        environmentIds: detail.environmentId ? [detail.environmentId] : environmentQueryIds,
+        moduleIds: detail.moduleIds?.length === 1 ? [detail.moduleIds[0]!] : undefined,
+      }).catch(() => [] as TestCaseItem[]);
+      setTestCases(list);
+      if (detail.caseIds?.length) {
+        const firstVisible = detail.caseIds.find((id) => list.some((tc) => tc.id === id));
+        if (firstVisible) setSelectedTestCaseId(firstVisible);
+        setSideTab("flow");
+      }
+    };
+    window.addEventListener("qeos-test-cases-updated", onTestCasesUpdated);
+    return () => window.removeEventListener("qeos-test-cases-updated", onTestCasesUpdated);
+  }, [
+    projectId,
+    activeEnvironmentId,
+    environmentQueryIds,
+    setActiveEnvironmentId,
+    setActiveModuleId,
+    reloadHierarchy,
+  ]);
 
   const toggleCaseSelect = (id: string) => {
     setSelectedCaseIds((prev) => {
@@ -219,11 +309,59 @@ function StudioPageContent() {
   useEffect(() => {
     if (debugRun?.status !== "running" || !projectId || !debugRun.id) {
       setLiveFrameTick(0);
+      if (liveFrameObjectUrlRef.current) {
+        URL.revokeObjectURL(liveFrameObjectUrlRef.current);
+        liveFrameObjectUrlRef.current = null;
+      }
+      setLiveFrameSrc(null);
       return;
     }
     const t = setInterval(() => setLiveFrameTick((n) => n + 1), 350);
     return () => clearInterval(t);
   }, [debugRun?.status, debugRun?.id, projectId]);
+
+  useEffect(() => {
+    if (debugRun?.status !== "running" || !projectId || !debugRun?.id) return;
+
+    let cancelled = false;
+    const loadFrame = async () => {
+      try {
+        const url = executionLiveFrameUrl(projectId, debugRun.id, liveFrameTick);
+        const res = await fetch(url, { headers: { ...authHeaders() } });
+        if (!res.ok || cancelled) return;
+        const blob = await res.blob();
+        if (cancelled) return;
+        const objectUrl = URL.createObjectURL(blob);
+        if (liveFrameObjectUrlRef.current) {
+          URL.revokeObjectURL(liveFrameObjectUrlRef.current);
+        }
+        liveFrameObjectUrlRef.current = objectUrl;
+        setLiveFrameSrc(objectUrl);
+      } catch {
+        /* live frame optional */
+      }
+    };
+
+    loadFrame();
+    return () => {
+      cancelled = true;
+    };
+  }, [debugRun?.status, debugRun?.id, projectId, liveFrameTick]);
+
+  const formatDebugError = (raw: string): string => {
+    const text = raw.trim();
+    if (!text) return text;
+    if (text.includes("Not Found") && text.includes("detail")) {
+      return "Debug session not found on the API — restart the backend (scripts\\restart-all-auto.bat), then run Debug again.";
+    }
+    if (/\b404\b/i.test(text) || /not found/i.test(text)) {
+      if (text.length < 120 && !text.includes("Error:")) {
+        return `The browser loaded a "Not Found" page — check Base URL and the first navigate step URL. (${text})`;
+      }
+      return `${text}\n\nHint: If the live browser showed "Not Found", your Base URL or step URL may be wrong (404 page), not the test flow order.`;
+    }
+    return text;
+  };
 
   useEffect(() => {
     if (!projectId) return;
@@ -260,10 +398,7 @@ function StudioPageContent() {
 
   const filteredTestCases = testCases;
 
-  const linkedTestCases = filteredTestCases.filter(
-    (tc) => !activeAsset?.test_case_ids?.length || activeAsset.test_case_ids.includes(tc.id)
-  );
-  const selectedTestCase = testCases.find((tc) => tc.id === selectedTestCaseId) ?? linkedTestCases[0] ?? null;
+  const selectedTestCase = testCases.find((tc) => tc.id === selectedTestCaseId) ?? filteredTestCases[0] ?? null;
 
   const scriptFlowSteps: FlowStep[] = activeFile && fileContent ? parseStepsFromScript(fileContent) : [];
 
@@ -371,6 +506,13 @@ function StudioPageContent() {
       setExecMessage("Test case is disabled or not found — enable it to debug.");
       return;
     }
+    const targetUrl = baseUrl.trim() || activeEnvironment?.base_url?.trim() || "";
+    if (!targetUrl) {
+      setExecMessage(
+        "Set a Base URL before debugging — configure it on your environment in Settings → Environments & Modules."
+      );
+      return;
+    }
     setSelectedTestCaseId(testCaseId);
     setSideTab("flow");
     setExecuting(true);
@@ -397,7 +539,7 @@ function StudioPageContent() {
             headed: false,
             background: true,
             framework: activeAsset.framework,
-            base_url: baseUrl,
+            base_url: targetUrl,
             asset_id: activeAsset.id,
             run_name: `Debug — ${tc.title}`,
           }),
@@ -441,12 +583,12 @@ function StudioPageContent() {
           } else if (updated.status === "cancelled") {
             setExecMessage("Debug stopped.");
           } else if (label === "failed" && errText) {
-            setExecMessage(`Debug complete — failed${videoNote}${err}`);
+            setExecMessage(`Debug complete — failed${videoNote}\n${formatDebugError(errText)}`);
           } else {
-            setExecMessage(`Debug complete — ${label}${videoNote}${err}`);
+            setExecMessage(`Debug complete — ${label}${videoNote}${err ? `\n${formatDebugError(errText)}` : ""}`);
           }
         } catch (e) {
-          setExecMessage(String(e));
+          setExecMessage(formatDebugError(String(e)));
         } finally {
           setExecuting(false);
         }
@@ -635,8 +777,23 @@ function StudioPageContent() {
       />
 
       {/* Toolbar */}
-      <div className="ds-card mb-4 px-4 py-3 flex flex-wrap items-center gap-3">
-        <select className="ds-input py-1.5 text-sm w-40" value={framework} onChange={(e) => setFramework(e.target.value)}>
+      <div className="ds-card mb-4 px-4 py-3 space-y-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-col gap-1 min-w-[220px]">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
+              Scope
+            </span>
+            <WorkspaceFilters
+              environments={environments}
+              modules={modules}
+              activeEnvironmentId={activeEnvironmentId}
+              activeModuleId={activeModuleId}
+              onEnvironmentChange={setActiveEnvironmentId}
+              onModuleChange={setActiveModuleId}
+            />
+          </div>
+          <div className="h-8 w-px bg-[var(--border-default)] hidden sm:block" />
+          <select className="ds-input py-1.5 text-sm w-40" value={framework} onChange={(e) => setFramework(e.target.value)}>
           {frameworks.map((f) => (
             <option key={f.id} value={f.id}>{f.name}</option>
           ))}
@@ -697,6 +854,14 @@ function StudioPageContent() {
             ))}
           </select>
         )}
+        </div>
+        <p className="text-[11px] text-[var(--text-tertiary)]">
+          {activeEnvironment?.name ?? "Environment"} · {moduleFilterLabel(activeModuleId, modules)} ·{" "}
+          {testCases.length} test case{testCases.length === 1 ? "" : "s"} in scope
+          {activeModule && ` (${activeModule.name})`}
+          {" · "}
+          <Link href="/settings" className="text-brand-700 hover:underline">Manage modules</Link>
+        </p>
       </div>
 
       {showSources && (
@@ -780,7 +945,7 @@ function StudioPageContent() {
                 <Tabs
                   tabs={[
                     { id: "files", label: "Files", count: activeAsset.files.length },
-                    { id: "flow", label: "Test Flow", count: linkedTestCases.length || scriptFlowSteps.length || undefined },
+                    { id: "flow", label: "Test Flow", count: filteredTestCases.length || scriptFlowSteps.length || undefined },
                     { id: "versions", label: "Versions", count: versions.length || undefined },
                     { id: "diff", label: "Diff", count: diffs?.length || undefined },
                     { id: "deps", label: "Deps" },
@@ -788,8 +953,8 @@ function StudioPageContent() {
                   active={sideTab}
                   onChange={(tab) => {
                     setSideTab(tab);
-                    if (tab === "flow" && !selectedTestCaseId && linkedTestCases[0]) {
-                      setSelectedTestCaseId(linkedTestCases[0].id);
+                    if (tab === "flow" && !selectedTestCaseId && filteredTestCases[0]) {
+                      setSelectedTestCaseId(filteredTestCases[0].id);
                     }
                   }}
                 />
@@ -832,9 +997,14 @@ function StudioPageContent() {
               )}
               {sideTab === "flow" && (
                 <div className="py-2 px-1 max-h-[420px] overflow-auto space-y-1">
-                  {linkedTestCases.length > 0 && (
+                  <p className="px-2 pb-2 text-[10px] text-[var(--text-tertiary)] border-b border-[var(--border-default)]">
+                    {filteredTestCases.length} case{filteredTestCases.length === 1 ? "" : "s"} ·{" "}
+                    {moduleFilterLabel(activeModuleId, modules)}
+                    {activeModuleId ? "" : " — all modules in environment"}
+                  </p>
+                  {filteredTestCases.length > 0 && (
                     <div className="px-1 pb-2 mb-1 border-b border-[var(--border-default)] flex flex-wrap gap-1">
-                      <button type="button" onClick={() => setSelectedCaseIds(new Set(linkedTestCases.map((t) => t.id)))} className="text-[10px] text-brand-700 px-1">Select all</button>
+                      <button type="button" onClick={() => setSelectedCaseIds(new Set(filteredTestCases.map((t) => t.id)))} className="text-[10px] text-brand-700 px-1">Select all</button>
                       {selectedCaseIds.size > 0 && (
                         <>
                           <button type="button" disabled={managingCases} onClick={() => bulkManageCases("disable")} className="text-[10px] ds-btn-secondary py-0.5 px-1.5"><Ban className="w-2.5 h-2.5 inline" /> Disable</button>
@@ -844,10 +1014,12 @@ function StudioPageContent() {
                       )}
                     </div>
                   )}
-                  {linkedTestCases.length === 0 && (
-                    <p className="px-2 text-xs text-[var(--text-tertiary)]">No linked test cases — steps parsed from script when available</p>
+                  {filteredTestCases.length === 0 && (
+                    <p className="px-2 text-xs text-[var(--text-tertiary)]">
+                      No test cases in scope — import from Discovery or widen the module filter above.
+                    </p>
                   )}
-                  {linkedTestCases.map((tc) => {
+                  {filteredTestCases.map((tc) => {
                     const disabled = !isAutomationEnabled(tc);
                     return (
                     <div key={tc.id} className={`flex items-start gap-1 ${disabled ? "opacity-60" : ""}`}>
@@ -922,6 +1094,14 @@ function StudioPageContent() {
                     </span>
                     {selectedTestCase && (
                       <div className="flex items-center gap-2">
+                        <input
+                          className="ds-input text-xs font-mono w-52 py-1"
+                          value={baseUrl}
+                          onChange={(e) => setBaseUrl(e.target.value)}
+                          placeholder="Base URL (from environment)"
+                          title="Target application URL for Playwright navigation"
+                          suppressHydrationWarning
+                        />
                         {debugRun?.status === "running" && (
                           <button
                             type="button"
@@ -956,13 +1136,17 @@ function StudioPageContent() {
                           </span>
                         </div>
                         {projectId && debugRun.id && (
-                          <img
-                            alt="Live browser view"
-                            className="w-full min-h-[280px] max-h-[420px] object-contain bg-slate-950"
-                            src={executionLiveFrameUrl(projectId, debugRun.id, liveFrameTick)}
-                            onLoad={(e) => { (e.target as HTMLImageElement).style.opacity = "1"; }}
-                            onError={(e) => { (e.target as HTMLImageElement).style.opacity = "0.85"; }}
-                          />
+                          liveFrameSrc ? (
+                            <img
+                              alt="Live browser view"
+                              className="w-full min-h-[280px] max-h-[420px] object-contain bg-slate-950"
+                              src={liveFrameSrc}
+                            />
+                          ) : (
+                            <div className="w-full min-h-[280px] max-h-[420px] flex items-center justify-center bg-slate-950 text-xs text-slate-400">
+                              Waiting for browser frame…
+                            </div>
+                          )
                         )}
                         <p className="px-3 py-1.5 text-[10px] text-brand-200/80 border-t border-brand-800">
                           Step highlight updates as each action runs in the browser.

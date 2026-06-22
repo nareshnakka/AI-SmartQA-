@@ -242,25 +242,35 @@ export function buildFlowSteps(
   stepStatuses?: { order: number; status: string; description?: string; expected?: string }[]
 ): FlowStep[] {
   const statusMap = new Map((stepStatuses ?? []).map((s) => [s.order, s]));
-  return rawSteps.map((s, i) => {
-    const order = i + 1;
+
+  const indexed = rawSteps.map((s, i) => ({ s, i }));
+  indexed.sort((a, b) => {
+    const orderA =
+      typeof a.s === "object" && a.s.order != null && a.s.order > 0 ? a.s.order : a.i + 1;
+    const orderB =
+      typeof b.s === "object" && b.s.order != null && b.s.order > 0 ? b.s.order : b.i + 1;
+    return orderA - orderB || a.i - b.i;
+  });
+
+  return indexed.map(({ s, i }, sortedIndex) => {
+    const order = sortedIndex + 1;
     const st = statusMap.get(order);
     if (typeof s === "string") {
       return {
         order,
         description: st?.description ?? s,
-        expected: st?.expected ?? expected?.[i] ?? null,
+        expected: st?.expected ?? expected?.[i] ?? expected?.[sortedIndex] ?? null,
         status: (st?.status as FlowStepStatus) ?? "pending",
         disabled: false,
       };
     }
     const disabled = Boolean(s.disabled);
     return {
-      order: s.order ?? order,
+      order,
       description: st?.description ?? s.description ?? String(s),
       action: s.action,
       url: s.url,
-      expected: st?.expected ?? expected?.[i] ?? null,
+      expected: st?.expected ?? expected?.[i] ?? expected?.[sortedIndex] ?? null,
       status: disabled ? "skipped" : ((st?.status as FlowStepStatus) ?? "pending"),
       disabled,
     };

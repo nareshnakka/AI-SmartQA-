@@ -102,7 +102,20 @@ class ModuleService:
         if not mod or mod.project_id != project_id:
             raise ValueError("Module not found")
         if name is not None:
-            mod.name = name.strip()
+            new_name = name.strip()
+            if not new_name:
+                raise ValueError("Module name cannot be empty")
+            dup = await self.db.execute(
+                select(ProjectModuleModel).where(
+                    ProjectModuleModel.project_id == project_id,
+                    ProjectModuleModel.environment_id == mod.environment_id,
+                    ProjectModuleModel.name.ilike(new_name),
+                    ProjectModuleModel.id != module_id,
+                )
+            )
+            if dup.scalars().first():
+                raise ValueError(f"Module '{new_name}' already exists in this environment")
+            mod.name = new_name
             mod.code = name_prefix(mod.name)
         if description is not None:
             mod.description = description

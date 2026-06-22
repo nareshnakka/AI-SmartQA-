@@ -4,6 +4,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +28,9 @@ from app.runners.test_case_runner import (
 from app.services.automation import AutomationService
 from app.services.e2e_bundle import (
     dedupe_files,
+    is_orangehrm_target,
     is_placeholder_playwright_asset,
+    load_generic_e2e_files,
     load_orangehrm_e2e_files,
     materialize_batch_playwright_specs,
 )
@@ -113,6 +116,8 @@ class ExecutionService:
         if framework not in ALL_FRAMEWORKS:
             framework = "playwright"
 
+        base_url = await self._resolve_base_url(project_id, base_url)
+
         if asset_id and run_type == "automation":
             asset = await self.automation.get_asset(asset_id)
             if asset and asset.project_id == project_id:
@@ -135,7 +140,14 @@ class ExecutionService:
             release=release,
             agent_id=agent_id,
             progress={"total": max(len(test_case_ids), 1 if run_type == "performance" else 0), "completed": 0, "current": None, "percent": 0},
-            summary={"run_type": run_type, "agent": agent.name, "framework": framework, "headed": headed, "embed_live": embed_live},
+            summary={
+                "run_type": run_type,
+                "agent": agent.name,
+                "framework": framework,
+                "headed": headed,
+                "embed_live": embed_live,
+                "base_url": base_url,
+            },
         )
         self.db.add(run)
         await self.db.flush()
@@ -178,6 +190,8 @@ class ExecutionService:
         framework = (run.summary or {}).get("framework", framework)
         headed = headed or bool((run.summary or {}).get("headed", False))
         embed_live = embed_live or bool((run.summary or {}).get("embed_live", False))
+        stored_base = (run.summary or {}).get("base_url")
+        base_url = await self._resolve_base_url(project_id, base_url or stored_base or "")
 
         if run_type == "performance" and performance_asset_id:
             await self._run_performance_batch(run, project_id, performance_asset_id, test_case_ids)
@@ -193,12 +207,103 @@ class ExecutionService:
             run.completed_at = datetime.now(timezone.utc)
             return
 
-        if mode == "live" and run_type == "automation" and not asset_id:
+        def _fail_batch(message: str) -> None:
             run.status = "failed"
-            run.logs = (
-                "Live Playwright execution requires an automation asset with real scripts. "
-                "Select an asset in Executions or Studio — stub goto tests are not used in live mode."
+            run.logs = message
+            run.results = [
+                {
+                    "test_case_id": str(tc.id),
+                    "title": tc.title,
+                    "status": "failed",
+                    "steps": map_steps_from_test_case(
+                        {
+                            "id": str(tc.id),
+                            "title": tc.title,
+                            "steps": tc.steps or [],
+                            "expected_results": tc.expected_results or [],
+                        },
+                        "failed",
+                    ),
+                    "error": message[:500],
+                    "has_video": False,
+                    "video_id": str(i),
+                }
+                for i, tc in enumerate(cases)
+            ]
+            flag_modified(run, "results")
+            run.summary = {
+                **(run.summary or {}),
+                "passed": 0,
+                "failed": len(cases),
+                "tests_detected": len(cases),
+                "videos_captured": 0,
+            }
+            run.completed_at = datetime.now(timezone.utc)
+            run.progress = {"total": len(cases), "completed": len(cases), "current": None, "percent": 100, "phase": "done"}
+            flag_modified(run, "progress")
+
+        if mode == "live" and run_type == "automation" and not asset_id:
+            base_url = await self._resolve_base_url(project_id, base_url)
+            orangehrm = is_orangehrm_target(base_url)
+            try:
+                bundle_files = (
+                    load_orangehrm_e2e_files(base_url) if orangehrm else load_generic_e2e_files(base_url)
+                )
+            except FileNotFoundError as exc:
+                _fail_batch(str(exc))
+                await self.db.flush()
+                return
+
+            step_asset = SimpleNamespace(
+                framework=framework,
+                files=bundle_files,
+                name="Test case step replay",
+                project_id=project_id,
             )
+            results: list[dict] = []
+            logs: list[str] = [
+                "Batch execution via localhost agent (test case step replay)",
+                f"Framework: {framework}",
+                f"Test cases: {len(cases)}",
+                "No automation asset selected — replaying stored test steps via Playwright",
+                f"Executor: asset_live_v2",
+            ]
+            passed, failed = await self._execute_batch_with_asset(
+                run,
+                cases,
+                step_asset,
+                apply_healing,
+                base_url,
+                results,
+                logs,
+                headed=headed,
+                embed_live=embed_live,
+                persist_asset=False,
+            )
+            run.progress = {"total": len(cases), "completed": len(cases), "current": None, "percent": 100, "phase": "done"}
+            from app.services.execution_worker import is_run_cancel_requested
+
+            if is_run_cancel_requested(run.id):
+                run.status = "cancelled"
+            elif failed:
+                run.status = "failed"
+            else:
+                run.status = "completed"
+            run.summary = {
+                **(run.summary or {}),
+                "passed": passed,
+                "failed": failed,
+                "warnings": sum(1 for r in results if r.get("status") == "passed_with_warnings"),
+                "tests_detected": len(cases),
+                "videos_captured": sum(1 for r in results if r.get("has_video")),
+                "runner": "localhost_agent",
+                "framework": framework,
+                "asset_name": step_asset.name,
+                "executor": "asset_live_v2",
+            }
+            run.results = list(results)
+            flag_modified(run, "results")
+            run.logs = "\n".join(logs)
             run.completed_at = datetime.now(timezone.utc)
             await self.db.flush()
             return
@@ -248,9 +353,7 @@ class ExecutionService:
                 await self.db.flush()
                 return
             logs_stub: list[str] = [f"Automation asset {asset_id} not found for this project"]
-            run.status = "failed"
-            run.logs = "\n".join(logs_stub)
-            run.completed_at = datetime.now(timezone.utc)
+            _fail_batch("\n".join(logs_stub))
             await self.db.flush()
             return
 
@@ -431,19 +534,54 @@ class ExecutionService:
     @staticmethod
     def _prepare_asset_files(files: list[dict], base_url: str) -> list[dict]:
         """Copy asset files and inject the configured base URL."""
+        from app.services.e2e_bundle import inject_orangehrm_login_url, inject_playwright_base_url, normalize_base_url
+
+        url = normalize_base_url(base_url)
         prepared: list[dict] = []
         for f in files:
             content = f.get("content", "")
-            if base_url and content:
-                content = content.replace("https://example.com", base_url)
-                content = content.replace("http://example.com", base_url)
-                content = re.sub(
-                    r"baseURL:\s*['\"]https?://[^'\"]+['\"]",
-                    f"baseURL: '{base_url}'",
-                    content,
-                )
+            path = f.get("path", "").replace("\\", "/")
+            if url and content:
+                if "playwright.config" in path:
+                    content = inject_playwright_base_url(content, url)
+                elif path.endswith("fixtures/testData.ts"):
+                    content = inject_orangehrm_login_url(content, url)
+                else:
+                    content = content.replace("https://example.com", url)
+                    content = content.replace("http://example.com", url)
             prepared.append({**f, "content": content})
         return prepared
+
+    async def _resolve_login_env(self, case: TestCaseModel | None) -> dict[str, str]:
+        """Optional login credentials from environment secrets hint."""
+        if not case or not case.environment_id:
+            return {}
+        from app.services.environments import EnvironmentService
+        from app.runners.discovery_prompt import resolve_discovery_auth
+
+        env_row = await EnvironmentService(self.db).get_environment(case.environment_id)
+        if not env_row or not env_row.secrets_hint:
+            return {}
+        user, pwd, _ = resolve_discovery_auth(env_row.secrets_hint)
+        out: dict[str, str] = {}
+        if user:
+            out["QEOS_USERNAME"] = user
+        if pwd:
+            out["QEOS_PASSWORD"] = pwd
+        return out
+
+    async def _resolve_base_url(self, project_id: uuid.UUID, base_url: str) -> str:
+        from app.services.e2e_bundle import normalize_base_url
+        from app.services.environments import EnvironmentService
+
+        url = normalize_base_url(base_url)
+        if url:
+            return url
+        env_svc = EnvironmentService(self.db)
+        default = await env_svc.get_default_environment(project_id)
+        if default and default.base_url:
+            return normalize_base_url(default.base_url)
+        return "https://example.com"
 
     @staticmethod
     def _match_playwright_result(
@@ -468,30 +606,40 @@ class ExecutionService:
         self,
         run: ExecutionRunModel,
         cases: list[TestCaseModel],
-        asset: AutomationAssetModel,
+        asset: AutomationAssetModel | SimpleNamespace,
         apply_healing: bool,
         base_url: str,
         results: list[dict],
         logs: list[str],
         headed: bool = False,
         embed_live: bool = False,
+        persist_asset: bool = True,
     ) -> tuple[int, int]:
+        base_url = await self._resolve_base_url(run.project_id, base_url)
         framework = asset.framework
         files = dedupe_files(self._prepare_asset_files(asset.files or [], base_url))
-        if framework == "playwright" and is_placeholder_playwright_asset(files):
-            logs.append("WARNING: Asset has placeholder stubs — swapping in bundled OrangeHRM E2E Playwright suite")
+        logs.append(f"Base URL: {base_url}")
+        orangehrm = is_orangehrm_target(base_url)
+        if orangehrm:
+            logs.append("Target app: OrangeHRM — using bundled LoginPage flows")
+        else:
+            logs.append("Target app: generic — replaying test case steps (not OrangeHRM login)")
+
+        if framework == "playwright" and persist_asset and is_placeholder_playwright_asset(files):
+            logs.append("WARNING: Asset has placeholder stubs — swapping in bundled Playwright support")
             try:
-                files = load_orangehrm_e2e_files(base_url)
-                asset.files = files
-                from sqlalchemy.orm.attributes import flag_modified as fm
-                fm(asset, "files")
-                await self.db.flush()
+                files = load_orangehrm_e2e_files(base_url) if orangehrm else load_generic_e2e_files(base_url)
+                if isinstance(asset, AutomationAssetModel):
+                    asset.files = files
+                    from sqlalchemy.orm.attributes import flag_modified as fm
+                    fm(asset, "files")
+                    await self.db.flush()
             except FileNotFoundError as exc:
                 logs.append(f"ERROR: {exc}")
 
         if framework == "playwright" and (embed_live or headed):
             try:
-                bundle = load_orangehrm_e2e_files(base_url)
+                bundle = load_orangehrm_e2e_files(base_url) if orangehrm else load_generic_e2e_files(base_url)
                 refresh_prefixes = ("utils/", "pages/", "fixtures/")
                 refresh_paths = {
                     f.get("path", "").replace("\\", "/")
@@ -507,7 +655,8 @@ class ExecutionService:
 
         if framework == "playwright" and cases:
             files = materialize_batch_playwright_specs(files, cases, base_url)
-            logs.append(f"Generated {len(cases)} per-test Playwright spec(s) with real page objects")
+            spec_kind = "OrangeHRM page objects" if orangehrm else "discovery step replay"
+            logs.append(f"Generated {len(cases)} per-test Playwright spec(s) ({spec_kind})")
 
         test_files = [f for f in files if f.get("type") == "test" or "spec" in f.get("path", "").lower() or f.get("path", "").endswith((".cy.js", ".test.js", ".robot"))]
         logs.append(f"Materialized {len(files)} file(s), {len(test_files)} test file(s)")
@@ -560,6 +709,9 @@ class ExecutionService:
         progress_path = artifact_dir / "progress.json"
         live_frame_path = artifact_dir / "live.jpg"
         total_steps = max(len(cases[0].steps or []), 1) if cases else 15
+        login_env = await self._resolve_login_env(cases[0] if cases else None)
+        if login_env:
+            logs.append("Login credentials loaded from environment secrets hint")
 
         await self._publish_run_progress(run, phase="prepare", detail="Preparing Playwright workspace…", logs=logs)
         await self.db.commit()
@@ -603,6 +755,8 @@ class ExecutionService:
                 total_steps=total_steps,
                 on_step_progress=on_step_progress if (embed_live or headed) else None,
                 cancel_run_id=str(run_id),
+                base_url=base_url,
+                login_env=login_env,
             )
             raw_results = outcome.get("results", [])
             exit_code = outcome.get("exit_code", 1)

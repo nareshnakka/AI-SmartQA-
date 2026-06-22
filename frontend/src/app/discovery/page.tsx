@@ -10,11 +10,10 @@ import { AppShell } from "@/components/shell/AppShell";
 import { PageHeader, Badge, MetricCard } from "@/components/ui";
 import { apiFetch } from "@/lib/api";
 import { useActiveProject } from "@/context/ProjectContext";
-import { filterByModuleNames } from "@/components/modules/ModuleFilter";
 import { WorkspaceFilters } from "@/components/workspace/WorkspaceFilters";
 import { createModule, type ProjectModule } from "@/lib/modules";
 import { useWorkspaceScope } from "@/lib/workspace";
-import { bulkTestCaseAction, fetchTestCases, type AutomationTestCase } from "@/lib/test-cases";
+import { bulkTestCaseAction, fetchTestCases, notifyTestCasesUpdated, type AutomationTestCase } from "@/lib/test-cases";
 
 interface TestStep {
   order: number;
@@ -51,7 +50,18 @@ interface DiscoverySession {
   screens: { name: string; url_pattern: string }[];
   apis: { method: string; path: string; purpose: string }[];
   critical_journeys: { name: string; priority: string; test_coverage: string }[];
-  coverage_matrix: { coverage_percentage: number; screen_inventory: number; proposed_test_cases?: number };
+  coverage_matrix: {
+    coverage_percentage?: number;
+    screen_inventory?: number;
+    proposed_test_cases?: number;
+    agent_progress?: {
+      phase?: string;
+      message?: string;
+      url?: string;
+      updated_at?: string;
+      log_count?: number;
+    };
+  };
   proposed_test_cases: ProposedTestCase[];
   navigation_log: NavEvent[];
 }
@@ -74,11 +84,10 @@ function DiscoveryPageContent() {
   const prevProjectRef = useRef(projectId);
   const [baseUrl, setBaseUrl] = useState("");
   const [requirements, setRequirements] = useState(
-    "As a user, I want to login, manage employees, and run reports."
+    "Submit enquiry form:\nName: Jane Doe\nEmail: jane@example.com\nPhone: 555-0100\nMessage: I would like a product demo"
   );
   const [running, setRunning] = useState(false);
-  const [username, setUsername] = useState("Admin");
-  const [password, setPassword] = useState("admin123");
+  const [stopping, setStopping] = useState(false);
   const [sessions, setSessions] = useState<DiscoverySession[]>([]);
   const [active, setActive] = useState<DiscoverySession | null>(null);
   const [message, setMessage] = useState("");
@@ -96,6 +105,10 @@ function DiscoveryPageContent() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [playwrightHint, setPlaywrightHint] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const navLogRef = useRef<HTMLDivElement | null>(null);
+  const proposedPanelRef = useRef<HTMLDivElement | null>(null);
+  const runStartedAtRef = useRef<number | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
 
   useEffect(() => {
     const loadHealth = () => {
@@ -172,21 +185,53 @@ function DiscoveryPageContent() {
 
   const startPolling = useCallback((pid: string, sid: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
+    runStartedAtRef.current = Date.now();
+    setElapsedSec(0);
     pollRef.current = setInterval(async () => {
       try {
         const s = await refreshSession(pid, sid);
+        const last = s.navigation_log?.[s.navigation_log.length - 1];
+        if (s.status === "running" && last?.message) {
+          setMessage(`Agent: ${last.message}`);
+        }
+        if (runStartedAtRef.current) {
+          setElapsedSec(Math.floor((Date.now() - runStartedAtRef.current) / 1000));
+        }
         if (s.status !== "running") {
           if (pollRef.current) clearInterval(pollRef.current);
           pollRef.current = null;
+          runStartedAtRef.current = null;
           setRunning(false);
-          setMessage(`Discovery complete — ${s.proposed_test_cases?.length ?? 0} test cases proposed`);
-          setSelected(new Set());
+          setStopping(false);
+          const count = s.proposed_test_cases?.length ?? 0;
+          const ids = (s.proposed_test_cases ?? []).map((t) => t.id);
+          setSelected(new Set(ids));
+          setExpanded(new Set(ids.slice(0, Math.min(3, ids.length))));
+          window.setTimeout(() => {
+            proposedPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+          }, 300);
+          if (s.status === "cancelled") {
+            setMessage(
+              count > 0
+                ? `Discovery stopped — ${count} test case(s) captured. Review below, then Import to Project.`
+                : "Discovery stopped — no test cases captured"
+            );
+          } else if (s.status === "failed") {
+            setMessage("Discovery failed — check the navigation log for details");
+          } else {
+            setMessage(
+              count > 0
+                ? `Discovery complete — ${count} test case(s) ready. Review below → Import to Project.`
+                : "Discovery complete — no test cases were generated"
+            );
+          }
         }
       } catch {
         if (pollRef.current) clearInterval(pollRef.current);
         setRunning(false);
+        runStartedAtRef.current = null;
       }
-    }, 2000);
+    }, 800);
   }, [refreshSession]);
 
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
@@ -207,8 +252,6 @@ function DiscoveryPageContent() {
           base_url: baseUrl,
           requirements,
           mode: "agent",
-          username: username || undefined,
-          password: password || undefined,
           background: true,
         }),
       });
@@ -258,6 +301,22 @@ function DiscoveryPageContent() {
     setSessions((prev) => prev.map((x) => (x.id === session.id ? session : x)));
     setSelected(new Set());
     setExpanded(new Set());
+  };
+
+  const stopAgent = async () => {
+    if (!projectId || !active || active.status !== "running") return;
+    setStopping(true);
+    setMessage("Stopping agent…");
+    try {
+      const session = await apiFetch<DiscoverySession>(
+        `/api/v1/projects/${projectId}/discovery/sessions/${active.id}/cancel`,
+        { method: "POST" }
+      );
+      applySessionUpdate(session);
+    } catch (e) {
+      setMessage(String(e));
+      setStopping(false);
+    }
   };
 
   const clearNavigation = async () => {
@@ -364,7 +423,7 @@ function DiscoveryPageContent() {
     try {
       const result = await apiFetch<{
         committed_count: number;
-        test_cases: { id: string; title: string; case_code?: string }[];
+        test_cases: { id: string; title: string; case_code?: string; module_id?: string | null; environment_id?: string | null }[];
         remaining_proposed?: number;
         session?: DiscoverySession;
       }>(
@@ -385,10 +444,29 @@ function DiscoveryPageContent() {
         setSelected(new Set());
       }
       await reloadModules();
-      await reloadSavedCases();
+      const importEnvId = activeEnvironmentId ?? result.test_cases[0]?.environment_id ?? undefined;
+      try {
+        setSavedCases(
+          await fetchTestCases(projectId, {
+            environmentIds: importEnvId ? [importEnvId] : environmentQueryIds,
+          })
+        );
+      } catch {
+        await reloadSavedCases();
+      }
+      const moduleIds = [
+        ...new Set(result.test_cases.map((c) => c.module_id).filter((id): id is string => Boolean(id))),
+      ];
+      notifyTestCasesUpdated({
+        projectId,
+        caseIds: result.test_cases.map((c) => c.id),
+        environmentId: importEnvId ?? null,
+        moduleIds,
+      });
       setMessage(
         `Saved ${result.committed_count} test case(s) with FTC naming` +
-          (result.remaining_proposed != null ? ` — ${result.remaining_proposed} still in review` : "")
+          (result.remaining_proposed != null ? ` — ${result.remaining_proposed} still in review` : "") +
+          " — open Automation IDE to debug or generate scripts."
       );
     } catch (e) {
       setMessage(String(e));
@@ -405,11 +483,21 @@ function DiscoveryPageContent() {
     if (type === "inspect") return "🔍";
     if (type === "error") return "❌";
     if (type === "agent_complete") return "🏁";
+    if (type === "status") return "⏳";
+    if (type === "warning") return "⚠️";
+    if (type === "observe") return "👁️";
+    if (type === "action") return "🤖";
     return "•";
   };
 
   const proposed = active?.proposed_test_cases ?? [];
   const navLog = active?.navigation_log ?? [];
+  const agentProgress = active?.coverage_matrix?.agent_progress;
+
+  useEffect(() => {
+    if (!navLogRef.current || navLog.length === 0) return;
+    navLogRef.current.scrollTop = navLogRef.current.scrollHeight;
+  }, [navLog.length, agentProgress?.updated_at]);
 
   const displayModules = useMemo((): ProjectModule[] => {
     const byName = new Map(modules.map((m) => [m.name.toLowerCase(), m]));
@@ -431,15 +519,8 @@ function DiscoveryPageContent() {
     return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
   }, [modules, proposed, projectId, activeEnvironmentId]);
 
-  const moduleFilterSet = useMemo(
-    () => (activeModuleId ? new Set([activeModuleId]) : new Set<string>()),
-    [activeModuleId]
-  );
-
-  const filteredProposed = useMemo(
-    () => filterByModuleNames(proposed, moduleFilterSet, displayModules),
-    [proposed, moduleFilterSet, displayModules]
-  );
+  // Show all proposed cases — workspace module filter only applies to saved cases below.
+  const reviewProposed = proposed;
 
   const filteredSaved = savedCases;
 
@@ -483,7 +564,7 @@ function DiscoveryPageContent() {
   };
 
   const selectAllFiltered = () => {
-    setSelected(new Set(filteredProposed.map((t) => t.id)));
+    setSelected(new Set(reviewProposed.map((t) => t.id)));
   };
 
   return (
@@ -509,23 +590,66 @@ function DiscoveryPageContent() {
             <div className="ds-card-header"><h2 className="text-sm font-semibold">Environment</h2></div>
             <div className="ds-card-body space-y-3 pt-0">
               <input className="ds-input text-sm font-mono" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://your-app.com" />
-              <div className="grid grid-cols-2 gap-2">
-                <input className="ds-input text-xs" placeholder="Username" value={username} onChange={(e) => setUsername(e.target.value)} />
-                <input className="ds-input text-xs" type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} />
+              <div>
+                <label className="text-xs font-medium text-[var(--text-secondary)] block mb-1">
+                  Discovery prompt
+                </label>
+                <textarea
+                  className="ds-input text-xs resize-none w-full"
+                  rows={5}
+                  value={requirements}
+                  onChange={(e) => setRequirements(e.target.value)}
+                  placeholder={
+                    "Describe exactly what the agent should do — it follows these instructions only.\n\n" +
+                    "Examples:\n" +
+                    "• Submit enquiry form with fields:\n  Name: Jane Doe\n  Email: jane@example.com\n  Message: Product demo request\n" +
+                    "• Login as admin/admin123, open Payroll and verify employee list\n" +
+                    "• No login — open Contact page and submit the form\n\n" +
+                    "Use field labels that match the form (Name, Email, Message, etc.). Add 'explore all modules' only for broad discovery."
+                  }
+                  suppressHydrationWarning
+                />
+                <p className="text-[10px] text-[var(--text-tertiary)] mt-1.5">
+                  The agent fills and submits forms when you provide field names and values. Strict by default — only your instructions unless you ask to explore broadly.
+                </p>
               </div>
-              <textarea className="ds-input text-xs resize-none font-mono" rows={3} value={requirements} onChange={(e) => setRequirements(e.target.value)} placeholder="Context for the QA Agent…" />
-              <button onClick={run} disabled={running || !!playwrightHint} className="ds-btn-primary w-full">
-                {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                {running ? "Agent Exploring…" : "Start QA Agent"}
-              </button>
+              <div className="flex gap-2">
+                <button onClick={run} disabled={running || !!playwrightHint} className="ds-btn-primary flex-1">
+                  {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                  {running ? "Agent Exploring…" : "Start QA Agent"}
+                </button>
+                {running && (
+                  <button
+                    type="button"
+                    onClick={stopAgent}
+                    disabled={stopping}
+                    className="ds-btn-secondary shrink-0 inline-flex items-center gap-1.5 px-3 border-red-200 text-red-700 hover:bg-red-50"
+                    title="Stop the running discovery agent"
+                  >
+                    {stopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-4 h-4 fill-current" />}
+                    Stop Agent
+                  </button>
+                )}
+              </div>
             </div>
           </div>
 
           {active?.status === "running" && (
             <div className="ds-card border-brand-200 bg-brand-50">
-              <div className="ds-card-body flex items-center gap-2 py-3">
-                <Loader2 className="w-4 h-4 animate-spin text-brand-700" />
-                <p className="text-xs text-brand-800">Agent is navigating {active.base_url}…</p>
+              <div className="ds-card-body flex items-center justify-between gap-2 py-3">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Loader2 className="w-4 h-4 animate-spin text-brand-700 shrink-0" />
+                  <p className="text-xs text-brand-800 truncate">Agent is navigating {active.base_url}…</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={stopAgent}
+                  disabled={stopping}
+                  className="text-xs py-1 px-2 inline-flex items-center gap-1 rounded-md border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50 shrink-0"
+                >
+                  {stopping ? <Loader2 className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3 fill-current" />}
+                  Stop
+                </button>
               </div>
             </div>
           )}
@@ -560,7 +684,16 @@ function DiscoveryPageContent() {
 
           <div className="ds-card">
             <div className="ds-card-header flex items-center justify-between gap-2">
-              <h2 className="text-sm font-semibold">Live Navigation</h2>
+              <div>
+                <h2 className="text-sm font-semibold">Live Navigation</h2>
+                {running && (
+                  <p className="text-[10px] text-brand-700 mt-0.5 flex items-center gap-1">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Running {elapsedSec > 0 ? `· ${elapsedSec}s` : ""}
+                    {navLog.length > 0 ? ` · ${navLog.length} events` : ""}
+                  </p>
+                )}
+              </div>
               {active && (
                 <div className="flex items-center gap-1.5">
                   <button
@@ -586,13 +719,27 @@ function DiscoveryPageContent() {
                 </div>
               )}
             </div>
-            <div className="ds-card-body pt-0 max-h-72 overflow-auto space-y-1">
-              {navLog.length === 0 && (
+            {running && agentProgress?.message && (
+              <div className="px-4 py-2 bg-brand-50 border-b border-brand-100 text-xs text-brand-800">
+                <span className="font-medium capitalize">{agentProgress.phase ?? "status"}:</span>{" "}
+                {agentProgress.message}
+              </div>
+            )}
+            <div
+              ref={navLogRef}
+              className="ds-card-body pt-0 max-h-72 overflow-auto space-y-1 font-mono"
+            >
+              {navLog.length === 0 && running && (
+                <p className="text-xs text-[var(--text-tertiary)]">
+                  Waiting for agent… (browser launch can take 10–30s)
+                </p>
+              )}
+              {navLog.length === 0 && !running && (
                 <p className="text-xs text-[var(--text-tertiary)]">Agent activity will appear here…</p>
               )}
-              {[...navLog].reverse().slice(0, 50).map((e, i) => (
-                <div key={i} className="text-xs flex gap-2 py-1 border-b border-[var(--border-default)]/50">
-                  <span>{eventIcon(e.type)}</span>
+              {navLog.map((e, i) => (
+                <div key={`${i}-${e.timestamp ?? e.message}`} className="text-xs flex gap-2 py-1 border-b border-[var(--border-default)]/50">
+                  <span className="shrink-0">{eventIcon(e.type)}</span>
                   <span className="text-[var(--text-secondary)] flex-1">{e.message}</span>
                 </div>
               ))}
@@ -622,18 +769,29 @@ function DiscoveryPageContent() {
           {active ? (
             <>
               <div className="grid grid-cols-4 gap-3">
-                <MetricCard label="Proposed Tests" value={filteredProposed.length} icon={<CheckCircle2 className="w-4 h-4" />} />
+                <MetricCard label="Proposed Tests" value={reviewProposed.length} icon={<CheckCircle2 className="w-4 h-4" />} />
                 <MetricCard label="Screens" value={active.screens.length} icon={<Globe className="w-4 h-4" />} />
                 <MetricCard label="Flows" value={active.flow_map.length} icon={<MapIcon className="w-4 h-4" />} />
                 <MetricCard label="Status" value={active.status} />
               </div>
 
-              <div className="ds-card">
+              {reviewProposed.length > 0 && active.status !== "running" && (
+                <div className="rounded-lg border border-brand-200 bg-brand-50 px-4 py-3 text-sm text-brand-900">
+                  <p className="font-medium">Next step: import test cases into your project</p>
+                  <ol className="mt-1.5 text-xs text-brand-800 list-decimal list-inside space-y-0.5">
+                    <li>Review each proposed test — click the row to expand steps and expected results</li>
+                    <li>Check the boxes for cases you want (or use Select All)</li>
+                    <li>Choose a target module if needed, then click <strong>Import to Project</strong></li>
+                  </ol>
+                </div>
+              )}
+
+              <div className="ds-card" ref={proposedPanelRef}>
                 <div className="ds-card-header flex items-center justify-between flex-wrap gap-2">
                   <div>
                     <h2 className="text-sm font-semibold">AI-Proposed Test Cases</h2>
                     <p className="text-xs text-[var(--text-tertiary)]">
-                      Scope: sidebar env & module · saves under Project → Env → Module
+                      Review discovery results here · import saves under Project → Environment → Module
                     </p>
                   </div>
                   <div className="flex flex-wrap gap-2 items-center">
@@ -641,14 +799,14 @@ function DiscoveryPageContent() {
                       className="ds-input text-xs py-1.5"
                       value={commitModuleId}
                       onChange={(e) => setCommitModuleId(e.target.value)}
-                      title="Optional: save all selected to this module"
+                      title="Target module when importing selected cases"
                     >
                       <option value="">Auto module (from discovery)</option>
                       {displayModules.map((m) => (
                         <option key={m.id} value={m.id.startsWith("temp-") ? "" : m.id}>{m.name}</option>
                       ))}
                     </select>
-                    <button onClick={selectAllFiltered} className="ds-btn-secondary text-xs" disabled={!filteredProposed.length}>
+                    <button onClick={selectAllFiltered} className="ds-btn-secondary text-xs" disabled={!reviewProposed.length}>
                       Select All
                     </button>
                     <button onClick={deselectAll} className="ds-btn-secondary text-xs" disabled={selected.size === 0}>
@@ -664,20 +822,22 @@ function DiscoveryPageContent() {
                     </button>
                     <button onClick={commitSelected} disabled={committing || selected.size === 0} className="ds-btn-primary text-xs">
                       {committing ? <Loader2 className="w-3 h-3 animate-spin" /> : <GitCommitHorizontal className="w-3 h-3" />}
-                      Save to Project ({selected.size})
+                      Import to Project ({selected.size})
                     </button>
                   </div>
                 </div>
                 <div className="ds-card-body space-y-2 pt-0">
-                  {filteredProposed.length === 0 && active.status === "running" && (
+                  {reviewProposed.length === 0 && active.status === "running" && (
                     <p className="text-sm text-[var(--text-tertiary)] py-8 text-center">
                       QA Agent is exploring — test cases will appear as navigation progresses…
                     </p>
                   )}
-                  {filteredProposed.length === 0 && active.status !== "running" && (
-                    <p className="text-sm text-[var(--text-tertiary)] py-8 text-center">No test cases for this module filter.</p>
+                  {reviewProposed.length === 0 && active.status !== "running" && (
+                    <p className="text-sm text-[var(--text-tertiary)] py-8 text-center">
+                      No test cases were generated for this session. Try a longer discovery run or a different prompt.
+                    </p>
                   )}
-                  {filteredProposed.map((tc) => (
+                  {reviewProposed.map((tc) => (
                     <div key={tc.id} className={`rounded-lg border p-3 ${selected.has(tc.id) ? "border-brand-300 bg-brand-50/30" : "border-[var(--border-default)]"}`}>
                       <div className="flex items-start gap-3">
                         <button onClick={() => toggleSelect(tc.id)} className="mt-0.5 shrink-0">
@@ -791,8 +951,9 @@ function DiscoveryPageContent() {
 
               {projectId && (
                 <p className="text-xs text-[var(--text-tertiary)]">
-                  Committed test cases appear in{" "}
+                  Imported test cases appear in{" "}
                   <Link href={`/projects/${projectId}`} className="text-brand-700 underline">Project → Test Cases</Link>
+                  {" "}and in Studio for automation.
                 </p>
               )}
             </>

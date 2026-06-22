@@ -93,6 +93,9 @@ class DiscoveryService:
             raise ValueError("Discovery session not found")
 
         req_text = requirements or session.requirements or ""
+        from app.runners.discovery_prompt import parse_discovery_prompt
+
+        prompt_intent = parse_discovery_prompt(req_text)
         if not req_text:
             result = await self.db.execute(
                 select(RequirementModel).where(RequirementModel.project_id == project_id).limit(5)
@@ -102,9 +105,14 @@ class DiscoveryService:
         flows, screens, apis = self._infer_from_text(req_text, base_url)
         crawl_meta: dict = {}
         proposed: list[dict] = []
+        agent_result: dict = {}
         nav_log: list[dict] = list(session.navigation_log or [])
+        import time
+
+        last_commit_at = 0.0
 
         async def on_event(event: dict) -> None:
+            nonlocal last_commit_at
             from app.services.discovery_worker import (
                 is_discovery_cancel_requested,
                 is_nav_clear_requested,
@@ -122,8 +130,28 @@ class DiscoveryService:
                 return
             nav_log.append(event)
             fresh.navigation_log = list(nav_log[-200:])
+            fresh.coverage_matrix = {
+                **(fresh.coverage_matrix or {}),
+                "agent_progress": {
+                    "phase": event.get("type", "status"),
+                    "message": str(event.get("message", ""))[:240],
+                    "url": event.get("url"),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "log_count": len(nav_log),
+                },
+            }
             flag_modified(fresh, "navigation_log")
+            flag_modified(fresh, "coverage_matrix")
             await self.db.flush()
+            now = time.monotonic()
+            if now - last_commit_at >= 0.35 or event.get("type") in (
+                "agent_start",
+                "agent_complete",
+                "error",
+                "warning",
+            ):
+                await self.db.commit()
+                last_commit_at = now
 
         if mode in ("agent", "browser", "both"):
             from app.services.discovery_worker import is_discovery_cancel_requested
@@ -134,12 +162,24 @@ class DiscoveryService:
                 await self.db.flush()
                 return
 
+            await on_event({"type": "status", "message": "Starting QA Agent — launching browser…"})
+
+            from app.runners.discovery_prompt import resolve_discovery_auth
+
+            login_user, login_pass, intent = resolve_discovery_auth(req_text, username, password)
+            if intent.summary:
+                await on_event({
+                    "type": "status",
+                    "message": f"Prompt understood — {intent.summary}",
+                })
+
             agent_result = await navigate_as_qa_user(
                 base_url,
-                username=username,
-                password=password,
+                username=login_user,
+                password=login_pass,
                 requirements=req_text,
                 on_event=on_event,
+                session_id=session_id,
             )
             crawl_meta = {
                 "crawl_mode": agent_result.get("mode"),
@@ -173,17 +213,19 @@ class DiscoveryService:
         coverage["crawl"] = crawl_meta
         coverage["discovery_mode"] = mode
         coverage["proposed_test_cases"] = len(proposed)
+        coverage["strict_follow"] = prompt_intent.strict_follow and not prompt_intent.broad_exploration
+        coverage["broad_exploration"] = prompt_intent.broad_exploration
+        coverage["explicit_targets"] = prompt_intent.explicit_targets
+        coverage["wants_form_submit"] = prompt_intent.wants_form_submit
+        coverage["form_fields"] = [{"label": f.label, "value": f.value} for f in prompt_intent.form_fields]
 
         from app.services.discovery_worker import is_discovery_cancel_requested
 
         session = await self.db.get(DiscoverySessionModel, session_id)
         if not session:
             return
-        if is_discovery_cancel_requested(session_id):
-            session.status = "cancelled"
-            session.completed_at = datetime.now(timezone.utc)
-            await self.db.flush()
-            return
+
+        cancelled = is_discovery_cancel_requested(session_id) or bool(agent_result.get("cancelled"))
 
         session.flow_map = flows
         session.screens = screens
@@ -192,7 +234,7 @@ class DiscoveryService:
         session.coverage_matrix = coverage
         session.proposed_test_cases = proposed
         session.navigation_log = nav_log
-        session.status = "completed"
+        session.status = "cancelled" if cancelled else "completed"
         session.completed_at = datetime.now(timezone.utc)
         if name:
             session.name = name
@@ -201,6 +243,7 @@ class DiscoveryService:
         if req_text:
             session.requirements = req_text
         await self.db.flush()
+        await self.db.commit()
 
     def _propose_from_static_flows(self, flows: list, base_url: str) -> list[dict]:
         cases = []
@@ -382,6 +425,28 @@ class DiscoveryService:
             "completed_at": session.completed_at.isoformat() if session.completed_at else None,
         }
 
+    async def cancel_running_session(self, project_id: uuid.UUID, session_id: uuid.UUID) -> DiscoverySessionModel:
+        session = await self.get_session(session_id)
+        if not session or session.project_id != project_id:
+            raise ValueError("Discovery session not found")
+        if session.status != "running":
+            raise ValueError("Discovery session is not running")
+
+        from app.services.discovery_worker import request_cancel_discovery
+        from sqlalchemy.orm.attributes import flag_modified
+
+        request_cancel_discovery(session_id)
+        log = list(session.navigation_log or [])
+        log.append({
+            "type": "status",
+            "message": "Stop requested — agent will finish the current step and halt…",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        session.navigation_log = log[-200:]
+        flag_modified(session, "navigation_log")
+        await self.db.flush()
+        return session
+
     async def clear_navigation_log(self, project_id: uuid.UUID, session_id: uuid.UUID) -> DiscoverySessionModel:
         session = await self.get_session(session_id)
         if not session or session.project_id != project_id:
@@ -427,18 +492,16 @@ class DiscoveryService:
 
         committed: list[dict] = []
         for p in selected:
-            steps = p.get("steps") or []
-            step_texts = [
-                s.get("description") if isinstance(s, dict) else str(s)
-                for s in steps
-            ]
+            from app.services.test_steps import steps_for_storage
+
+            stored_steps = steps_for_storage(p.get("steps") or [])
             module_name = p.get("module") or p.get("screen") or "General"
             case = await create_project_test_case(
                 self.db,
                 project_id,
                 title=p.get("title", "Discovered Test"),
                 description=f"Captured by QA Agent from {session.base_url}",
-                steps=step_texts,
+                steps=stored_steps,
                 expected_results=p.get("expected_results") or ["Test completes successfully"],
                 priority=p.get("priority", "medium"),
                 module_id=default_module_id,
@@ -454,7 +517,7 @@ class DiscoveryService:
                 "case_code": case.case_code,
                 "module_id": str(case.module_id) if case.module_id else None,
                 "environment_id": str(case.environment_id) if case.environment_id else None,
-                "steps_count": len(step_texts),
+                "steps_count": len(stored_steps),
                 "proposed_id": p.get("id"),
             })
 

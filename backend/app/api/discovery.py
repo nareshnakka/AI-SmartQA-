@@ -65,6 +65,21 @@ class CommitTestsRequest(BaseModel):
     environment_id: UUID | None = None
 
 
+@router.post("/sessions/{session_id}/cancel")
+async def cancel_discovery_session(
+    project_id: UUID,
+    session_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    svc = DiscoveryService(db)
+    try:
+        session = await svc.cancel_running_session(project_id, session_id)
+        await db.commit()
+        return svc.to_dict(session)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
 @router.post("/sessions/{session_id}/clear-navigation")
 async def clear_session_navigation(
     project_id: UUID,

@@ -141,7 +141,17 @@ export function useWorkspaceScope(projectId: string | null | undefined) {
       }
     };
     window.addEventListener("qeos-workspace-change", onChange);
-    return () => window.removeEventListener("qeos-workspace-change", onChange);
+    const onHierarchyUpdated = (e: Event) => {
+      const detail = (e as CustomEvent<{ projectId: string }>).detail;
+      if (detail?.projectId === projectId) {
+        reloadHierarchy();
+      }
+    };
+    window.addEventListener("qeos-environments-updated", onHierarchyUpdated);
+    return () => {
+      window.removeEventListener("qeos-workspace-change", onChange);
+      window.removeEventListener("qeos-environments-updated", onHierarchyUpdated);
+    };
   }, [projectId, reloadHierarchy]);
 
   useEffect(() => {

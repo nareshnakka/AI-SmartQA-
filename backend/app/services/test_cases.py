@@ -23,8 +23,11 @@ def is_automation_enabled(case: TestCaseModel) -> bool:
 
 
 def test_case_to_dict(case: TestCaseModel) -> dict:
+    from app.services.test_steps import steps_for_storage
+
     mod = case.module
     env = case.environment
+    steps = steps_for_storage(case.steps or []) if case.steps else []
     return {
         "id": case.id,
         "project_id": case.project_id,
@@ -35,7 +38,7 @@ def test_case_to_dict(case: TestCaseModel) -> dict:
         "case_code": case.case_code,
         "title": case.title,
         "description": case.description,
-        "steps": case.steps,
+        "steps": steps,
         "expected_results": case.expected_results,
         "priority": case.priority,
         "tags": case.tags,

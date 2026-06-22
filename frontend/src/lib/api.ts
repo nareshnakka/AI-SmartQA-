@@ -155,7 +155,8 @@ export function executionVideoUrl(projectId: string, runId: string, videoId: str
 
 export function executionLiveFrameUrl(projectId: string, runId: string, cacheBust?: number) {
   const q = cacheBust != null ? `?t=${cacheBust}` : "";
-  return `${BACKEND_URL}/api/v1/projects/${projectId}/executions/${runId}/live-frame${q}`;
+  // Same-origin proxy (next.config rewrites) — do not use BACKEND_URL directly in <img> (auth/CORS).
+  return `/api/v1/projects/${projectId}/executions/${runId}/live-frame${q}`;
 }
 
 export function executionExportUrl(projectId: string, runId: string, format: "html" | "json" | "csv") {

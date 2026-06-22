@@ -22,11 +22,18 @@ def _venv_bin(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def _is_stale_browser_path(path: Path) -> bool:
+    s = str(path).lower()
+    return "cursor-sandbox-cache" in s or "sandbox-cache" in s
+
+
 def _playwright_browser_roots() -> list[Path]:
     roots: list[Path] = []
     env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
     if env_path:
-        roots.append(Path(env_path))
+        p = Path(env_path)
+        if p.exists() and _chromium_tree_ready(p) and not _is_stale_browser_path(p):
+            roots.append(p)
     local_app = os.environ.get("LOCALAPPDATA")
     if local_app:
         roots.append(Path(local_app) / "ms-playwright")
@@ -41,6 +48,36 @@ def _playwright_browser_roots() -> list[Path]:
         seen.add(key)
         unique.append(root)
     return unique
+
+
+def configure_playwright_browsers_env() -> tuple[bool, str]:
+    """
+    Point PLAYWRIGHT_BROWSERS_PATH at installed Chromium.
+    Ignores stale Cursor/sandbox paths that break Discovery and live runs.
+    """
+    env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if env_path:
+        p = Path(env_path)
+        if _is_stale_browser_path(p) or not p.exists() or not _chromium_tree_ready(p):
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+
+    for root in _playwright_browser_roots():
+        if root.exists() and _chromium_tree_ready(root):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
+            return True, ""
+
+    return False, "python -m playwright install chromium (or scripts\\install-playwright.bat)"
+
+
+def _playwright_browsers_on_disk() -> tuple[bool, str]:
+    """Check pip package + downloaded Chromium without launching a browser."""
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return False, "pip install playwright && python -m playwright install chromium"
+
+    ok, hint = configure_playwright_browsers_env()
+    return ok, hint
 
 
 def _chromium_tree_ready(root: Path) -> bool:
@@ -61,22 +98,9 @@ def _chromium_tree_ready(root: Path) -> bool:
     return False
 
 
-def _playwright_browsers_on_disk() -> tuple[bool, str]:
-    """Check pip package + downloaded Chromium without launching a browser."""
-    try:
-        import playwright  # noqa: F401
-    except ImportError:
-        return False, "pip install playwright && python -m playwright install chromium"
-
-    for root in _playwright_browser_roots():
-        if root.exists() and _chromium_tree_ready(root):
-            return True, ""
-
-    return False, "python -m playwright install chromium (or scripts\\install-playwright.bat)"
-
-
 def _check_playwright_python() -> tuple[bool, str]:
     """Launch Chromium — use only outside a running asyncio loop (scripts, thread pool)."""
+    configure_playwright_browsers_env()
     try:
         from playwright.sync_api import sync_playwright
 

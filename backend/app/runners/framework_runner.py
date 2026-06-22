@@ -34,16 +34,18 @@ def _escape(s: str) -> str:
 
 
 def build_test_case_files(test_cases: list[dict], framework: str, base_url: str) -> list[dict]:
+    from app.services.test_steps import normalize_test_steps
+
     files: list[dict] = []
     for i, tc in enumerate(test_cases):
         title = tc.get("title", f"Test {i}")
-        steps = tc.get("steps") or ["Execute test scenario"]
+        steps = normalize_test_steps(tc.get("steps") or ["Execute test scenario"])
+        step_descs = [s["description"] for s in steps]
         safe = re.sub(r"[^a-zA-Z0-9_-]", "_", title)[:50]
 
         if framework == "playwright":
             step_blocks = []
-            for j, step in enumerate(steps, start=1):
-                desc = step if isinstance(step, str) else step.get("description", str(step))
+            for j, desc in enumerate(step_descs, start=1):
                 step_blocks.append(f"""  await test.step('{_escape(desc)}', async () => {{
     await page.goto('{base_url}');
     await expect(page).toHaveURL(/.+/);
@@ -56,8 +58,8 @@ test('{_escape(title)}', async ({{ page }}) => {{
 
         elif framework == "cypress":
             step_lines = "\n".join(
-                f"    cy.visit('{base_url}'); cy.log('{_escape(s if isinstance(s, str) else str(s))}');"
-                for s in steps
+                f"    cy.visit('{base_url}'); cy.log('{_escape(desc)}');"
+                for desc in step_descs
             )
             content = f"""describe('{_escape(title)}', () => {{
   it('executes test steps', () => {{
@@ -68,8 +70,8 @@ test('{_escape(title)}', async ({{ page }}) => {{
 
         elif framework == "puppeteer":
             step_lines = "\n".join(
-                f"    console.log('Step: {_escape(s if isinstance(s, str) else str(s))}');"
-                for s in steps
+                f"    console.log('Step: {_escape(desc)}');"
+                for desc in step_descs
             )
             content = f"""const puppeteer = require('puppeteer');
 describe('{_escape(title)}', () => {{
@@ -85,8 +87,8 @@ describe('{_escape(title)}', () => {{
 
         elif framework == "testcafe":
             step_lines = "\n".join(
-                f"  .expect(true).ok(); // {_escape(s if isinstance(s, str) else str(s))}"
-                for s in steps
+                f"  .expect(true).ok(); // {_escape(desc)}"
+                for desc in step_descs
             )
             content = f"""import {{ Selector }} from 'testcafe';
 fixture `{_escape(title)}`.page `{base_url}`;
@@ -98,8 +100,8 @@ test('Execute steps', async t => {{
 
         elif framework == "webdriverio":
             step_lines = "\n".join(
-                f"        console.log('{_escape(s if isinstance(s, str) else str(s))}');"
-                for s in steps
+                f"        console.log('{_escape(desc)}');"
+                for desc in step_descs
             )
             content = f"""describe('{_escape(title)}', () => {{
     it('executes steps', async () => {{
@@ -111,8 +113,8 @@ test('Execute steps', async t => {{
 
         elif framework == "robot_framework":
             rf_steps = "\n".join(
-                f"    Log    {s if isinstance(s, str) else str(s)}"
-                for s in steps
+                f"    Log    {desc}"
+                for desc in step_descs
             )
             content = f"""*** Settings ***
 Library    Browser
@@ -129,8 +131,8 @@ Suite Teardown    Close Browser
 
         elif framework == "selenium":
             step_lines = "\n".join(
-                f"        // Step: {s if isinstance(s, str) else str(s)}"
-                for s in steps
+                f"        // Step: {desc}"
+                for desc in step_descs
             )
             content = f"""import org.testng.annotations.Test;
 import org.openqa.selenium.WebDriver;
@@ -149,8 +151,8 @@ public class {safe}_{i} {{
 
         else:  # appium
             step_lines = "\n".join(
-                f"    # Step: {s if isinstance(s, str) else str(s)}"
-                for s in steps
+                f"    # Step: {desc}"
+                for desc in step_descs
             )
             content = f"""import pytest
 
@@ -279,6 +281,8 @@ async def run_framework(
     total_steps: int = 15,
     on_step_progress: Callable[[dict], Awaitable[None]] | None = None,
     cancel_run_id: str | None = None,
+    base_url: str | None = None,
+    login_env: dict[str, str] | None = None,
 ) -> dict:
     timeout_sec = timeout_sec or settings.execution_timeout_sec
 
@@ -295,6 +299,8 @@ async def run_framework(
             total_steps=total_steps,
             on_step_progress=on_step_progress,
             cancel_run_id=cancel_run_id,
+            base_url=base_url,
+            login_env=login_env,
         )
 
     if not node_available() and framework in ("cypress", "puppeteer", "testcafe", "webdriverio"):

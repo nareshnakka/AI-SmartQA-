@@ -1,6 +1,8 @@
 import { apiFetch } from "@/lib/api";
 
-export type TestCaseStep = string | { description: string; disabled?: boolean };
+export type TestCaseStep =
+  | string
+  | { description: string; disabled?: boolean; order?: number; action?: string; url?: string };
 
 export interface AutomationTestCase {
   id: string;
@@ -63,6 +65,19 @@ export async function fetchTestCases(
   if (opts?.environmentIds?.length) params.set("environment_id", opts.environmentIds.join(","));
   const qs = params.toString() ? `?${params}` : "";
   return apiFetch<AutomationTestCase[]>(`/api/v1/projects/${projectId}/test-cases${qs}`);
+}
+
+export type TestCasesUpdatedDetail = {
+  projectId: string;
+  caseIds?: string[];
+  environmentId?: string | null;
+  moduleIds?: string[];
+};
+
+/** Notify other pages (e.g. Automation IDE) to reload test cases after Discovery import. */
+export function notifyTestCasesUpdated(detail: TestCasesUpdatedDetail) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent("qeos-test-cases-updated", { detail }));
 }
 
 export async function createTestCase(
