@@ -77,3 +77,23 @@ def test_instruction_mode_no_broad_explore_on_form_only():
     assert intent.strict_follow is True
     assert intent.broad_exploration is False
     assert intent.wants_form_submit is True
+
+
+def test_contact_us_tab_normalizes_target():
+    from app.runners.discovery_prompt import navigation_targets, normalize_nav_target
+
+    prompt = (
+        "no login\n\nOpen Contact Us tab and view the contact page, then submit the enquiry form:\n"
+        "Your Name: Jane Doe\nEmail: jane@example.com"
+    )
+    intent = parse_discovery_prompt(prompt)
+    nav = navigation_targets(intent)
+    assert any(normalize_nav_target(t).lower() == "contact us" for t in nav)
+    assert not any("view the contact" in t.lower() for t in nav)
+
+
+def test_normalize_nav_target_strips_noise():
+    from app.runners.discovery_prompt import normalize_nav_target
+
+    assert normalize_nav_target("Contact Us tab and view the contact").lower() == "contact us"
+    assert normalize_nav_target("Payroll module").lower() == "payroll"

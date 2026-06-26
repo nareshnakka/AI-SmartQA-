@@ -637,7 +637,7 @@ class ExecutionService:
             except FileNotFoundError as exc:
                 logs.append(f"ERROR: {exc}")
 
-        if framework == "playwright" and (embed_live or headed):
+        if framework == "playwright":
             try:
                 bundle = load_orangehrm_e2e_files(base_url) if orangehrm else load_generic_e2e_files(base_url)
                 refresh_prefixes = ("utils/", "pages/", "fixtures/")
@@ -729,14 +729,24 @@ class ExecutionService:
             step_index = int(data.get("step_index") or 0)
             status = str(data.get("status") or "running")
             mapped = "running" if status == "running" else ("passed" if status == "passed" else "failed")
+            tc_id = str(data.get("test_case_id") or "")
+            tc_index = 0
+            if tc_id:
+                for i, row in enumerate(run_row.results):
+                    if row.get("test_case_id") == tc_id:
+                        tc_index = i
+                        break
             live_results = list(run_row.results)
-            ExecutionService._apply_live_step_progress(live_results, 0, step_index, mapped)
+            ExecutionService._apply_live_step_progress(live_results, tc_index, step_index, mapped)
             run_row.results = live_results
             flag_modified(run_row, "results")
             prog = dict(run_row.progress or {})
             prog["current_step_index"] = step_index
             prog["phase"] = "playwright_test"
             prog["detail"] = str(data.get("description") or f"Step {step_index + 1}")
+            prog["executor"] = "asset_live_v2"
+            if tc_id:
+                prog["current_test_case_id"] = tc_id
             run_row.progress = prog
             flag_modified(run_row, "progress")
             await self.db.flush()
@@ -753,7 +763,7 @@ class ExecutionService:
                 progress_path=progress_path,
                 live_frame_path=live_frame_path,
                 total_steps=total_steps,
-                on_step_progress=on_step_progress if (embed_live or headed) else None,
+                on_step_progress=on_step_progress,
                 cancel_run_id=str(run_id),
                 base_url=base_url,
                 login_env=login_env,

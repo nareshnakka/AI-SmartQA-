@@ -187,8 +187,9 @@ export default function ExecutionsPage() {
     [testCasesById, testCases]
   );
 
-  const pollRun = useCallback((pid: string, runId: string) => {
+  const pollRun = useCallback((pid: string, runId: string, fast = false) => {
     if (pollRef.current) clearInterval(pollRef.current);
+    const intervalMs = fast ? 350 : 1500;
     pollRef.current = setInterval(async () => {
       try {
         const run = await apiFetch<ExecutionRun>(`/api/v1/projects/${pid}/executions/${runId}`);
@@ -205,7 +206,7 @@ export default function ExecutionsPage() {
       } catch {
         setRunning(false);
       }
-    }, 1500);
+    }, intervalMs);
   }, [loadProjectData]);
 
   useEffect(() => () => {
@@ -270,6 +271,7 @@ export default function ExecutionsPage() {
         body: JSON.stringify({
           test_case_ids: [testCaseId],
           mode: "live",
+          embed_live: true,
           background: true,
           framework: matchedAsset?.framework ?? framework,
           base_url: baseUrl,
@@ -282,7 +284,7 @@ export default function ExecutionsPage() {
       activeRunIdRef.current = run.id;
       setActive(run);
       setTab("history");
-      pollRun(projectId, run.id);
+      pollRun(projectId, run.id, true);
     } catch {
       setRunning(false);
       setDebugTestCaseId(null);

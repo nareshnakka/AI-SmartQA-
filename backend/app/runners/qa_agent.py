@@ -16,6 +16,64 @@ SKIP_TEXT = re.compile(
     re.I,
 )
 
+_BLOCKED_EXTERNAL_HOSTS = (
+    "facebook.com",
+    "twitter.com",
+    "x.com",
+    "linkedin.com",
+    "instagram.com",
+    "youtube.com",
+    "tiktok.com",
+    "pinterest.com",
+)
+
+
+def _compact_nav_label(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _score_nav_label_match(target: str, candidate: str) -> int:
+    """Score how well a link/menu label matches the user's navigation target."""
+    from app.runners.discovery_prompt import normalize_nav_target
+
+    t = _compact_nav_label(normalize_nav_target(target))
+    c = _compact_nav_label(candidate)
+    if not t or not c:
+        return 0
+    if t == c:
+        return 100
+    t_compact = t.replace(" ", "")
+    c_compact = c.replace(" ", "")
+    if t_compact == c_compact:
+        return 98
+    if t in c or c in t:
+        shorter = min(len(t), len(c))
+        if shorter >= 4:
+            return 72 + min(shorter, 20)
+        return 0
+    t_words = set(t.split())
+    c_words = set(c.split())
+    overlap = t_words & c_words
+    if overlap and len(overlap) >= min(len(t_words), max(1, len(t_words) - 1)):
+        return 58 + 12 * len(overlap)
+    return 0
+
+
+def _host_blocked(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return any(host == h or host.endswith(f".{h}") for h in _BLOCKED_EXTERNAL_HOSTS)
+
+
+def _is_allowed_nav_url(url: str, origin: str) -> bool:
+    if not url or url.startswith("javascript:") or url == "#":
+        return False
+    if _host_blocked(url):
+        return False
+    return _same_origin(origin, url)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -64,6 +122,7 @@ async def navigate_as_qa_user(
                 max_pages or settings.discovery_max_pages,
                 on_event_cb,
                 reason=pw_hint,
+                requirements=requirements,
             )
 
         configure_playwright_browsers_env()
@@ -76,6 +135,7 @@ async def navigate_as_qa_user(
                 max_pages or settings.discovery_max_pages,
                 on_event_cb,
                 reason=str(exc) or "playwright package not installed",
+                requirements=requirements,
             )
 
         try:
@@ -96,6 +156,7 @@ async def navigate_as_qa_user(
                 max_pages or settings.discovery_max_pages,
                 on_event_cb,
                 reason="Playwright subprocess not supported on this platform",
+                requirements=requirements,
             )
         except Exception as e:
             err = str(e) or type(e).__name__
@@ -109,6 +170,7 @@ async def navigate_as_qa_user(
                 max_pages or settings.discovery_max_pages,
                 on_event_cb,
                 reason=reason,
+                requirements=requirements,
             )
 
     if use_isolated:
@@ -275,35 +337,76 @@ async def _menu_item_href(page, text: str) -> str | None:
         return None
 
 
-async def _click_menu_item(page, text: str) -> bool:
+async def _collect_nav_link_candidates(page, origin: str) -> list[dict]:
+    raw = await page.eval_on_selector_all(
+        "nav a, header a, .menu a, .navbar a, .nav a, [role=navigation] a, a[href]",
+        """els => els.map(e => ({
+            href: e.href,
+            text: (e.innerText || e.textContent || e.getAttribute('aria-label') || '').trim().slice(0, 80)
+        })).filter(x => x.href && x.text)""",
+    )
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        href = item.get("href", "")
+        if not _is_allowed_nav_url(href, origin):
+            continue
+        text = (item.get("text") or "").strip()
+        if not text or text in seen or SKIP_TEXT.search(text):
+            continue
+        seen.add(text)
+        out.append({"href": href, "text": text})
+    return out
+
+
+async def _click_menu_item(page, text: str, *, origin: str | None = None) -> bool:
+    from app.runners.discovery_prompt import normalize_nav_target
+
     if SKIP_TEXT.search(text):
         return False
 
-    for selector in [".oxd-main-menu-item", "[role=menuitem]", "nav a", ".sidebar a", "header nav a"]:
-        loc = page.locator(selector).filter(has_text=text)
-        if await loc.count():
-            if await _safe_click(page, loc):
-                return True
-            break
+    target = normalize_nav_target(text)
+    if not target:
+        return False
+    origin = origin or f"{urlparse(page.url).scheme}://{urlparse(page.url).netloc}"
 
-    loc = page.get_by_role("link", name=text, exact=False)
-    if await loc.count():
-        if await _safe_click(page, loc):
-            return True
+    best_score = 0
+    best: dict | None = None
+    for item in await _collect_nav_link_candidates(page, origin):
+        score = _score_nav_label_match(target, item["text"])
+        if "contact" in target.lower() and re.search(r"contact", item.get("href", ""), re.I):
+            score += 20
+        if score > best_score:
+            best_score = score
+            best = item
 
-    loc = page.get_by_text(text, exact=True)
-    if await loc.count():
-        if await _safe_click(page, loc):
-            return True
-
-    href = await _menu_item_href(page, text)
-    if href:
+    if best and best_score >= 58:
         try:
-            dest = urljoin(page.url, href)
-            await page.goto(dest, timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
-            return True
+            await page.goto(best["href"], timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+            await _wait_for_spa(page)
+            if _is_allowed_nav_url(page.url, origin):
+                return True
         except Exception:
             pass
+        loc = page.get_by_role("link", name=best["text"], exact=True)
+        if await loc.count() and await _safe_click(page, loc):
+            await _wait_for_spa(page)
+            return _is_allowed_nav_url(page.url, origin)
+
+    for selector in [".oxd-main-menu-item", "[role=menuitem]", "nav a", ".sidebar a", "header nav a"]:
+        loc = page.locator(selector).filter(has_text=re.compile(rf"^{re.escape(target)}$", re.I))
+        if await loc.count():
+            if await _safe_click(page, loc):
+                await _wait_for_spa(page)
+                return _is_allowed_nav_url(page.url, origin)
+            break
+
+    loc = page.get_by_role("link", name=target, exact=True)
+    if await loc.count():
+        if await _safe_click(page, loc):
+            await _wait_for_spa(page)
+            return _is_allowed_nav_url(page.url, origin)
+
     return False
 
 
@@ -785,14 +888,386 @@ _FORM_LINK_KEYWORDS = (
     "enquiry", "inquiry", "contact", "contact us", "get in touch", "feedback", "request", "support",
 )
 
+_CONTACT_PAGE_PATHS = (
+    "/contact-us.html",
+    "/contact-us",
+    "/contactus.html",
+    "/contact.html",
+    "/contactus",
+    "/contact",
+    "/enquiry.html",
+    "/enquiry",
+    "/get-in-touch",
+    "/reach-us",
+)
+
+# Prompt label → common input name / id attributes (Vivilex uses name=comments for Message)
+_FIELD_NAME_ALIASES: dict[str, list[str]] = {
+    "your name": ["name", "fullname", "full_name", "your_name"],
+    "name": ["name", "fullname", "full_name"],
+    "e-mail": ["email", "e-mail", "mail"],
+    "email": ["email", "e-mail", "mail"],
+    "mobile number": ["mobile", "phone", "tel", "mobile_number"],
+    "mobile": ["mobile", "phone", "tel"],
+    "phone": ["phone", "mobile", "tel"],
+    "organization name": ["organization", "company", "org", "organisation"],
+    "organization": ["organization", "company", "org", "organisation"],
+    "company": ["company", "organization", "org"],
+    "message": ["comments", "message", "body", "enquiry", "inquiry", "description"],
+}
+
+
+def _field_name_candidates(label: str) -> list[str]:
+    key = re.sub(r"\s*\*+\s*$", "", label.strip().lower())
+    key = re.sub(r"\s+", " ", key)
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        n = name.strip().lower()
+        if n and n not in seen:
+            seen.add(n)
+            names.append(n)
+
+    for alias in _FIELD_NAME_ALIASES.get(key, []):
+        add(alias)
+    compact = key.replace(" ", "").replace("-", "")
+    if compact:
+        add(compact)
+    for token in key.split():
+        if len(token) >= 3:
+            add(token)
+    return names
+
+
+async def _scroll_to_form(page) -> None:
+    try:
+        form = page.locator("form").first
+        if await form.count():
+            await form.scroll_into_view_if_needed(timeout=8000)
+            return
+        section = page.locator(".send_message, .contact-form, #contact, [class*='contact']").first
+        if await section.count():
+            await section.scroll_into_view_if_needed(timeout=8000)
+    except Exception:
+        pass
+
+
+async def _discover_form_inputs(page) -> list[dict]:
+    """List visible inputs/textareas with nearby label text."""
+    try:
+        return await page.evaluate(
+            """() => {
+                const skipTypes = new Set(['hidden', 'submit', 'button', 'reset', 'image']);
+                const items = [];
+                const visible = (el) => {
+                    const s = window.getComputedStyle(el);
+                    return s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null;
+                };
+                const clean = (t) => (t || '').replace(/\\s*\\*+\\s*$/g, '').trim();
+                const labelFor = (el) => {
+                    if (el.id) {
+                        const lb = document.querySelector('label[for="' + el.id + '"]');
+                        if (lb) return clean(lb.innerText || lb.textContent);
+                    }
+                    let node = el.parentElement;
+                    for (let i = 0; i < 6 && node; i++) {
+                        const prev = node.previousElementSibling;
+                        if (prev) {
+                            const t = clean(prev.innerText || prev.textContent);
+                            if (t) return t;
+                        }
+                        const lab = node.querySelector('p.label, .label, label, legend, .form-label');
+                        if (lab) return clean(lab.innerText || lab.textContent);
+                        node = node.parentElement;
+                    }
+                    return clean(el.getAttribute('aria-label') || el.placeholder || '');
+                };
+                for (const el of document.querySelectorAll('input, textarea, select')) {
+                    const typ = (el.type || el.tagName).toLowerCase();
+                    if (skipTypes.has(typ)) continue;
+                    if (!visible(el)) continue;
+                    items.push({
+                        name: el.name || '',
+                        id: el.id || '',
+                        type: typ,
+                        tag: el.tagName.toLowerCase(),
+                        label: labelFor(el),
+                        placeholder: el.placeholder || '',
+                    });
+                }
+                return items;
+            }"""
+        )
+    except Exception:
+        return []
+
+
+def _score_prompt_field_to_input(prompt_label: str, discovered: dict) -> int:
+    key = re.sub(r"\s*\*+\s*$", "", prompt_label.strip().lower())
+    label = re.sub(r"\s*\*+\s*$", "", (discovered.get("label") or "").lower()).strip()
+    name = (discovered.get("name") or discovered.get("id") or "").lower()
+    placeholder = (discovered.get("placeholder") or "").lower()
+
+    for candidate in _field_name_candidates(prompt_label):
+        if candidate == name or candidate == (discovered.get("id") or "").lower():
+            return 100
+        if candidate in name or name in candidate:
+            return 92
+
+    if key and label:
+        if key == label or key in label or label in key:
+            return 85
+        key_compact = key.replace(" ", "").replace("-", "")
+        label_compact = label.replace(" ", "").replace("-", "")
+        if key_compact and key_compact in label_compact:
+            return 78
+
+    if key and placeholder and (key in placeholder or placeholder in key):
+        return 70
+
+    return 0
+
+
+async def _click_then_fill(el, value: str) -> None:
+    await el.click(timeout=5000)
+    await el.fill(value, timeout=8000)
+
+
+async def _type_value_into_locator(locator, value: str) -> bool:
+    """Click, fill, and verify — with JS fallback for stubborn legacy forms."""
+    try:
+        el = locator.first
+        if not await locator.count():
+            return False
+    except Exception:
+        return False
+
+    try:
+        await el.scroll_into_view_if_needed(timeout=6000)
+    except Exception:
+        pass
+
+    for fill_fn in (
+        lambda: el.fill(value, timeout=8000),
+        lambda: _click_then_fill(el, value),
+        lambda: el.fill(value, force=True, timeout=8000),
+    ):
+        try:
+            await fill_fn()
+            current = await el.input_value()
+            if current == value or (value and value[:8] in (current or "")):
+                return True
+        except Exception:
+            continue
+
+    try:
+        ok = await el.evaluate(
+            """(element, val) => {
+                element.focus();
+                element.scrollIntoView({ block: 'center' });
+                element.value = val;
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                return element.value === val || (val && element.value.includes(val.slice(0, 8)));
+            }""",
+            value,
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+async def _fill_input_by_name(page, name: str, value: str) -> bool:
+    if not name:
+        return False
+    for sel in (
+        f"input[name='{name}']",
+        f"textarea[name='{name}']",
+        f"select[name='{name}']",
+        f"#{name}",
+    ):
+        loc = page.locator(sel)
+        if await loc.count():
+            return await _type_value_into_locator(loc, value)
+    return False
+
+
+async def _page_ready_for_contact_form(page) -> bool:
+    try:
+        score = await page.evaluate(
+            """() => {
+                const fields = Array.from(document.querySelectorAll(
+                    'input:not([type=hidden]):not([type=submit]):not([type=button]), textarea'
+                )).filter(el => el.offsetParent !== null);
+                if (fields.length < 2) return 0;
+                const blob = fields.map(el =>
+                    ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.type || '')).toLowerCase()
+                ).join(' ');
+                let s = fields.length;
+                if (/name|email|mail|mobile|phone|organization|comment|message/.test(blob)) s += 10;
+                if (document.querySelector('textarea')) s += 5;
+                if (document.querySelector('form')) s += 3;
+                return s;
+            }"""
+        )
+        return int(score or 0) >= 8
+    except Exception:
+        return False
+
+
+async def _ensure_contact_form_page(
+    page, origin: str, emit, explicit_targets: list[str] | None = None,
+) -> bool:
+    """Navigate until a real contact/enquiry form is visible."""
+    if await _page_ready_for_contact_form(page):
+        return True
+
+    if await _navigate_to_form_page(page, origin, emit, explicit_targets):
+        await _scroll_to_form(page)
+        if await _page_ready_for_contact_form(page):
+            return True
+
+    if await _try_same_origin_contact_paths(page, origin, emit):
+        await _scroll_to_form(page)
+        if await _page_ready_for_contact_form(page) or await _page_has_fillable_form(page):
+            return True
+
+    return False
+
+
+async def _fill_all_prompt_fields(page, form_fields: list, emit) -> tuple[int, list[str]]:
+    """Fill every prompt field using name aliases, discovery, and label heuristics."""
+    discovered = await _discover_form_inputs(page)
+    await emit({
+        "type": "observe",
+        "message": f"Form scan — {len(discovered)} fillable field(s) on {urlparse(page.url).path or page.url}",
+        "url": page.url,
+        "elements": {"form_fields": len(discovered)},
+    })
+
+    filled_labels: set[str] = set()
+    missing: list[str] = []
+
+    for field in form_fields:
+        label = field.label.strip()
+        value = field.value.strip()
+        if not label or not value:
+            continue
+        if label.lower() in filled_labels:
+            continue
+
+        done = False
+
+        for name in _field_name_candidates(label):
+            if await _fill_input_by_name(page, name, value):
+                done = True
+                break
+
+        if not done and discovered:
+            best_score = 0
+            best_idx = -1
+            for i, meta in enumerate(discovered):
+                if meta.get("_used"):
+                    continue
+                score = _score_prompt_field_to_input(label, meta)
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+            if best_idx >= 0 and best_score >= 70:
+                meta = discovered[best_idx]
+                sel_parts = []
+                if meta.get("name"):
+                    sel_parts.append(f"[name='{meta['name']}']")
+                if meta.get("id"):
+                    sel_parts.append(f"#{meta['id']}")
+                for sel in sel_parts:
+                    tag = meta.get("tag") or "input"
+                    loc = page.locator(f"{tag}{sel}")
+                    if await loc.count() and await _type_value_into_locator(loc, value):
+                        discovered[best_idx]["_used"] = True
+                        done = True
+                        break
+
+        if not done:
+            done = await _fill_by_paragraph_label(page, label, value)
+
+        if not done:
+            for sel in (
+                f"input[name='{label.lower().replace(' ', '')}']",
+                f"textarea[name='{label.lower().replace(' ', '')}']",
+            ):
+                loc = page.locator(sel)
+                if await loc.count() and await _type_value_into_locator(loc, value):
+                    done = True
+                    break
+
+        if done:
+            filled_labels.add(label.lower())
+            await emit({
+                "type": "fill",
+                "message": f"Filled '{label}' → {value[:60]}",
+                "url": page.url,
+                "field": label,
+            })
+        else:
+            missing.append(label)
+
+    if missing:
+        extra = await _fill_remaining_fields_sequential(page, form_fields, filled_labels, emit)
+        if extra:
+            for field in form_fields:
+                if field.label.lower() not in filled_labels:
+                    for name in _field_name_candidates(field.label):
+                        loc = page.locator(f"input[name='{name}'], textarea[name='{name}'], #{name}")
+                        if await loc.count():
+                            val = await loc.first.input_value()
+                            if val and field.value[:6] in val:
+                                filled_labels.add(field.label.lower())
+                                break
+        missing = [f.label for f in form_fields if f.label.lower() not in filled_labels]
+
+    return len(filled_labels), missing
+
+
+async def _try_same_origin_contact_paths(page, origin: str, emit) -> bool:
+    """Common contact URL paths when menu matching fails."""
+    base = origin.rstrip("/")
+    paths = _CONTACT_PAGE_PATHS
+    for path in paths:
+        url = f"{base}{path}"
+        try:
+            await emit({
+                "type": "navigate",
+                "message": f"Trying contact page — {url}",
+                "url": page.url,
+                "target": url,
+            })
+            resp = await page.goto(url, timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+            await _wait_for_spa(page)
+            if not _is_allowed_nav_url(page.url, origin):
+                continue
+            status = resp.status if resp else 0
+            if status == 404:
+                continue
+            if await _page_has_fillable_form(page):
+                return True
+            body = (await page.locator("body").inner_text())[:1500].lower()
+            if any(k in body for k in ("contact", "enquiry", "message", "your name", "e-mail", "email")):
+                return True
+        except Exception:
+            continue
+    return False
+
 
 async def _open_named_target(page, target: str, origin: str, emit) -> bool:
     """Navigate to a page or module named in the user's prompt."""
-    target_clean = target.strip()
+    from app.runners.discovery_prompt import normalize_nav_target
+
+    target_clean = normalize_nav_target(target.strip())
     if not target_clean:
         return False
 
-    target_lower = target_clean.lower()
     await emit({
         "type": "click",
         "message": f"Open \"{target_clean}\" as instructed",
@@ -800,8 +1275,7 @@ async def _open_named_target(page, target: str, origin: str, emit) -> bool:
         "element": target_clean,
     })
 
-    if await _click_menu_item(page, target_clean):
-        await _wait_for_spa(page)
+    if await _click_menu_item(page, target_clean, origin=origin):
         title = await page.title()
         await emit({
             "type": "navigate",
@@ -811,42 +1285,28 @@ async def _open_named_target(page, target: str, origin: str, emit) -> bool:
         })
         return True
 
-    for link in await _collect_actionable_links(page, origin):
-        text_lower = link["text"].lower()
-        if target_lower in text_lower or text_lower in target_lower:
-            try:
-                await emit({
-                    "type": "navigate",
-                    "message": f"Following link \"{link['text']}\" → {link['href']}",
-                    "url": page.url,
-                    "target": link["href"],
-                    "element": link["text"],
-                })
-                await page.goto(link["href"], timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
-                await _wait_for_spa(page)
-                title = await page.title()
-                await emit({
-                    "type": "navigate",
-                    "message": f"Opened {target_clean} — {title or page.url}",
-                    "url": page.url,
-                    "title": title,
-                })
-                return True
-            except Exception as exc:
-                await emit({
-                    "type": "warning",
-                    "message": f"Could not follow link \"{link['text']}\": {str(exc)[:120]}",
-                    "url": link["href"],
-                })
+    best_score = 0
+    best: dict | None = None
+    for link in await _collect_nav_link_candidates(page, origin):
+        score = _score_nav_label_match(target_clean, link["text"])
+        if "contact" in target_clean.lower() and re.search(r"contact", link.get("href", ""), re.I):
+            score += 20
+        if score > best_score:
+            best_score = score
+            best = link
 
-    for item in await _collect_menu_items(page):
-        text = (item.get("text") or "").strip()
-        if not text or SKIP_TEXT.search(text):
-            continue
-        text_lower = text.lower()
-        if target_lower in text_lower or text_lower in target_lower:
-            if await _click_menu_item(page, text):
-                await _wait_for_spa(page)
+    if best and best_score >= 58:
+        try:
+            await emit({
+                "type": "navigate",
+                "message": f"Following link \"{best['text']}\" → {best['href']}",
+                "url": page.url,
+                "target": best["href"],
+                "element": best["text"],
+            })
+            await page.goto(best["href"], timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+            await _wait_for_spa(page)
+            if _is_allowed_nav_url(page.url, origin):
                 title = await page.title()
                 await emit({
                     "type": "navigate",
@@ -855,12 +1315,33 @@ async def _open_named_target(page, target: str, origin: str, emit) -> bool:
                     "title": title,
                 })
                 return True
+            await emit({
+                "type": "warning",
+                "message": f"Skipped \"{best['text']}\" — left the application (external site)",
+                "url": page.url,
+            })
+        except Exception as exc:
+            await emit({
+                "type": "warning",
+                "message": f"Could not follow link \"{best['text']}\": {str(exc)[:120]}",
+                "url": best["href"],
+            })
+
+    if await _try_same_origin_contact_paths(page, origin, emit):
+        title = await page.title()
+        await emit({
+            "type": "navigate",
+            "message": f"Opened contact page — {title or page.url}",
+            "url": page.url,
+            "title": title,
+        })
+        return True
 
     await emit({
         "type": "warning",
         "message": (
-            f"Could not find \"{target_clean}\" on this page — "
-            "check spelling matches a menu or link, or put the form URL in Base URL"
+            f"Could not find \"{target_clean}\" on this site — "
+            "check the menu label or put the contact page URL in Base URL"
         ),
         "url": page.url,
     })
@@ -955,7 +1436,8 @@ async def _fill_remaining_fields_sequential(page, fields: list, filled_labels: s
                 elif input_type in ("checkbox", "radio"):
                     await el.check()
                 else:
-                    await el.fill(field.value)
+                    if not await _type_value_into_locator(el, field.value):
+                        continue
                 await emit({
                     "type": "fill",
                     "message": f"Filled '{field.label}' → {field.value[:60]} (by field order)",
@@ -979,66 +1461,130 @@ async def _page_has_fillable_form(page) -> bool:
 
 
 async def _navigate_to_form_page(page, origin: str, emit, explicit_targets: list[str] | None = None) -> bool:
+    if not _is_allowed_nav_url(page.url, origin):
+        await emit({
+            "type": "error",
+            "message": "Not on the application site — cannot fill the contact form on an external page",
+            "url": page.url,
+        })
+        return False
     if await _page_has_fillable_form(page):
         return True
 
+    from app.runners.discovery_prompt import normalize_nav_target
+
     keywords = list(_FORM_LINK_KEYWORDS)
     for target in explicit_targets or []:
-        if target.lower() not in keywords:
-            keywords.append(target.lower())
+        cleaned = normalize_nav_target(target).lower()
+        if cleaned and cleaned not in keywords:
+            keywords.append(cleaned)
 
-    for link in await _collect_actionable_links(page, origin):
+    best_score = 0
+    best: dict | None = None
+    for link in await _collect_nav_link_candidates(page, origin):
         text = link["text"].lower()
+        score = max(
+            (_score_nav_label_match(k, link["text"]) for k in keywords),
+            default=0,
+        )
         if any(k in text for k in keywords):
-            try:
-                await emit({
-                    "type": "navigate",
-                    "message": f"Opening form page — \"{link['text']}\"",
-                    "url": page.url,
-                    "target": link["href"],
-                })
-                await page.goto(link["href"], timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
-                await _wait_for_spa(page)
-                return await _page_has_fillable_form(page)
-            except Exception as exc:
-                await emit({"type": "warning", "message": f"Could not open form link: {str(exc)[:120]}", "url": link["href"]})
+            score = max(score, 65)
+        if score > best_score:
+            best_score = score
+            best = link
+
+    if best and best_score >= 58:
+        try:
+            await emit({
+                "type": "navigate",
+                "message": f"Opening form page — \"{best['text']}\"",
+                "url": page.url,
+                "target": best["href"],
+            })
+            await page.goto(best["href"], timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+            await _wait_for_spa(page)
+            if _is_allowed_nav_url(page.url, origin) and await _page_has_fillable_form(page):
+                return True
+        except Exception as exc:
+            await emit({"type": "warning", "message": f"Could not open form link: {str(exc)[:120]}", "url": best["href"]})
 
     for item in await _collect_menu_items(page):
         text = (item.get("text") or "").strip()
         if not text or SKIP_TEXT.search(text):
             continue
-        if any(k in text.lower() for k in keywords):
+        if max((_score_nav_label_match(k, text) for k in keywords), default=0) >= 58:
             await emit({"type": "click", "message": f"Open \"{text}\" for form", "url": page.url, "element": text})
-            if await _click_menu_item(page, text):
+            if await _click_menu_item(page, text, origin=origin):
                 await _wait_for_spa(page)
-                if await _page_has_fillable_form(page):
+                if _is_allowed_nav_url(page.url, origin) and await _page_has_fillable_form(page):
                     return True
+
+    return await _try_same_origin_contact_paths(page, origin, emit)
+
+
+async def _fill_by_paragraph_label(page, label_clean: str, value: str) -> bool:
+    """Sites that use <p class=\"label\"> instead of <label for=\"\">."""
+    core = re.sub(r"\s*\*+\s*$", "", label_clean).strip()
+    if not core:
+        return False
+    pattern = re.compile(re.escape(core), re.I)
+    for sel in ("p.label", ".label", "label", "span.label", ".form-label", "legend"):
+        loc = page.locator(sel).filter(has_text=pattern)
+        count = await loc.count()
+        for i in range(count):
+            label_el = loc.nth(i)
+            try:
+                field = label_el.locator("xpath=following::input[1] | following::textarea[1] | following::select[1]")
+                if not await field.count():
+                    field = label_el.locator("xpath=..//input | xpath=..//textarea | xpath=..//select")
+                if not await field.count():
+                    field = label_el.locator("xpath=ancestor::*[1]//input | ancestor::*[1]//textarea | ancestor::*[1]//select")
+                if not await field.count():
+                    continue
+                if await _type_value_into_locator(field, value):
+                    return True
+            except Exception:
+                continue
     return False
 
 
 async def _fill_form_field(page, label: str, value: str, emit) -> bool:
     label_clean = label.strip()
     label_lower = label_clean.lower()
-    escaped = re.escape(label_clean)
+    escaped = re.escape(re.sub(r"\s*\*+\s*$", "", label_clean))
 
-    strategies: list = [
+    strategies: list = []
+
+    for name in _field_name_candidates(label_clean):
+        strategies.append(
+            lambda n=name: page.locator(
+                f"input[name='{n}'], textarea[name='{n}'], select[name='{n}'], "
+                f"input#{n}, textarea#{n}, select#{n}"
+            )
+        )
+        strategies.append(lambda n=name: page.locator(f"input[name*='{n}'], textarea[name*='{n}']"))
+
+    strategies.extend([
         lambda: page.get_by_label(re.compile(escaped, re.I)),
         lambda: page.get_by_placeholder(re.compile(escaped, re.I)),
         lambda: page.locator(
-            f"input[name*='{label_lower}'], textarea[name*='{label_lower}'], select[name*='{label_lower}']"
-        ),
-        lambda: page.locator(
-            f"input[id*='{label_lower}'], textarea[id*='{label_lower}'], select[id*='{label_lower}']"
+            f"input[name*='{label_lower.replace(' ', '')}'], textarea[name*='{label_lower.replace(' ', '')}']"
         ),
         lambda: page.get_by_role("textbox", name=re.compile(escaped, re.I)),
-    ]
+    ])
 
-    if "email" in label_lower:
-        strategies.insert(0, lambda: page.locator("input[type=email]"))
+    if "email" in label_lower or "e-mail" in label_lower:
+        strategies.insert(0, lambda: page.locator("input[type=email], input[name='email'], input#email"))
     if any(k in label_lower for k in ("phone", "mobile", "tel")):
-        strategies.insert(0, lambda: page.locator("input[type=tel], input[name*='phone'], input[name*='mobile']"))
+        strategies.insert(0, lambda: page.locator(
+            "input[type=tel], input[name='mobile'], input#mobile, input[name*='phone'], input[name*='mobile']"
+        ))
     if any(k in label_lower for k in ("message", "comment", "enquiry", "inquiry", "description", "details")):
-        strategies.insert(0, lambda: page.locator("textarea"))
+        strategies.insert(0, lambda: page.locator(
+            "textarea, textarea[name='comments'], textarea#comments, textarea[name='message']"
+        ))
+    if "name" in label_lower and "organization" not in label_lower:
+        strategies.insert(0, lambda: page.locator("input[name='name'], input#name"))
 
     for strategy in strategies:
         try:
@@ -1066,21 +1612,43 @@ async def _fill_form_field(page, label: str, value: str, emit) -> bool:
             return True
         except Exception:
             continue
+
+    if await _fill_by_paragraph_label(page, label_clean, value):
+        await emit({
+            "type": "fill",
+            "message": f"Filled '{label_clean}' → {value[:60]}",
+            "url": page.url,
+            "field": label_clean,
+        })
+        return True
     return False
 
 
 async def _click_form_submit(page, emit) -> bool:
     submit_patterns = [
-        "button[type=submit]",
         "input[type=submit]",
+        "button[type=submit]",
+        "form input.btn[type=submit]",
+        "form .general_button",
     ]
     for sel in submit_patterns:
         loc = page.locator(sel)
         if await loc.count() and await _safe_click(page, loc):
-            await emit({"type": "click", "message": "Click submit button", "url": page.url, "element": "Submit"})
+            val = await loc.first.get_attribute("value")
+            label = (val or "Submit").strip()
+            await emit({"type": "click", "message": f"Click \"{label}\"", "url": page.url, "element": label})
             return True
 
-    for name in ("Submit", "Send", "Enquiry", "Inquiry", "Contact", "Send message", "Send enquiry"):
+    for name in (
+        "Send Message",
+        "Send message",
+        "Submit",
+        "Send",
+        "Enquiry",
+        "Inquiry",
+        "Contact",
+        "Send enquiry",
+    ):
         loc = page.get_by_role("button", name=name, exact=False)
         if await loc.count() and await _safe_click(page, loc):
             await emit({"type": "click", "message": f"Click \"{name}\"", "url": page.url, "element": name})
@@ -1167,35 +1735,43 @@ async def _execute_form_workflow(page, intent, origin: str, emit, proposed_cases
         return False
 
     await emit({"type": "action", "message": "Starting form submission from your prompt…", "url": page.url})
-    if not await _navigate_to_form_page(page, origin, emit, intent.explicit_targets):
+    if not _is_allowed_nav_url(page.url, origin):
         await emit({
             "type": "error",
-            "message": "Could not find enquiry/contact form — add a link target (e.g. 'open Contact page') or put the form URL in Base URL",
+            "message": (
+                "Cannot submit the form — browser left your application "
+                f"(now on {urlparse(page.url).netloc}). Use Contact Us on the same site only."
+            ),
+            "url": page.url,
+        })
+        return False
+    if not await _ensure_contact_form_page(page, origin, emit, intent.explicit_targets):
+        await emit({
+            "type": "error",
+            "message": (
+                "Could not find enquiry/contact form — set Base URL to the contact page "
+                "(e.g. https://www.vivilextech.com/contact-us.html) or say 'open Contact Us'"
+            ),
             "url": page.url,
         })
         return False
 
-    filled = 0
-    missing: list[str] = []
-    filled_labels: set[str] = set()
-    for field in intent.form_fields:
-        if await _fill_form_field(page, field.label, field.value, emit):
-            filled += 1
-            filled_labels.add(field.label.lower())
-        else:
-            missing.append(field.label)
+    await _scroll_to_form(page)
+    await page.wait_for_timeout(800)
 
+    filled, missing = await _fill_all_prompt_fields(page, intent.form_fields, emit)
     if missing:
-        filled += await _fill_remaining_fields_sequential(page, intent.form_fields, filled_labels, emit)
-        missing = [f.label for f in intent.form_fields if f.label.lower() not in filled_labels]
-        if missing:
-            await emit({
-                "type": "warning",
-                "message": f"Could not locate field(s): {', '.join(missing)} — check labels match the form on the page",
-                "url": page.url,
-            })
+        await emit({
+            "type": "warning",
+            "message": f"Could not locate field(s): {', '.join(missing)} — check labels match the form on the page",
+            "url": page.url,
+        })
     if filled == 0:
-        await emit({"type": "error", "message": "No form fields could be filled", "url": page.url})
+        await emit({
+            "type": "error",
+            "message": "No form fields could be filled — ensure Playwright is running (not HTTP crawl fallback)",
+            "url": page.url,
+        })
         return False
 
     before_url = page.url
@@ -1457,7 +2033,7 @@ def _same_origin(origin: str, url: str) -> bool:
 
 
 async def _fallback_http_agent(
-    start_url: str, origin: str, max_pages: int, emit, *, reason: str | None = None
+    start_url: str, origin: str, max_pages: int, emit, *, reason: str | None = None, requirements: str | None = None
 ) -> dict:
     from app.runners.browser_discovery import crawl_application
 
@@ -1484,9 +2060,20 @@ async def _fallback_http_agent(
         "type": "error",
         "message": (
             "Prompt instructions (login, form submit, open pages) cannot run without Playwright. "
-            "HTTP crawl only lists static links — it will not follow your prompt."
+            "HTTP crawl only lists static links — it cannot fill or submit forms."
         ),
     })
+    from app.runners.discovery_prompt import parse_discovery_prompt
+
+    prompt_intent = parse_discovery_prompt(requirements)
+    if prompt_intent.form_fields or prompt_intent.wants_form_submit:
+        await log_event({
+            "type": "error",
+            "message": (
+                "Form fill was requested but Playwright browser is not available. "
+                "Run scripts\\install-playwright.bat then scripts\\restart-all-auto.bat."
+            ),
+        })
     crawled = await crawl_application(start_url, max_pages=max_pages)
     for p in crawled.get("pages", []):
         await log_event({"type": "navigate", "message": f"Fetched {p.get('title') or p['url']}", "url": p["url"], "title": p.get("title")})

@@ -230,11 +230,14 @@ def _generic_step_spec_content(title: str, steps: list[dict], base_url: str) -> 
     url = normalize_base_url(base_url) or "https://example.com"
     return f"""import {{ test }} from '@playwright/test';
 import {{ runDiscoverySteps }} from '../../pages/GenericSteps';
+import {{ resetQeosProgress, setQeosProgressPage }} from '../../utils/qeosProgress';
 
 const STEPS = {steps_literal} as const;
 const BASE = process.env.PLAYWRIGHT_BASE_URL || process.env.BASE_URL || '{_escape_ts(url)}';
 
 test('{_escape_ts(title)}', async ({{ page }}) => {{
+  resetQeosProgress();
+  setQeosProgressPage(page);
   await runDiscoverySteps(page, [...STEPS], BASE);
 }});
 """
@@ -297,8 +300,11 @@ def materialize_batch_playwright_specs(
             content = f"""import {{ test }} from '@playwright/test';
 import {{ LoginPage }} from '../../pages/LoginPage';
 import {{ NavigationPage }} from '../../pages/NavigationPage';
+import {{ resetQeosProgress, setQeosProgressPage }} from '../../utils/qeosProgress';
 
 test('{_escape_ts(title)}', async ({{ page }}) => {{
+  resetQeosProgress();
+  setQeosProgressPage(page);
   const login = new LoginPage(page);
   const nav = new NavigationPage(page);
   await login.goto();
@@ -310,8 +316,11 @@ test('{_escape_ts(title)}', async ({{ page }}) => {{
         else:
             content = f"""import {{ test, expect }} from '@playwright/test';
 import {{ LoginPage }} from '../../pages/LoginPage';
+import {{ resetQeosProgress, setQeosProgressPage }} from '../../utils/qeosProgress';
 
 test('{_escape_ts(title)}', async ({{ page }}) => {{
+  resetQeosProgress();
+  setQeosProgressPage(page);
   const login = new LoginPage(page);
   await login.goto();
   await login.login();

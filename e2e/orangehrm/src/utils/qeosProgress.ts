@@ -36,6 +36,21 @@ async function captureLiveFrame() {
   }
 }
 
+/** Report a specific test-case step index — keeps Studio flow in sync with stored steps */
+export function reportQeosStepAt(
+  index: number,
+  description: string,
+  status: 'running' | 'passed' | 'failed',
+) {
+  const idx = Math.max(0, Math.min(index, totalSteps() - 1));
+  stepIndex = idx;
+  writeProgress({ step_index: idx, description, status });
+  void captureLiveFrame();
+  if (status === 'passed') {
+    stepIndex = Math.min(idx + 1, totalSteps() - 1);
+  }
+}
+
 /** Report step start — syncs Studio flow highlight with browser */
 export function reportQeosStepStart(description: string) {
   writeProgress({

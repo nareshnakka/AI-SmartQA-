@@ -85,6 +85,20 @@ _FORM_FIELD_SKIP = frozenset(
     {"login", "log", "password", "pass", "pwd", "username", "user", "credential", "credentials"}
 )
 
+_NAV_NOISE_SUFFIX = re.compile(
+    r"\s+(?:tab|menu|module|section|screen|page|flow|form)\b.*$",
+    re.I,
+)
+_NAV_NOISE_AFTER_AND = re.compile(r"\s+and\s+.*$", re.I)
+
+
+def normalize_nav_target(label: str) -> str:
+    """Reduce 'Contact Us tab and view the page' → 'Contact Us'."""
+    t = label.strip().strip(".,;")
+    t = _NAV_NOISE_AFTER_AND.sub("", t)
+    t = _NAV_NOISE_SUFFIX.sub("", t)
+    return t.strip() or label.strip()
+
 
 @dataclass
 class DiscoveryIntent:
@@ -134,6 +148,15 @@ def extract_explicit_targets(text: str) -> list[str]:
             continue
         if re.match(r"^[A-Za-z][\w\s]{0,30}?\s*[:=]\s*.+", line):
             continue
+        tab_match = re.search(
+            r"\b(?:open|go\s+to|visit|navigate\s+to)\s+(?:the\s+)?"
+            r"([A-Za-z][\w\s/&-]+?)\s+tab\b",
+            line,
+            re.I,
+        )
+        if tab_match:
+            add(normalize_nav_target(tab_match.group(1)))
+            continue
         page_match = re.search(
             r"\b(?:open|go\s+to|visit|navigate\s+to)\s+(?:the\s+)?"
             r"([A-Za-z][\w\s/&-]+?)\s+(?:module|menu|page|screen|flow)\b",
@@ -141,17 +164,17 @@ def extract_explicit_targets(text: str) -> list[str]:
             re.I,
         )
         if page_match:
-            add(page_match.group(1))
+            add(normalize_nav_target(page_match.group(1)))
             continue
         nav_match = re.search(
             r"\b(?:go\s+to|open|visit|navigate\s+to|check|test|verify)\s+(?:the\s+)?"
-            r"([A-Za-z][\w\s/&-]{1,40}?)(?:\s+module|\s+page|\s+screen|\s+flow|\s+form)?"
-            r"(?:\s+and|\s*$|,|\.)",
+            r"([A-Za-z][\w\s/&-]+?)(?:\s+tab)?(?:\s+module|\s+page|\s+screen|\s+flow|\s+form)?"
+            r"(?:\s+and\b|\s*$|,|\.)",
             line,
             re.I,
         )
         if nav_match:
-            add(nav_match.group(1))
+            add(normalize_nav_target(nav_match.group(1)))
             continue
         if _FORM_SUBMIT_HINT.search(line):
             continue
@@ -209,7 +232,7 @@ def extract_form_fields(text: str) -> list[FormFieldSpec]:
         line = line.strip().lstrip("-*• ")
         if not line:
             continue
-        match = re.match(r"^([A-Za-z][\w\s]{0,30}?)\s*[:=]\s*(.+)$", line)
+        match = re.match(r"^([A-Za-z][\w\s-]{0,30}?)\s*[:=]\s*(.+)$", line)
         if match:
             add(match.group(1), match.group(2))
             continue
@@ -228,13 +251,18 @@ def navigation_targets(intent: DiscoveryIntent) -> list[str]:
     """Pages/modules the user asked to open — exclude bare form-action phrases."""
     skip_exact = {"enquiry", "inquiry", "form", "submit", "feedback"}
     out: list[str] = []
+    seen: set[str] = set()
     for target in intent.explicit_targets:
-        key = target.lower().strip()
+        cleaned = normalize_nav_target(target)
+        key = cleaned.lower().strip()
         if key in skip_exact:
             continue
         if key.endswith(" form") or key.startswith("submit "):
             continue
-        out.append(target)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
     return out
 
 
@@ -265,7 +293,7 @@ def parse_discovery_prompt(text: str | None) -> DiscoveryIntent:
     intent.wants_form_submit = bool(_FORM_SUBMIT_HINT.search(raw)) or (
         len(intent.form_fields) >= 1
         and bool(re.search(r"\b(?:submit|send|form|enquiry|inquiry|contact)\b", raw, re.I))
-    )
+    ) or len(intent.form_fields) >= 2
 
     cred_span: tuple[int, int] | None = None
     for pattern in _CRED_PATTERNS:

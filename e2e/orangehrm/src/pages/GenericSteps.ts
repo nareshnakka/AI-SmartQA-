@@ -1,6 +1,5 @@
 import { expect, Page } from '@playwright/test';
 import { publishLiveFrame } from '../utils/helpers';
-import { logStep } from '../utils/logger';
 
 export type DiscoveryStep = {
   description: string;
@@ -41,7 +40,7 @@ async function tryGenericLogin(page: Page) {
     if ((await loc.count()) > 0) {
       if (user) await loc.fill(user, { timeout: 8000 });
       filledUser = true;
-      logStep(`Enter username (${sel})`, user ? 'pass' : 'info');
+      console.log(`→ Enter username (${sel})`);
       break;
     }
   }
@@ -51,7 +50,7 @@ async function tryGenericLogin(page: Page) {
     if ((await ph.count()) > 0) {
       if (user) await ph.fill(user, { timeout: 8000 });
       filledUser = true;
-      logStep('Enter username (placeholder)', user ? 'pass' : 'info');
+      console.log('→ Enter username (placeholder)');
     }
   }
 
@@ -63,7 +62,7 @@ async function tryGenericLogin(page: Page) {
     const loc = page.locator(sel).first();
     if ((await loc.count()) > 0) {
       if (pass) await loc.fill(pass, { timeout: 8000 });
-      logStep('Enter password', pass ? 'pass' : 'info');
+      console.log('→ Enter password');
       break;
     }
   }
@@ -71,7 +70,7 @@ async function tryGenericLogin(page: Page) {
   const loginBtn = page.getByRole('button', { name: /login|sign in|submit/i }).first();
   if ((await loginBtn.count()) > 0) {
     await loginBtn.click({ timeout: 8000 });
-    logStep('Click login button', 'pass');
+    console.log('✓ Click login button');
   } else {
     await page.locator('button[type=submit], input[type=submit]').first().click({ timeout: 8000 }).catch(() => {});
   }
@@ -91,7 +90,7 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
       const fromDesc = desc.match(/https?:\/\/[^\s'"]+/i)?.[0];
       url = fromDesc || (url ? `${baseUrl.replace(/\/$/, '')}${url.startsWith('/') ? url : `/${url}`}` : baseUrl);
     }
-    logStep(`Navigate to ${url}`, 'info');
+    console.log(`→ Navigate to ${url}`);
     const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await publishLiveFrame(page);
     const status = resp?.status() ?? 0;
@@ -101,20 +100,20 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
         `HTTP ${status || 404} — page not found at ${url}. Check Base URL in Automation IDE and the navigate step URL.`
       );
     }
-    logStep(`Loaded: ${page.url()}`, 'pass');
+    console.log(`✓ Loaded: ${page.url()}`);
     return;
   }
 
   if (lower.includes('login') || lower.includes('sign in') || action === 'fill') {
-    logStep(desc, 'info');
+    console.log(`→ ${desc}`);
     await tryGenericLogin(page);
-    logStep(desc, 'pass');
+    console.log(`✓ ${desc}`);
     return;
   }
 
   if (action === 'click' || lower.includes('click')) {
     const label = step.element || quotedText(desc) || desc.replace(/^click\s+/i, '').trim();
-    logStep(`Click "${label}"`, 'info');
+    console.log(`→ Click "${label}"`);
     const link = page.getByRole('link', { name: new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first();
     const menu = page.locator(
       '.oxd-main-menu-item, [role=menuitem], nav a, .sidebar a, .menu-item'
@@ -134,18 +133,18 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
     }
     await page.waitForLoadState('domcontentloaded').catch(() => {});
     await publishLiveFrame(page);
-    logStep(`After click: ${page.url()}`, 'pass');
+    console.log(`✓ After click: ${page.url()}`);
     return;
   }
 
   if (action === 'verify' || lower.includes('verify')) {
-    logStep(desc, 'info');
+    console.log(`→ ${desc}`);
     await expect(page).toHaveURL(/.+/);
     const title = await page.title();
     if (step.target) {
       await expect(page).toHaveURL(new RegExp(step.target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
     }
-    logStep(`Verified page: ${title || page.url()}`, 'pass');
+    console.log(`✓ Verified page: ${title || page.url()}`);
     return;
   }
 
@@ -154,23 +153,39 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
     if (href) {
       await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 30_000 });
       await publishLiveFrame(page);
-      logStep(`Opened ${href}`, 'pass');
+      console.log(`✓ Opened ${href}`);
       return;
     }
   }
 
-  logStep(desc, 'info');
+  console.log(`→ ${desc}`);
   await expect(page.locator('body')).toBeVisible();
-  logStep(desc, 'pass');
+  console.log(`✓ ${desc}`);
 }
 
 export async function runDiscoverySteps(page: Page, steps: DiscoveryStep[], baseUrl: string) {
+  const { resetQeosProgress, setQeosProgressPage, reportQeosStepAt } = await import('../utils/qeosProgress');
+  resetQeosProgress();
+  setQeosProgressPage(page);
+
   if (!steps.length) {
+    reportQeosStepAt(0, 'Open application', 'running');
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
     await expect(page.locator('body')).toBeVisible();
+    reportQeosStepAt(0, 'Open application', 'passed');
     return;
   }
-  for (const step of steps) {
-    await runOneStep(page, step, baseUrl);
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const desc = step.description?.trim() || `Step ${i + 1}`;
+    reportQeosStepAt(i, desc, 'running');
+    try {
+      await runOneStep(page, step, baseUrl);
+      reportQeosStepAt(i, desc, 'passed');
+    } catch (err) {
+      reportQeosStepAt(i, desc, 'failed');
+      throw err;
+    }
   }
 }

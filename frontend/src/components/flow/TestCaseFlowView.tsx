@@ -366,11 +366,16 @@ export function applyDebugFlowSteps(
         )
       : null;
 
-  const displaySteps = steps.map((s, i) => ({
-    ...s,
-    status: (opts.runStatus === "running" && activeStepIndex === i && s.status === "pending"
-      ? "running"
-      : s.status) as FlowStepStatus,
-  }));
+  const displaySteps = steps.map((s, i) => {
+    let status = s.status ?? "pending";
+    if (opts.runStatus === "running" && activeStepIndex != null) {
+      if (i < activeStepIndex && (status === "pending" || status === "running")) {
+        status = "passed";
+      } else if (i === activeStepIndex && status === "pending") {
+        status = "running";
+      }
+    }
+    return { ...s, status } as FlowStep;
+  });
   return { steps: displaySteps, activeStepIndex };
 }
