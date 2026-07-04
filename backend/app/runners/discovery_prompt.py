@@ -82,7 +82,19 @@ _FORM_SUBMIT_HINT = re.compile(
 
 # Skip when parsing generic field lines (login credentials handled separately)
 _FORM_FIELD_SKIP = frozenset(
-    {"login", "log", "password", "pass", "pwd", "username", "user", "credential", "credentials"}
+    {
+        "login", "log", "password", "pass", "pwd", "username", "user",
+        "credential", "credentials", "base url", "base", "url", "prompt",
+        "instructions", "instruction", "requirements", "debug", "discovery",
+    }
+)
+
+_NAV_TARGET_BLOCKLIST = frozenset(
+    {
+        "debug", "prompt", "test", "flow", "base", "url", "base url", "submit",
+        "form", "instructions", "instruction", "agent", "discovery", "strict",
+        "enquiry", "inquiry", "product", "demo", "session", "prompt submit",
+    }
 )
 
 _NAV_NOISE_SUFFIX = re.compile(
@@ -98,6 +110,39 @@ def normalize_nav_target(label: str) -> str:
     t = _NAV_NOISE_AFTER_AND.sub("", t)
     t = _NAV_NOISE_SUFFIX.sub("", t)
     return t.strip() or label.strip()
+
+
+def _is_prompt_meta_line(line: str) -> bool:
+    s = line.strip()
+    if re.match(r"^(base\s+url|url|prompt|instructions?|requirements?)\s*[:=]", s, re.I):
+        return True
+    if re.match(r"^https?://", s, re.I):
+        return True
+    return False
+
+
+def sanitize_prompt_text(text: str) -> str:
+    """Remove Base URL / Prompt header lines — URL belongs in Discovery Base URL field only."""
+    lines: list[str] = []
+    for line in text.splitlines():
+        if _is_prompt_meta_line(line):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def filter_form_fields(fields: list[FormFieldSpec]) -> list[FormFieldSpec]:
+    """Drop meta lines (Base URL, Prompt) and values that look like URLs."""
+    out: list[FormFieldSpec] = []
+    for field in fields:
+        key = field.label.lower().strip()
+        val = field.value.strip()
+        if key in _FORM_FIELD_SKIP or key in _NAV_TARGET_BLOCKLIST:
+            continue
+        if val.lower().startswith(("http://", "https://", "www.")):
+            continue
+        out.append(field)
+    return out
 
 
 @dataclass
@@ -130,11 +175,13 @@ def extract_explicit_targets(text: str) -> list[str]:
     seen: set[str] = set()
 
     def add(label: str) -> None:
-        t = label.strip().strip(".,;")
+        t = normalize_nav_target(label.strip().strip(".,;"))
         if len(t) < 2:
             return
         key = t.lower()
-        if key in seen:
+        if key in seen or key in _NAV_TARGET_BLOCKLIST:
+            return
+        if key.startswith("http") or "://" in key:
             return
         seen.add(key)
         targets.append(t)
@@ -145,6 +192,8 @@ def extract_explicit_targets(text: str) -> list[str]:
     for line in text.splitlines():
         line = line.strip().lstrip("-*• ")
         if not line:
+            continue
+        if _is_prompt_meta_line(line):
             continue
         if re.match(r"^[A-Za-z][\w\s]{0,30}?\s*[:=]\s*.+", line):
             continue
@@ -232,6 +281,8 @@ def extract_form_fields(text: str) -> list[FormFieldSpec]:
         line = line.strip().lstrip("-*• ")
         if not line:
             continue
+        if _is_prompt_meta_line(line):
+            continue
         match = re.match(r"^([A-Za-z][\w\s-]{0,30}?)\s*[:=]\s*(.+)$", line)
         if match:
             add(match.group(1), match.group(2))
@@ -277,7 +328,8 @@ def has_actionable_instructions(intent: DiscoveryIntent) -> bool:
 
 def parse_discovery_prompt(text: str | None) -> DiscoveryIntent:
     raw = (text or "").strip()
-    intent = DiscoveryIntent(raw=raw, goals=raw)
+    cleaned = sanitize_prompt_text(raw)
+    intent = DiscoveryIntent(raw=raw, goals=cleaned or raw)
 
     if not raw:
         intent.summary = "provide instructions in the Discovery prompt"
@@ -288,8 +340,8 @@ def parse_discovery_prompt(text: str | None) -> DiscoveryIntent:
     intent.skip_login = bool(_LOGIN_SKIP.search(raw))
     intent.should_login = bool(_LOGIN_HINT.search(raw)) and not intent.skip_login
     intent.broad_exploration = bool(_BROAD_EXPLORE.search(raw))
-    intent.explicit_targets = extract_explicit_targets(raw)
-    intent.form_fields = extract_form_fields(raw)
+    intent.explicit_targets = extract_explicit_targets(cleaned or raw)
+    intent.form_fields = filter_form_fields(extract_form_fields(cleaned or raw))
     intent.wants_form_submit = bool(_FORM_SUBMIT_HINT.search(raw)) or (
         len(intent.form_fields) >= 1
         and bool(re.search(r"\b(?:submit|send|form|enquiry|inquiry|contact)\b", raw, re.I))
@@ -309,10 +361,11 @@ def parse_discovery_prompt(text: str | None) -> DiscoveryIntent:
             cred_span = match.span()
             break
 
-    goals = raw
-    if cred_span:
-        goals = (raw[: cred_span[0]] + raw[cred_span[1] :]).strip(" ,.-")
-    goals = _STRICT_HINT.sub("", goals)
+    goals = cleaned or raw
+    if cred_span and cred_span[0] < len(raw):
+        stripped = (raw[: cred_span[0]] + raw[cred_span[1] :]).strip(" ,.-")
+        goals = sanitize_prompt_text(stripped) or goals
+    goals = sanitize_prompt_text(_STRICT_HINT.sub("", goals))
     goals = _STRIP_CRED_LINES.sub("", goals)
     goals = re.sub(r"^\s*(?:and|then)\s+", "", goals, flags=re.I)
     goals = re.sub(r"\s+", " ", goals).strip()

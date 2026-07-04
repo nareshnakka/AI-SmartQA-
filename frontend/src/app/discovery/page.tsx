@@ -610,7 +610,8 @@ function DiscoveryPageContent() {
                   suppressHydrationWarning
                 />
                 <p className="text-[10px] text-[var(--text-tertiary)] mt-1.5">
-                  The agent fills and submits forms when you provide field names and values. Strict by default — only your instructions unless you ask to explore broadly.
+                  Put the site URL in <strong>Base URL</strong> above only — do not repeat it in this prompt.
+                  The agent fills and submits forms when you list field names and values (Name, Email, Message, etc.).
                 </p>
               </div>
               <div className="flex gap-2">

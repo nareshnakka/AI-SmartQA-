@@ -92,8 +92,19 @@ def test_contact_us_tab_normalizes_target():
     assert not any("view the contact" in t.lower() for t in nav)
 
 
-def test_normalize_nav_target_strips_noise():
-    from app.runners.discovery_prompt import normalize_nav_target
+def test_sanitize_prompt_strips_base_url_line():
+    from app.runners.discovery_prompt import parse_discovery_prompt, sanitize_prompt_text
 
-    assert normalize_nav_target("Contact Us tab and view the contact").lower() == "contact us"
-    assert normalize_nav_target("Payroll module").lower() == "payroll"
+    raw = """Base URL: https://www.vivilextech.com/contact-us.html
+Prompt:
+Submit contact form:
+Your Name: Jane Doe
+E-mail: jane@example.com
+Message: Hello"""
+    cleaned = sanitize_prompt_text(raw)
+    assert "Base URL" not in cleaned.split("\n")[0]
+    intent = parse_discovery_prompt(raw)
+    labels = {f.label.lower() for f in intent.form_fields}
+    assert "base url" not in labels
+    assert "your name" in labels
+    assert not any("debug" in t.lower() for t in intent.explicit_targets)

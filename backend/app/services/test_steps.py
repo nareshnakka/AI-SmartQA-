@@ -51,14 +51,13 @@ def normalize_test_steps(steps: list | None) -> list[dict]:
 
 
 def steps_for_storage(steps: list | None) -> list[dict]:
-    """Structured steps persisted on test cases (order, description, action, url)."""
+    """Structured steps persisted on test cases (order, description, action, url, field, element)."""
     stored: list[dict] = []
     for item in normalize_test_steps(steps):
         row: dict = {"order": item["order"], "description": item["description"]}
-        if item.get("action"):
-            row["action"] = item["action"]
-        if item.get("url"):
-            row["url"] = item["url"]
+        for key in ("action", "url", "field", "element", "target", "expected"):
+            if item.get(key):
+                row[key] = item[key]
         if item.get("disabled"):
             row["disabled"] = True
         stored.append(row)

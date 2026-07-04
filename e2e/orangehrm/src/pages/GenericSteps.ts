@@ -7,11 +7,91 @@ export type DiscoveryStep = {
   url?: string;
   element?: string;
   target?: string;
+  field?: string;
 };
 
 function quotedText(text: string): string | null {
   const m = text.match(/["']([^"']+)["']/);
   return m?.[1] ?? null;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseFillStep(step: DiscoveryStep): { label: string; value: string } {
+  const desc = step.description || '';
+  const fromDesc = desc.match(/^Enter\s+(.+?):\s*(.+)$/i);
+  if (fromDesc) {
+    return { label: (step.field || fromDesc[1]).trim(), value: fromDesc[2].trim() };
+  }
+  return { label: (step.field || desc).trim(), value: '' };
+}
+
+const FIELD_ALIASES: Record<string, string[]> = {
+  'your name': ['name'],
+  name: ['name'],
+  'e-mail': ['email'],
+  email: ['email'],
+  'mobile number': ['mobile'],
+  mobile: ['mobile'],
+  phone: ['mobile', 'phone'],
+  'organization name': ['organization'],
+  organization: ['organization'],
+  message: ['comments', 'message'],
+};
+
+async function fillFormField(page: Page, step: DiscoveryStep) {
+  const { label, value } = parseFillStep(step);
+  if (!value) {
+    throw new Error(`Fill step missing value: ${step.description}`);
+  }
+  const key = label.toLowerCase().replace(/\*+$/, '').trim();
+  const names = FIELD_ALIASES[key] || [key.replace(/\s+/g, ''), ...key.split(/\s+/).filter((t) => t.length >= 3)];
+
+  for (const name of names) {
+    const loc = page.locator(
+      `input[name='${name}'], textarea[name='${name}'], #${name}, input[name*='${name}'], textarea[name*='${name}']`
+    ).first();
+    if ((await loc.count()) > 0) {
+      await loc.fill(value, { timeout: 8000 });
+      console.log(`✓ Filled ${label} → ${value.slice(0, 40)}`);
+      await publishLiveFrame(page);
+      return;
+    }
+  }
+
+  // Paragraph-style labels (Vivilex: <p class="label">Your Name</p><input name="name">)
+  const labelPattern = new RegExp(escapeRegExp(label.replace(/\*+$/, '').trim()), 'i');
+  for (const sel of ['p.label', '.label', 'label']) {
+    const labelEl = page.locator(sel).filter({ hasText: labelPattern }).first();
+    if ((await labelEl.count()) > 0) {
+      const field = labelEl.locator('xpath=following::input[1] | following::textarea[1]').first();
+      if ((await field.count()) > 0) {
+        await field.fill(value, { timeout: 8000 });
+        console.log(`✓ Filled ${label} → ${value.slice(0, 40)}`);
+        await publishLiveFrame(page);
+        return;
+      }
+    }
+  }
+
+  if (key.includes('email') || key.includes('mail')) {
+    const email = page.locator('input[type=email], input#email, input[name=email]').first();
+    if ((await email.count()) > 0) {
+      await email.fill(value, { timeout: 8000 });
+      return;
+    }
+  }
+  if (key.includes('message') || key.includes('comment')) {
+    const ta = page.locator('textarea, textarea#comments, textarea[name=comments]').first();
+    if ((await ta.count()) > 0) {
+      await ta.fill(value, { timeout: 8000 });
+      return;
+    }
+  }
+
+  throw new Error(`Could not find form field for: ${label}`);
 }
 
 async function tryGenericLogin(page: Page) {
@@ -84,7 +164,7 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
   const lower = desc.toLowerCase();
   const action = (step.action || '').toLowerCase();
 
-  if (action === 'navigate' || lower.startsWith('open ') || lower.includes('navigate to') || step.url) {
+  if (action === 'navigate') {
     let url = step.url || step.target || '';
     if (!url || url.startsWith('/')) {
       const fromDesc = desc.match(/https?:\/\/[^\s'"]+/i)?.[0];
@@ -104,26 +184,37 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
     return;
   }
 
-  if (lower.includes('login') || lower.includes('sign in') || action === 'fill') {
+  if (action === 'fill') {
+    console.log(`→ ${desc}`);
+    await fillFormField(page, step);
+    console.log(`✓ ${desc}`);
+    return;
+  }
+
+  if (lower.includes('login') || lower.includes('sign in')) {
     console.log(`→ ${desc}`);
     await tryGenericLogin(page);
     console.log(`✓ ${desc}`);
     return;
   }
 
-  if (action === 'click' || lower.includes('click')) {
-    const label = step.element || quotedText(desc) || desc.replace(/^click\s+/i, '').trim();
+  if (action === 'click' || lower.includes('click') || lower.startsWith('open ')) {
+    const label = step.element || quotedText(desc) || desc.replace(/^(click|open)\s+/i, '').trim();
     console.log(`→ Click "${label}"`);
-    const link = page.getByRole('link', { name: new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first();
+    const escaped = escapeRegExp(label);
+    const link = page.getByRole('link', { name: new RegExp(escaped, 'i') }).first();
     const menu = page.locator(
-      '.oxd-main-menu-item, [role=menuitem], nav a, .sidebar a, .menu-item'
-    ).filter({ hasText: new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first();
-    const btn = page.getByRole('button', { name: new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first();
+      '.oxd-main-menu-item, [role=menuitem], nav a, .sidebar a, .menu-item, header a'
+    ).filter({ hasText: new RegExp(escaped, 'i') }).first();
+    const btn = page.getByRole('button', { name: new RegExp(escaped, 'i') }).first();
+    const submitInput = page.locator(`input[type=submit][value="${label}" i], input[type=submit]`).filter({ hasText: new RegExp(escaped, 'i') }).first();
 
     if ((await menu.count()) > 0) {
       await menu.click({ timeout: 15_000 });
     } else if ((await link.count()) > 0) {
       await link.click({ timeout: 15_000 });
+    } else if ((await submitInput.count()) > 0) {
+      await submitInput.click({ timeout: 15_000 });
     } else if ((await btn.count()) > 0) {
       await btn.click({ timeout: 15_000 });
     } else if (step.target) {
@@ -137,13 +228,19 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
     return;
   }
 
-  if (action === 'verify' || lower.includes('verify')) {
+  if (action === 'verify' || lower.includes('verify') || lower.includes('confirm')) {
     console.log(`→ ${desc}`);
-    await expect(page).toHaveURL(/.+/);
-    const title = await page.title();
-    if (step.target) {
-      await expect(page).toHaveURL(new RegExp(step.target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+    await expect(page.locator('body')).toBeVisible();
+    if (step.url) {
+      const pathPart = step.url.replace(/^https?:\/\/[^/]+/, '').replace(/^\//, '');
+      if (pathPart) {
+        expect(page.url()).toContain(pathPart);
+      }
     }
+    if (step.target) {
+      await expect(page).toHaveURL(new RegExp(escapeRegExp(step.target), 'i'));
+    }
+    const title = await page.title();
     console.log(`✓ Verified page: ${title || page.url()}`);
     return;
   }

@@ -59,6 +59,28 @@ def _score_nav_label_match(target: str, candidate: str) -> int:
     return 0
 
 
+def _is_contact_form_url(url: str) -> bool:
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(k in path for k in ("contact", "enquiry", "inquiry", "get-in-touch", "reach-us"))
+
+
+def _case_looks_valid(case: dict, origin: str) -> bool:
+    title = (case.get("title") or "").lower()
+    if any(h in title for h in ("facebook", "twitter", "linkedin", "login to")):
+        return False
+    for step in case.get("steps") or []:
+        url = step.get("url") or ""
+        if url and not _is_allowed_nav_url(url, origin):
+            return False
+        desc = (step.get("description") or "").lower()
+        if "base url" in desc and "http" in desc:
+            return False
+    return True
+
+
 def _host_blocked(url: str) -> bool:
     try:
         host = urlparse(url).netloc.lower()
@@ -550,11 +572,15 @@ async def _navigate_with_playwright(
             })
             form_completed = await _run_instruction_plan(
                 page, intent, origin, emit, proposed_cases, logged_in,
+                start_url=start_url, navigation_log=navigation_log,
             )
             step_count += max(len(intent.form_fields), 1)
         else:
             if intent.wants_form_submit or intent.form_fields:
-                form_completed = await _execute_form_workflow(page, intent, origin, emit, proposed_cases)
+                form_completed = await _execute_form_workflow(
+                    page, intent, origin, emit, proposed_cases,
+                    start_url=start_url, navigation_log=navigation_log,
+                )
                 if form_completed:
                     step_count += max(len(intent.form_fields), 1) + 2
 
@@ -781,12 +807,14 @@ async def _navigate_with_playwright(
             seen_titles.add(t)
             unique_cases.append(case)
 
-    # Journey-level test cases from navigation log (strict: only from actual agent actions)
-    if len(navigation_log) > 3:
-        if strict_follow:
-            unique_cases.insert(0, _instruction_session_test(start_url, navigation_log, nav_requirements))
-        else:
-            unique_cases.insert(0, _full_session_test(start_url, navigation_log))
+    # Journey-level test from log — never for form-submit prompts (structured case is built separately)
+    has_form_flow = any(c.get("flow_kind") == "form_submit" for c in unique_cases)
+    form_intent = bool(intent.form_fields) or intent.wants_form_submit
+    unique_cases = [c for c in unique_cases if _case_looks_valid(c, origin)]
+    if len(navigation_log) > 3 and strict_follow and not has_form_flow and not form_intent:
+        unique_cases.insert(0, _instruction_session_test(start_url, navigation_log, intent.goals or nav_requirements))
+    elif len(navigation_log) > 3 and not strict_follow:
+        unique_cases.insert(0, _full_session_test(start_url, navigation_log))
 
     return {
         "mode": "qa_agent",
@@ -1355,6 +1383,9 @@ async def _run_instruction_plan(
     emit,
     proposed_cases: list[dict],
     logged_in: bool,
+    *,
+    start_url: str = "",
+    navigation_log: list[dict] | None = None,
 ) -> bool:
     """Execute prompt instructions only — no menu crawl."""
     from app.runners.discovery_prompt import has_actionable_instructions, navigation_targets
@@ -1369,12 +1400,31 @@ async def _run_instruction_plan(
 
     completed = False
     nav_targets = navigation_targets(intent)
+    if _is_contact_form_url(start_url) or _is_contact_form_url(page.url):
+        nav_targets = []
+    elif await _page_ready_for_contact_form(page):
+        nav_targets = []
 
     for target in nav_targets:
-        await _open_named_target(page, target, origin, emit)
+        if not await _open_named_target(page, target, origin, emit):
+            await emit({
+                "type": "warning",
+                "message": f"Skipped navigation to \"{target}\" — continuing on current page",
+                "url": page.url,
+            })
+        if not _is_allowed_nav_url(page.url, origin):
+            await emit({
+                "type": "error",
+                "message": f"Left application site while opening \"{target}\" — stopping navigation",
+                "url": page.url,
+            })
+            break
 
     if intent.wants_form_submit or intent.form_fields:
-        completed = await _execute_form_workflow(page, intent, origin, emit, proposed_cases)
+        completed = await _execute_form_workflow(
+            page, intent, origin, emit, proposed_cases,
+            start_url=start_url, navigation_log=navigation_log or [],
+        )
     elif nav_targets:
         title = await page.title()
         for target in nav_targets:
@@ -1675,6 +1725,110 @@ async def _verify_form_submitted(page, before_url: str, emit) -> bool:
     return False
 
 
+def _extract_submit_label(log: list[dict]) -> str:
+    for e in reversed(log):
+        if e.get("type") != "click":
+            continue
+        msg = e.get("message", "")
+        m = re.search(r'Click "([^"]+)"', msg)
+        if m:
+            label = m.group(1).strip()
+            if any(w in label.lower() for w in ("send", "submit", "message", "enquiry", "contact")):
+                return label
+    return "Send Message"
+
+
+def _build_form_flow_test_case(
+    start_url: str,
+    intent,
+    form_url: str,
+    submitted: bool,
+    navigation_log: list[dict],
+    form_fields: list | None = None,
+) -> dict:
+    """One clean test case: navigate → open target → fill fields → submit → verify."""
+    from app.runners.discovery_prompt import navigation_targets
+
+    nav_targets = navigation_targets(intent)
+    fields = form_fields or intent.form_fields
+    steps: list[dict] = []
+    order = 1
+
+    steps.append({
+        "order": order,
+        "action": "navigate",
+        "description": f"Navigate to {start_url}",
+        "url": start_url,
+    })
+    order += 1
+
+    for target in nav_targets:
+        steps.append({
+            "order": order,
+            "action": "click",
+            "description": f"Open {target}",
+            "element": target,
+        })
+        order += 1
+
+    norm_start = _normalize_url(start_url)
+    norm_form = _normalize_url(form_url)
+    if norm_form != norm_start:
+        verify_label = nav_targets[0] if nav_targets else "Contact form"
+        steps.append({
+            "order": order,
+            "action": "verify",
+            "description": f"Verify {verify_label} page is displayed with enquiry form",
+            "url": form_url,
+        })
+        order += 1
+
+    for field in fields:
+        label = field.label.strip()
+        steps.append({
+            "order": order,
+            "action": "fill",
+            "description": f"Enter {label}: {field.value}",
+            "field": label,
+        })
+        order += 1
+
+    submit_label = _extract_submit_label(navigation_log)
+    steps.append({
+        "order": order,
+        "action": "click",
+        "description": f"Click {submit_label}",
+        "element": submit_label,
+    })
+    order += 1
+
+    steps.append({
+        "order": order,
+        "action": "verify",
+        "description": "Confirm enquiry submitted successfully",
+    })
+
+    flow_name = nav_targets[0] if nav_targets else "Contact form"
+    return {
+        "id": _new_id(),
+        "title": f"{flow_name} — submit enquiry form",
+        "type": "functional",
+        "priority": "critical",
+        "source": "qa_agent",
+        "risk": "high",
+        "flow_kind": "form_submit",
+        "module": "Forms",
+        "screen": flow_name,
+        "steps": steps,
+        "expected_results": [
+            f"{flow_name} page opens with the enquiry form visible",
+            "All required fields accept the provided data",
+            "Form submits without validation errors",
+            "Success confirmation or thank-you message is shown" if submitted else "Form submission completes",
+        ],
+    }
+
+
 def _form_submission_test_case(
     page_url: str,
     page_title: str,
@@ -1718,15 +1872,25 @@ def _form_submission_test_case(
     }
 
 
-async def _execute_form_workflow(page, intent, origin: str, emit, proposed_cases: list[dict]) -> bool:
+async def _execute_form_workflow(
+    page,
+    intent,
+    origin: str,
+    emit,
+    proposed_cases: list[dict],
+    *,
+    start_url: str = "",
+    navigation_log: list[dict] | None = None,
+) -> bool:
     """Fill and submit a form using field values from the discovery prompt."""
-    from app.runners.discovery_prompt import DiscoveryIntent
+    from app.runners.discovery_prompt import DiscoveryIntent, filter_form_fields
 
     if not isinstance(intent, DiscoveryIntent):
         return False
     if not intent.wants_form_submit and not intent.form_fields:
         return False
-    if not intent.form_fields:
+    fields = filter_form_fields(intent.form_fields)
+    if not fields:
         await emit({
             "type": "warning",
             "message": "Form submission requested but no field values found — add lines like 'Name: John, Email: john@test.com'",
@@ -1740,11 +1904,12 @@ async def _execute_form_workflow(page, intent, origin: str, emit, proposed_cases
             "type": "error",
             "message": (
                 "Cannot submit the form — browser left your application "
-                f"(now on {urlparse(page.url).netloc}). Use Contact Us on the same site only."
+                f"(now on {urlparse(page.url).netloc}). Stay on the same site only."
             ),
             "url": page.url,
         })
         return False
+
     if not await _ensure_contact_form_page(page, origin, emit, intent.explicit_targets):
         await emit({
             "type": "error",
@@ -1759,7 +1924,7 @@ async def _execute_form_workflow(page, intent, origin: str, emit, proposed_cases
     await _scroll_to_form(page)
     await page.wait_for_timeout(800)
 
-    filled, missing = await _fill_all_prompt_fields(page, intent.form_fields, emit)
+    filled, missing = await _fill_all_prompt_fields(page, fields, emit)
     if missing:
         await emit({
             "type": "warning",
@@ -1779,9 +1944,19 @@ async def _execute_form_workflow(page, intent, origin: str, emit, proposed_cases
         await emit({"type": "error", "message": "Submit button not found on the form", "url": page.url})
         return False
 
+    if not _is_allowed_nav_url(page.url, origin):
+        await emit({"type": "error", "message": "Form submit aborted — not on application site", "url": page.url})
+        return False
+
     submitted = await _verify_form_submitted(page, before_url, emit)
-    title = await page.title()
-    proposed_cases.append(_form_submission_test_case(page.url, title, intent.form_fields, submitted))
+    proposed_cases.append(_build_form_flow_test_case(
+        start_url or page.url,
+        intent,
+        page.url,
+        submitted,
+        navigation_log or [],
+        form_fields=fields,
+    ))
     return True
 
 
@@ -1926,18 +2101,31 @@ def _button_click_test(from_url: str, btn: dict, result_title: str) -> dict:
 
 def _instruction_session_test(start_url: str, log: list[dict], goals: str | None) -> dict:
     """One test case summarizing only what the agent did per user instructions."""
-    action_types = {"navigate", "click", "fill", "verify", "action", "inspect"}
-    nav_events = [e for e in log if e.get("type") in action_types and e.get("type") != "observe"]
+    skip_types = {"status", "warning", "error", "observe", "agent_start", "agent_complete"}
+    action_types = {"navigate", "click", "fill", "verify", "inspect"}
+    nav_events = [
+        e for e in log
+        if e.get("type") in action_types
+        and e.get("type") not in skip_types
+        and not (e.get("type") == "action" and "starting form" in (e.get("message") or "").lower())
+    ]
     nav_events.sort(key=lambda e: e.get("timestamp") or "")
     steps = []
     for i, e in enumerate(nav_events[:20], start=1):
-        steps.append({
+        step: dict = {
             "order": i,
             "action": e.get("type", "action"),
             "description": e.get("message", ""),
-            "url": e.get("url"),
-        })
-    title = f"Instruction flow — {(goals or 'session')[:60]}"
+        }
+        if e.get("url"):
+            step["url"] = e["url"]
+        if e.get("element"):
+            step["element"] = e["element"]
+        if e.get("field"):
+            step["field"] = e["field"]
+        steps.append(step)
+    goal_snippet = (goals or "session").split("\n")[0][:60]
+    title = f"Instruction flow — {goal_snippet}"
     return {
         "id": _new_id(),
         "title": title,
