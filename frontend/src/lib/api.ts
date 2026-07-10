@@ -25,7 +25,7 @@ export function isBackendNetworkError(err: unknown): boolean {
 function backendUnreachableMessage(): string {
   return (
     `Cannot reach QEOS API at ${BACKEND_URL}. ` +
-    "Start the backend: run scripts\\restart-backend.bat (or setup-and-run.bat). " +
+    "Start the backend: run restart.bat (or update-and-install.bat). " +
     "Keep the backend terminal window open on port 8000."
   );
 }
@@ -102,7 +102,7 @@ export async function checkBackendHealth(): Promise<{
     if (h.execution_executor !== "asset_live_v2") {
       return {
         ok: false,
-        message: "Backend is running but outdated — restart scripts\\restart-backend.bat",
+        message: "Backend is running but outdated — run restart.bat",
         execution_executor: h.execution_executor,
         playwright_browsers: h.playwright_browsers,
       };

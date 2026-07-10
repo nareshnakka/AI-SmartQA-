@@ -108,7 +108,7 @@ export function NamingPatternsPanel({ projectId }: { projectId: string }) {
           <p className="text-xs text-red-600 dark:text-red-400 font-mono whitespace-pre-wrap">{loadError}</p>
         )}
         <p className="text-xs text-[var(--text-tertiary)]">
-          If the API returns 404, restart the backend: <code>scripts\restart-all-auto.bat</code>
+          If the API returns 404, restart the backend: <code>restart.bat</code>
         </p>
         <button type="button" onClick={reload} className="ds-btn-secondary text-sm">
           Retry

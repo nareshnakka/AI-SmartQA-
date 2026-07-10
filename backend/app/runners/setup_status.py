@@ -66,7 +66,7 @@ def configure_playwright_browsers_env() -> tuple[bool, str]:
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
             return True, ""
 
-    return False, "python -m playwright install chromium (or scripts\\install-playwright.bat)"
+    return False, "python -m playwright install chromium (or run update-and-install.bat)"
 
 
 def _playwright_browsers_on_disk() -> tuple[bool, str]:
@@ -136,7 +136,7 @@ async def check_playwright_async() -> tuple[bool, str]:
     except Exception as exc:
         msg = _ascii(str(exc))
         if "Executable doesn't exist" in msg or "browser" in msg.lower():
-            return False, "python -m playwright install chromium (or scripts\\install-playwright.bat)"
+            return False, "python -m playwright install chromium (or run update-and-install.bat)"
         return False, msg[:200]
 
 
@@ -156,22 +156,22 @@ def collect_runner_status() -> dict:
         },
         "cypress": {
             "ready": node and _node_module("cypress"),
-            "hint": "" if _node_module("cypress") else "run scripts/install-all-runners.bat",
+            "hint": "" if _node_module("cypress") else "run update-and-install.bat",
             "live": node and _node_module("cypress"),
         },
         "puppeteer": {
             "ready": node and _node_module("puppeteer"),
-            "hint": "" if _node_module("puppeteer") else "run scripts/install-all-runners.bat",
+            "hint": "" if _node_module("puppeteer") else "run update-and-install.bat",
             "live": node and _node_module("puppeteer"),
         },
         "testcafe": {
             "ready": node and _node_module("testcafe"),
-            "hint": "" if _node_module("testcafe") else "run scripts/install-all-runners.bat",
+            "hint": "" if _node_module("testcafe") else "run update-and-install.bat",
             "live": node and _node_module("testcafe"),
         },
         "webdriverio": {
             "ready": node and _node_module("@wdio/cli"),
-            "hint": "" if _node_module("@wdio/cli") else "run scripts/install-all-runners.bat",
+            "hint": "" if _node_module("@wdio/cli") else "run update-and-install.bat",
             "live": node and _node_module("@wdio/cli"),
         },
         "selenium": {

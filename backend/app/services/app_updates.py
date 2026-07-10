@@ -240,12 +240,12 @@ async def get_running_activity(db: AsyncSession) -> dict:
 
 
 def _spawn_install_process(repo_root: Path) -> None:
-    script = repo_root / "scripts" / "install-update-auto.bat"
+    script = repo_root / "update-and-install.bat"
     if not script.is_file():
         raise FileNotFoundError(f"Update script not found: {script}")
 
     if sys.platform == "win32":
-        cmd = ["cmd", "/c", "start", "", "/MIN", str(script), str(repo_root)]
+        cmd = ["cmd", "/c", "start", "", "/MIN", str(script), "/auto", str(repo_root)]
         subprocess.Popen(
             cmd,
             cwd=str(repo_root),
@@ -281,7 +281,7 @@ async def install_update(force: bool = False) -> dict:
             "message": "Updates are only available in a Git clone of QEOS.",
         }
 
-    script = repo_root / "scripts" / "install-update-auto.bat"
+    script = repo_root / "update-and-install.bat"
     if sys.platform != "win32":
         return {
             "started": False,
@@ -292,7 +292,7 @@ async def install_update(force: bool = False) -> dict:
         return {
             "started": False,
             "status": "error",
-            "message": "Update script is missing. Run get-latest-update.bat manually.",
+            "message": "Update script is missing. Run update-and-install.bat manually.",
         }
 
     async with _INSTALL_LOCK:

@@ -35,17 +35,20 @@ cd AI-SmartQA-
 From the project root, double-click or run:
 
 ```bat
-setup-and-run.bat
+update-and-install.bat
+restart.bat
 ```
 
-This script will:
+`update-and-install.bat` will:
 
+- Pull the latest code from GitHub (if this folder is a git clone)
 - Install **Python 3.11+** and **Node.js LTS** via `winget` if they are missing
 - Create `backend\.venv` and install Python packages
 - Install **all automation & performance runners** (see table below)
 - Run `npm ci` in `frontend`
-- Start backend (`http://127.0.0.1:8000`) and frontend (`http://localhost:3000`)
-- Open the app in your default browser
+- Initialize the SQLite database
+
+`restart.bat` stops any running servers, starts backend (`http://127.0.0.1:8000`) and frontend (`http://localhost:3000`), and opens the app in your default browser.
 
 **First run can take 20–40 minutes** depending on network speed (browser binaries and Node runner cache are large).
 
@@ -63,10 +66,10 @@ This script will:
 | | JMeter | Best-effort — winget |
 | | Gatling | Scripts generated for export; needs Gatling CLI to run |
 
-Re-run only runner setup anytime:
+Re-run dependency install anytime:
 
 ```bat
-scripts\install-all-runners.bat
+update-and-install.bat
 ```
 
 Check status:
@@ -78,7 +81,7 @@ cd backend
 
 Or open `http://127.0.0.1:8000/api/v1/platform/capabilities` after the backend is running.
 
-If Python or Node was just installed, close the terminal, open a new one, and run `setup-and-run.bat` again so PATH is refreshed.
+If Python or Node was just installed, close the terminal, open a new one, and run `update-and-install.bat` again so PATH is refreshed.
 
 ---
 
@@ -115,7 +118,7 @@ pip install -r requirements-runners.txt
 python scripts/install_all_runners.py --skip-winget
 
 # Or on Windows after venv + requirements.txt:
-# scripts\install-all-runners.bat
+# update-and-install.bat
 
 # 3. Frontend
 cd ../frontend
@@ -149,8 +152,8 @@ curl http://127.0.0.1:8000/health
 Look for `"execution_executor": "asset_live_v2"`. If that field is missing, restart the backend:
 
 ```bat
-scripts\stop-servers.bat
-scripts\restart-all.bat
+stop.bat
+restart.bat
 ```
 
 ---
@@ -162,7 +165,7 @@ When you are done reviewing or testing:
 ### Windows
 
 ```bat
-scripts\stop-servers.bat
+stop.bat
 ```
 
 Or close the two terminal windows titled **QEOS Backend** and **QEOS Frontend**.
@@ -175,7 +178,15 @@ Stop the processes listening on ports **8000** (API) and **3000** (UI), or press
 
 ## 6. Pull latest changes
 
-If the repo is updated on GitHub:
+**Windows (recommended):**
+
+```bat
+update-and-install.bat
+```
+
+This pulls from GitHub, reinstalls dependencies when needed, and can restart the app.
+
+**Manual:**
 
 ```bash
 git pull origin main
@@ -186,6 +197,7 @@ Then reinstall only if dependencies changed:
 ```bash
 cd backend && .venv\Scripts\pip install -r requirements.txt
 cd ../frontend && npm ci
+restart.bat
 ```
 
 ---
@@ -206,11 +218,11 @@ Use a [Personal Access Token](https://github.com/settings/tokens) or `gh auth lo
 
 | Issue | Fix |
 |-------|-----|
-| `TypeError: Failed to fetch` in Studio / Executions | Backend not running. Run `scripts\restart-backend.bat` and keep that window open. Verify `http://127.0.0.1:8000/health` in a browser. |
-| Debug finishes in ~2s, no real browser | Stale backend — restart with `scripts\restart-all.bat` |
-| `npm` or `python` not found after winget install | Open a **new** terminal and run setup again |
-| Runners missing (Discovery, debug, k6, Cypress, …) | `scripts\install-all-runners.bat` then `scripts\restart-backend.bat` |
+| `TypeError: Failed to fetch` in Studio / Executions | Backend not running. Run `restart.bat` and keep that window open. Verify `http://127.0.0.1:8000/health` in a browser. |
+| Debug finishes in ~2s, no real browser | Stale backend — run `restart.bat` |
+| `npm` or `python` not found after winget install | Open a **new** terminal and run `update-and-install.bat` again |
+| Runners missing (Discovery, debug, k6, Cypress, …) | `update-and-install.bat` then `restart.bat` |
 | Discovery HTTP crawl only | Same as above; verify `playwright_browsers: true` on `/health` |
-| Performance simulates instead of live k6 | `winget install GrafanaLabs.k6`, new terminal, `scripts\install-all-runners.bat` |
+| Performance simulates instead of live k6 | `winget install GrafanaLabs.k6`, new terminal, `update-and-install.bat` |
 
 For architecture and features, see [README.md](../README.md) and [docs/](.).

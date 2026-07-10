@@ -36,3 +36,14 @@ def test_git_check_sync_behind_count():
     assert result["commits_behind"] == 2
     assert result["current_commit"] == "abc1234"
     assert result["remote_commit"] == "def1234"
+
+
+def test_windows_update_scripts_exist():
+    root = find_repo_root()
+    assert root is not None
+    for rel in (
+        "update-and-install.bat",
+        "restart.bat",
+        "stop.bat",
+    ):
+        assert (root / rel).is_file(), f"missing {rel}"

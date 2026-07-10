@@ -120,9 +120,9 @@ function DiscoveryPageContent() {
               hint.toLowerCase().includes("sync api") || hint.toLowerCase().includes("asyncio loop");
             setPlaywrightHint(
               staleBackend
-                ? "Backend is outdated or multiple backends are running on port 8000. Close all QEOS Backend windows, run scripts\\restart-backend.bat once, then refresh this page."
+                ? "Backend is outdated or multiple backends are running on port 8000. Close all QEOS Backend windows, run restart.bat once, then refresh this page."
                 : hint ||
-                    "Playwright Chromium not installed. Run scripts\\install-all-runners.bat and restart the backend."
+                    "Playwright Chromium not installed. Run update-and-install.bat, then restart.bat."
             );
           } else {
             setPlaywrightHint(null);
@@ -334,7 +334,7 @@ function DiscoveryPageContent() {
       const err = String(e);
       setMessage(
         err.includes("Not Found")
-          ? "Clear failed — restart the backend (scripts\\restart-all-auto.bat) so new Discovery APIs load, then try again."
+          ? "Clear failed — run restart.bat so new Discovery APIs load, then try again."
           : err
       );
     } finally {
@@ -378,7 +378,7 @@ function DiscoveryPageContent() {
       const err = String(e);
       setMessage(
         err.includes("Not Found")
-          ? "Delete failed — restart the backend (scripts\\restart-all-auto.bat) so new Discovery APIs load, then try again."
+          ? "Delete failed — run restart.bat so new Discovery APIs load, then try again."
           : err
       );
     } finally {
@@ -580,7 +580,7 @@ function DiscoveryPageContent() {
         <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950">
           <p className="font-medium">Playwright not ready — QA Agent will only do a basic HTTP crawl until this is fixed.</p>
           <p className="mt-1 text-xs">{playwrightHint}</p>
-          <p className="mt-2 text-xs font-mono">scripts\install-all-runners.bat → scripts\restart-backend.bat</p>
+          <p className="mt-2 text-xs font-mono">update-and-install.bat → restart.bat</p>
         </div>
       )}
 

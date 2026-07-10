@@ -2496,7 +2496,7 @@ async def _fallback_http_agent(
 
     detail = reason or "browser automation not available"
     if "cursor-sandbox-cache" in detail or "sandbox-cache" in detail:
-        detail = "stale browser path (restart backend after scripts\\install-playwright.bat)"
+        detail = "stale browser path (run update-and-install.bat, then restart.bat)"
     await log_event({
         "type": "agent_start",
         "message": f"Playwright unavailable ({detail}) — using HTTP crawl fallback",
@@ -2504,7 +2504,7 @@ async def _fallback_http_agent(
     if reason and ("install" in reason.lower() or "sandbox" in reason.lower() or "Executable doesn't exist" in reason):
         await log_event({
             "type": "warning",
-            "message": "Fix: run scripts\\install-playwright.bat, then scripts\\restart-all-auto.bat. HTTP crawl only fetches static pages — use Playwright for login and menus.",
+            "message": "Fix: run update-and-install.bat, then restart.bat. HTTP crawl only fetches static pages — use Playwright for login and menus.",
         })
     await log_event({
         "type": "error",
@@ -2521,7 +2521,7 @@ async def _fallback_http_agent(
             "type": "error",
             "message": (
                 "Form fill was requested but Playwright browser is not available. "
-                "Run scripts\\install-playwright.bat then scripts\\restart-all-auto.bat."
+                "Run update-and-install.bat then restart.bat."
             ),
         })
     crawled = await crawl_application(start_url, max_pages=max_pages)

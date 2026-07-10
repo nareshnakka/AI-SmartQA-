@@ -19,7 +19,7 @@ def _venv_python() -> Path:
     posix = BACKEND / ".venv" / "bin" / "python"
     if posix.exists():
         return posix
-    print("ERROR: backend .venv not found. Run setup-and-run.bat step 4 first.")
+    print("ERROR: backend .venv not found. Run update-and-install.bat first.")
     sys.exit(1)
 
 
@@ -153,7 +153,7 @@ def install_all(*, skip_winget: bool = False) -> int:
 
     critical = [f for f in failures if f in ("playwright verify", "playwright chromium (python)", "requirements.txt")]
     if critical or verify_code != 0:
-        print("\nSetup completed with critical issues. Retry: scripts\\install-all-runners.bat")
+        print("\nSetup completed with critical issues. Retry: update-and-install.bat")
         return 1
     if failures:
         print("\nNon-critical items (optional tools):")

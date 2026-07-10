@@ -21,7 +21,7 @@ def main() -> int:
         print(f"FAIL: {msg}")
         if "Executable doesn't exist" in msg or "browser" in msg.lower():
             print("Fix: cd backend && .venv\\Scripts\\python.exe -m playwright install chromium")
-            print("Or from project root: scripts\\install-playwright.bat")
+            print("Or from project root: update-and-install.bat")
         return 1
 
     print("OK: Playwright Chromium is ready for QA Discovery and live debug runs.")

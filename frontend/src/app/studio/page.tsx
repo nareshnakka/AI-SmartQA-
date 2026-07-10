@@ -298,7 +298,7 @@ function StudioPageContent() {
       const err = String(e);
       setMessage(
         err.includes("Not Found")
-          ? "Delete failed — restart the backend (scripts\\restart-all-auto.bat) so file delete is available, then try again."
+          ? "Delete failed — run restart.bat so file delete is available, then try again."
           : err
       );
     } finally {
@@ -352,7 +352,7 @@ function StudioPageContent() {
     const text = raw.trim();
     if (!text) return text;
     if (text.includes("Not Found") && text.includes("detail")) {
-      return "Debug session not found on the API — restart the backend (scripts\\restart-all-auto.bat), then run Debug again.";
+      return "Debug session not found on the API — run restart.bat, then run Debug again.";
     }
     if (/\b404\b/i.test(text) || /not found/i.test(text)) {
       if (text.length < 120 && !text.includes("Error:")) {
@@ -523,7 +523,7 @@ function StudioPageContent() {
     try {
       const health = await checkBackendHealth();
       if (!health.ok) {
-        setExecMessage(health.message ?? "Backend unavailable — start scripts\\restart-backend.bat");
+        setExecMessage(health.message ?? "Backend unavailable — run restart.bat");
         setExecuting(false);
         return;
       }
