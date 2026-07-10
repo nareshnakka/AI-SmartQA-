@@ -221,7 +221,7 @@ def _generic_step_spec_content(title: str, steps: list[dict], base_url: str) -> 
     import json
 
     payload = [
-        {k: step[k] for k in ("description", "action", "url", "element", "target", "field") if step.get(k)}
+        {k: step[k] for k in ("description", "action", "url", "element", "target", "field", "interaction") if step.get(k)}
         for step in steps
     ]
     if not payload:

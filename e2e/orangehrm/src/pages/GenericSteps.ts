@@ -8,6 +8,7 @@ export type DiscoveryStep = {
   element?: string;
   target?: string;
   field?: string;
+  interaction?: string;
 };
 
 function quotedText(text: string): string | null {
@@ -159,12 +160,172 @@ async function tryGenericLogin(page: Page) {
   await publishLiveFrame(page);
 }
 
+function siteBrand(baseUrl: string): string {
+  try {
+    const host = new URL(baseUrl).hostname.replace(/^www\./, '');
+    const name = host.split('.')[0] || 'home';
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  } catch {
+    return 'Home';
+  }
+}
+
+async function dismissPopups(page: Page): Promise<number> {
+  const closePatterns = [
+    /^close$/i, /^skip$/i, /not now/i, /maybe later/i, /no thanks/i, /got it/i,
+    /continue without/i, /^later$/i, /^dismiss$/i, /accept all/i, /^agree$/i, /^ok$/i, /^×$/, /^✕$/,
+  ];
+  let total = 0;
+  for (let round = 0; round < 4; round++) {
+    let roundCount = 0;
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(200);
+
+    const overlays = page.locator(
+      "[role=dialog], [aria-modal='true'], .modal, [class*='popup' i], [class*='overlay' i], [class*='modal' i]"
+    );
+    const overlayN = await overlays.count();
+    for (let i = 0; i < Math.min(overlayN, 6); i++) {
+      const overlay = overlays.nth(i);
+      if (!(await overlay.isVisible().catch(() => false))) continue;
+      for (const pat of closePatterns) {
+        const btn = overlay.getByRole('button', { name: pat }).first();
+        if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+          await btn.click({ timeout: 8000 }).catch(() => {});
+          roundCount++;
+          await page.waitForTimeout(300);
+          break;
+        }
+      }
+    }
+
+    for (const pat of closePatterns) {
+      const buttons = page.getByRole('button', { name: pat });
+      const n = await buttons.count();
+      for (let j = 0; j < Math.min(n, 4); j++) {
+        const btn = buttons.nth(j);
+        if (!(await btn.isVisible().catch(() => false))) continue;
+        const box = await btn.boundingBox().catch(() => null);
+        if (box && box.y > 900) continue;
+        await btn.click({ timeout: 8000 }).catch(() => {});
+        roundCount++;
+        await page.waitForTimeout(300);
+      }
+    }
+
+    if (roundCount === 0) break;
+    total += roundCount;
+  }
+  if (total > 0) {
+    console.log(`✓ Dismissed ${total} popup(s) / overlay(s)`);
+  }
+  return total;
+}
+
+async function clickHome(page: Page, baseUrl: string) {
+  const brand = siteBrand(baseUrl);
+  const candidates = [
+    page.getByRole('link', { name: new RegExp(`^${escapeRegExp(brand)}$`, 'i') }).first(),
+    page.getByRole('link', { name: /home/i }).first(),
+    page.locator("header a[href='/']").first(),
+    page.locator(`a:has(img[alt*='logo' i]), a:has(img[alt*='${brand}' i])`).first(),
+  ];
+  for (const loc of candidates) {
+    if ((await loc.count()) > 0) {
+      await loc.click({ timeout: 15_000 });
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await publishLiveFrame(page);
+      console.log(`✓ Returned to homepage via UI click`);
+      return;
+    }
+  }
+  throw new Error('Could not return to homepage via logo or Home link — use UI navigation, not URLs');
+}
+
+async function clickMenuLabel(page: Page, label: string) {
+  const escaped = escapeRegExp(label);
+  const pattern = new RegExp(escaped, 'i');
+  const scopes = [
+    page.getByRole('link', { name: pattern }).first(),
+    page.locator('.oxd-main-menu-item, [role=menuitem], nav a, .sidebar a, .menu-item, header a, header span')
+      .filter({ hasText: pattern }).first(),
+    page.getByRole('button', { name: pattern }).first(),
+  ];
+
+  for (const loc of scopes) {
+    if ((await loc.count()) > 0) {
+      try {
+        await loc.hover({ timeout: 5000 });
+        await page.waitForTimeout(400);
+      } catch {
+        /* hover optional */
+      }
+      await loc.click({ timeout: 15_000 });
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await publishLiveFrame(page);
+      console.log(`✓ Clicked menu "${label}" — ${page.url()}`);
+      return;
+    }
+  }
+
+  // Mega-menu: hover category seed then click full label
+  const seeds = [label];
+  if (label.includes(',')) seeds.push(label.split(',')[0].trim());
+  if (label.includes('&')) {
+    seeds.push(label.replace(/&/g, 'and').trim());
+    label.split(/[,/&]/).forEach((p) => {
+      const t = p.trim();
+      if (t.length >= 3) seeds.push(t);
+    });
+  }
+  const seen = new Set<string>();
+  for (const seed of seeds) {
+    const key = seed.toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const trigger = page.locator('header, nav, [role=navigation]').getByText(new RegExp(escapeRegExp(seed), 'i')).first();
+    if ((await trigger.count()) === 0) continue;
+    await trigger.hover({ timeout: 5000 });
+    await page.waitForTimeout(500);
+    const flyout = page.getByRole('link', { name: pattern }).first();
+    if ((await flyout.count()) > 0) {
+      await flyout.click({ timeout: 15_000 });
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await publishLiveFrame(page);
+      console.log(`✓ Clicked mega-menu "${label}" — ${page.url()}`);
+      return;
+    }
+  }
+
+  throw new Error(`Could not find menu element to click: ${label}`);
+}
+
 async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
   const desc = step.description || '';
   const lower = desc.toLowerCase();
   const action = (step.action || '').toLowerCase();
+  const interaction = (step.interaction || '').toLowerCase();
+
+  if (action === 'dismiss' || interaction === 'popup') {
+    console.log(`→ ${desc || 'Dismiss blocking popups'}`);
+    await dismissPopups(page);
+    return;
+  }
+
+  if (interaction === 'home' || (action === 'click' && /return to homepage|via site logo/i.test(desc))) {
+    console.log(`→ ${desc}`);
+    await clickHome(page, baseUrl);
+    return;
+  }
 
   if (action === 'navigate') {
+    // Only the first application entry may use URL navigation; menu journeys use UI clicks.
+    if (interaction === 'menu' || /menu|category/i.test(desc)) {
+      const label = step.element || quotedText(desc) || desc;
+      console.log(`→ Click menu "${label}" (UI navigation)`);
+      await clickMenuLabel(page, label);
+      return;
+    }
     let url = step.url || step.target || '';
     if (!url || url.startsWith('/')) {
       const fromDesc = desc.match(/https?:\/\/[^\s'"]+/i)?.[0];
@@ -181,6 +342,7 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
       );
     }
     console.log(`✓ Loaded: ${page.url()}`);
+    await dismissPopups(page);
     return;
   }
 
@@ -200,6 +362,11 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
 
   if (action === 'click' || lower.includes('click') || lower.startsWith('open ')) {
     const label = step.element || quotedText(desc) || desc.replace(/^(click|open)\s+/i, '').trim();
+    if (interaction === 'menu' || /main navigation|main menu|mega-menu/i.test(desc)) {
+      console.log(`→ Click menu "${label}"`);
+      await clickMenuLabel(page, label);
+      return;
+    }
     console.log(`→ Click "${label}"`);
     const escaped = escapeRegExp(label);
     const link = page.getByRole('link', { name: new RegExp(escaped, 'i') }).first();
@@ -217,10 +384,8 @@ async function runOneStep(page: Page, step: DiscoveryStep, baseUrl: string) {
       await submitInput.click({ timeout: 15_000 });
     } else if ((await btn.count()) > 0) {
       await btn.click({ timeout: 15_000 });
-    } else if (step.target) {
-      await page.goto(step.target, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     } else {
-      throw new Error(`Could not find clickable target: ${label}`);
+      throw new Error(`Could not find clickable DOM element: ${label}`);
     }
     await page.waitForLoadState('domcontentloaded').catch(() => {});
     await publishLiveFrame(page);
@@ -278,6 +443,7 @@ export async function runDiscoverySteps(page: Page, steps: DiscoveryStep[], base
     const desc = step.description?.trim() || `Step ${i + 1}`;
     reportQeosStepAt(i, desc, 'running');
     try {
+      await dismissPopups(page);
       await runOneStep(page, step, baseUrl);
       reportQeosStepAt(i, desc, 'passed');
     } catch (err) {

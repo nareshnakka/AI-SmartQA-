@@ -5,8 +5,8 @@ def test_version_info():
     info = version_info()
     assert info["major"] == 2
     assert info["minor"] == 0
-    assert info["build"] == 6
+    assert info["build"] == 9
     assert info["feature_version"] == "2.0"
-    assert info["label"] == "V2.0-Build 6"
+    assert info["label"] == "V2.0-Build 9"
     assert feature_version() == "2.0"
-    assert version_label() == "V2.0-Build 6"
+    assert version_label() == "V2.0-Build 9"

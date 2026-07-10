@@ -131,6 +131,51 @@ Stay on flipkart.com only — do not open external links."""
     assert len(nav) == 14
 
 
+def test_flipkart_full_prompt_ignores_instruction_paragraphs():
+    prompt = """no login
+
+Navigate each of the below menus:
+For You
+Fashion
+Mobiles
+Beauty
+Electronics
+Home
+Appliances
+Toys, Baby & Kids
+Food & Health
+Auto Accessories
+2 Wheelers
+Sports & Fitness
+Books & Media
+Furniture
+
+Create one end-to-end navigation journey starting from the Flipkart homepage.
+
+For each menu in the list above:
+1. Start from the homepage (https://www.flipkart.com).
+2. Click the menu item in the top navigation bar (do not use direct category URLs).
+
+Rules:
+- Stay on flipkart.com only — do not open external links or third-party sites.
+- Do not log in or create an account.
+
+Expected outcome:
+- One combined test case: Main menu navigation journey covering all menus above in a single flow.
+- Each step should use click + verify (not deep-link navigation).
+"""
+    intent = parse_discovery_prompt(prompt)
+    from app.runners.discovery_prompt import navigation_targets
+
+    nav = navigation_targets(intent)
+    assert intent.menu_list_navigation is True
+    assert intent.wants_form_submit is False
+    assert intent.form_fields == []
+    assert len(nav) == 14
+    assert not any("journey" in t.lower() for t in nav)
+    assert not any("create one" in t.lower() for t in nav)
+
+
 def test_split_test_cases_when_explicitly_requested():
     intent = parse_discovery_prompt(
         "Explore Flipkart and create possible test cases for each main menu"
@@ -149,15 +194,19 @@ def test_combined_menu_journey_test_case():
         ],
     )
     assert case["flow_kind"] == "menu_journey"
-    assert len(case["steps"]) == 6  # home, click+verify, return home, click+verify
+    assert len(case["steps"]) == 10  # nav, dismiss, click, verify, dismiss, home, dismiss, click, verify, dismiss
     assert case["steps"][0]["url"] == "https://www.flipkart.com"
     assert case["steps"][0]["action"] == "navigate"
-    assert case["steps"][1]["action"] == "click"
-    assert case["steps"][1]["element"] == "For You"
-    assert case["steps"][2]["action"] == "verify"
-    assert case["steps"][3]["url"] == "https://www.flipkart.com"
-    assert case["steps"][3]["description"].lower().find("homepage") >= 0
-    assert case["steps"][4]["element"] == "Fashion"
+    assert case["steps"][1]["action"] == "dismiss"
+    assert case["steps"][2]["action"] == "click"
+    assert case["steps"][2]["element"] == "For You"
+    assert case["steps"][3]["action"] == "verify"
+    assert case["steps"][4]["action"] == "dismiss"
+    assert case["steps"][5]["action"] == "click"
+    assert case["steps"][5]["interaction"] == "home"
+    assert case["steps"][6]["action"] == "dismiss"
+    assert case["steps"][7]["element"] == "Fashion"
+    assert case["steps"][7]["interaction"] == "menu"
 
 
 def test_consolidate_module_flow_into_journey():

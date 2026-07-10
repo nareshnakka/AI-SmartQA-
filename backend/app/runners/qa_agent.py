@@ -270,7 +270,124 @@ MENU_SELECTORS = (
 )
 
 
-async def _wait_for_spa(page, timeout_ms: int = 6000) -> None:
+_POPUP_CLOSE_LABELS: list[re.Pattern[str]] = [
+    re.compile(r"^close$", re.I),
+    re.compile(r"^skip$", re.I),
+    re.compile(r"not\s+now", re.I),
+    re.compile(r"maybe\s+later", re.I),
+    re.compile(r"no\s+thanks", re.I),
+    re.compile(r"got\s+it", re.I),
+    re.compile(r"continue\s+without", re.I),
+    re.compile(r"^later$", re.I),
+    re.compile(r"^dismiss$", re.I),
+    re.compile(r"accept\s+all", re.I),
+    re.compile(r"^agree$", re.I),
+    re.compile(r"^ok$", re.I),
+    re.compile(r"^×$"),
+    re.compile(r"^✕$"),
+]
+
+_POPUP_OVERLAY_SELECTORS = (
+    "[role=dialog], [aria-modal='true'], .modal, [class*='popup' i], "
+    "[class*='overlay' i], [class*='modal' i], [class*='drawer' i]"
+)
+
+
+async def _dismiss_blocking_popups(page, emit=None) -> int:
+    """Close login, location, cookie, and overlay popups that block navigation."""
+    total = 0
+    for _ in range(4):
+        round_count = 0
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(250)
+        except Exception:
+            pass
+
+        try:
+            overlays = page.locator(_POPUP_OVERLAY_SELECTORS)
+            overlay_n = await overlays.count()
+            for i in range(min(overlay_n, 6)):
+                overlay = overlays.nth(i)
+                try:
+                    if not await overlay.is_visible():
+                        continue
+                except Exception:
+                    continue
+                for label_pat in _POPUP_CLOSE_LABELS:
+                    close_btn = overlay.get_by_role("button", name=label_pat).first
+                    try:
+                        if await close_btn.count() and await close_btn.is_visible():
+                            if await _safe_click(page, close_btn):
+                                round_count += 1
+                                await page.wait_for_timeout(350)
+                                break
+                    except Exception:
+                        continue
+                else:
+                    for sel in (
+                        "button[aria-label*='lose' i]",
+                        "button[aria-label*='ismiss' i]",
+                        "[class*='close' i]",
+                        "button:has-text('×')",
+                        "button:has-text('✕')",
+                    ):
+                        x_btn = overlay.locator(sel).first
+                        try:
+                            if await x_btn.count() and await x_btn.is_visible():
+                                if await _safe_click(page, x_btn):
+                                    round_count += 1
+                                    await page.wait_for_timeout(350)
+                                    break
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+        for label_pat in _POPUP_CLOSE_LABELS:
+            try:
+                buttons = page.get_by_role("button", name=label_pat)
+                btn_n = await buttons.count()
+                for j in range(min(btn_n, 4)):
+                    btn = buttons.nth(j)
+                    try:
+                        if not await btn.is_visible():
+                            continue
+                        box = await btn.bounding_box()
+                        if not box or box.get("y", 0) > 900:
+                            continue
+                        if await _safe_click(page, btn):
+                            round_count += 1
+                            await page.wait_for_timeout(350)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        if round_count == 0:
+            break
+        total += round_count
+
+    if total and emit:
+        await emit({
+            "type": "dismiss",
+            "message": f"Dismissed {total} popup(s) / overlay(s)",
+            "url": page.url,
+        })
+    return total
+
+
+def _popup_dismiss_step(order: int) -> dict:
+    return {
+        "order": order,
+        "action": "dismiss",
+        "description": "Close login, location, cookie, or overlay popups if visible",
+        "interaction": "popup",
+        "expected": "Blocking popups are closed and navigation can continue",
+    }
+
+
+async def _wait_for_spa(page, timeout_ms: int = 6000, *, dismiss_popups: bool = True, emit=None) -> None:
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
     except Exception:
@@ -286,6 +403,8 @@ async def _wait_for_spa(page, timeout_ms: int = 6000) -> None:
         )
     except Exception:
         await page.wait_for_timeout(800)
+    if dismiss_popups:
+        await _dismiss_blocking_popups(page, emit)
 
 
 async def _collect_menu_items(page) -> list[dict]:
@@ -381,6 +500,107 @@ async def _collect_nav_link_candidates(page, origin: str) -> list[dict]:
     return out
 
 
+def _site_brand_label(origin: str) -> str:
+    try:
+        host = urlparse(origin).netloc.lower().replace("www.", "")
+        name = host.split(".")[0]
+        return name[:1].upper() + name[1:] if name else "Home"
+    except Exception:
+        return "Home"
+
+
+async def _return_to_homepage_via_ui(page, home_url: str, origin: str, emit) -> bool:
+    """Return to the app homepage by clicking logo / Home — never use page.goto when possible."""
+    brand = _site_brand_label(origin)
+    await emit({
+        "type": "click",
+        "message": f"Return to homepage via logo or Home link",
+        "url": page.url,
+        "element": brand,
+    })
+    await _dismiss_blocking_popups(page, emit)
+
+    candidates: list[tuple[str, object]] = []
+    try:
+        candidates.append(("brand link", page.get_by_role("link", name=re.compile(re.escape(brand), re.I)).first))
+        candidates.append(("home link", page.get_by_role("link", name=re.compile(r"^home$", re.I)).first))
+        candidates.append(("header root", page.locator("header a[href='/'], header a[href='" + home_url + "']").first))
+        candidates.append(("logo image", page.locator("a:has(img[alt*='logo' i]), a:has(img[alt*='" + brand + "' i])").first))
+    except Exception:
+        pass
+
+    home_norm = home_url.split("#")[0].rstrip("/")
+    for label, loc in candidates:
+        try:
+            if not await loc.count():
+                continue
+            if await _safe_click(page, loc):
+                await _wait_for_spa(page)
+                if page.url.split("#")[0].rstrip("/") == home_norm or _same_origin(origin, page.url):
+                    await emit({
+                        "type": "navigate",
+                        "message": f"Returned to homepage via {label}",
+                        "url": page.url,
+                    })
+                    return True
+        except Exception:
+            continue
+
+    await emit({
+        "type": "warning",
+        "message": "Could not return to homepage via UI click — menu journey requires logo/Home navigation",
+        "url": page.url,
+    })
+    return False
+
+
+async def _click_mega_menu_item(page, target: str, origin: str) -> bool:
+    """Hover a top nav category then click a flyout link (Flipkart-style mega menus)."""
+    from app.runners.discovery_prompt import normalize_nav_target
+
+    target = normalize_nav_target(target)
+    if not target:
+        return False
+
+    seeds: list[str] = [target]
+    if "," in target:
+        seeds.append(target.split(",")[0].strip())
+    if "&" in target:
+        seeds.append(target.replace("&", "and").strip())
+        seeds.extend(p.strip() for p in re.split(r"[,/&]", target) if len(p.strip()) >= 3)
+    seeds.extend(w for w in target.split() if len(w) >= 3)
+
+    seen: set[str] = set()
+    link_pattern = re.compile(re.escape(target), re.I)
+    for seed in seeds:
+        key = seed.lower()
+        if key in seen or len(seed) < 2:
+            continue
+        seen.add(key)
+        try:
+            scope = page.locator("header, nav, [role=navigation]").first
+            trigger = scope.get_by_text(re.compile(re.escape(seed), re.I)).first
+            if not await trigger.count():
+                trigger = page.get_by_text(re.compile(re.escape(seed), re.I)).first
+            if not await trigger.count():
+                continue
+            await trigger.scroll_into_view_if_needed(timeout=5000)
+            await trigger.hover(timeout=5000)
+            await page.wait_for_timeout(600)
+            for link in (
+                page.get_by_role("link", name=link_pattern).first,
+                page.locator("a").filter(has_text=link_pattern).first,
+                page.get_by_role("link", name=re.compile(re.escape(seed), re.I)).first,
+            ):
+                if await link.count() and await _safe_click(page, link):
+                    await _wait_for_spa(page)
+                    if _is_allowed_nav_url(page.url, origin):
+                        return True
+        except Exception:
+            continue
+    return False
+
+
 async def _click_menu_item(
     page, text: str, *, origin: str | None = None, min_score: int = 58, click_only: bool = False,
 ) -> bool:
@@ -442,6 +662,9 @@ async def _click_menu_item(
     needles: list[str] = [target]
     if "," in target:
         needles.append(target.split(",")[0].strip())
+    if "&" in target:
+        needles.append(target.replace("&", "and").strip())
+        needles.extend(p.strip() for p in re.split(r"[,/&]", target) if len(p.strip()) >= 3)
     words = target.split()
     if words:
         needles.append(words[0])
@@ -472,6 +695,9 @@ async def _click_menu_item(
                             return True
                 except Exception:
                     continue
+
+    if click_only and await _click_mega_menu_item(page, target, origin):
+        return True
 
     return False
 
@@ -606,7 +832,8 @@ async def _navigate_with_playwright(
                 step_count += 1
         else:
             await page.goto(start_url, timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
-            await _wait_for_spa(page)
+            await _wait_for_spa(page, emit=emit)
+            await _dismiss_blocking_popups(page, emit)
 
         form_completed = False
         instruction_mode = (strict_follow and not intent.broad_exploration) or intent.menu_list_navigation
@@ -1412,12 +1639,26 @@ async def _open_named_target(page, target: str, origin: str, emit, *, menu_list_
         "url": page.url,
         "element": target_clean,
     })
+    await _dismiss_blocking_popups(page, emit)
 
-    if await _click_menu_item(
+    before_url = _normalize_url(page.url)
+    clicked = await _click_menu_item(
         page, target_clean, origin=origin,
         min_score=50 if menu_list_mode else 58,
         click_only=menu_list_mode,
-    ):
+    )
+    if clicked and menu_list_mode and _normalize_url(page.url) == before_url:
+        clicked = await _click_mega_menu_item(page, target_clean, origin)
+    if clicked and menu_list_mode and _normalize_url(page.url) == before_url:
+        await emit({
+            "type": "warning",
+            "message": f"Click on \"{target_clean}\" did not change the page — menu may need hover or a different label",
+            "url": page.url,
+        })
+        clicked = False
+
+    if clicked:
+        await _dismiss_blocking_popups(page, emit)
         title = await page.title()
         await emit({
             "type": "navigate",
@@ -1442,7 +1683,7 @@ async def _open_named_target(page, target: str, origin: str, emit, *, menu_list_
             loc = page.get_by_role("link", name=best["text"], exact=False)
             if await loc.count() and await _safe_click(page, loc.first):
                 await _wait_for_spa(page)
-                if _is_allowed_nav_url(page.url, origin):
+                if _is_allowed_nav_url(page.url, origin) and _normalize_url(page.url) != before_url:
                     title = await page.title()
                     await emit({
                         "type": "navigate",
@@ -1451,6 +1692,15 @@ async def _open_named_target(page, target: str, origin: str, emit, *, menu_list_
                         "title": title,
                     })
                     return True
+            if await _click_mega_menu_item(page, target_clean, origin):
+                title = await page.title()
+                await emit({
+                    "type": "navigate",
+                    "message": f"Opened {target_clean} via mega-menu click — {title or page.url}",
+                    "url": page.url,
+                    "title": title,
+                })
+                return True
         else:
             try:
                 await emit({
@@ -1536,12 +1786,22 @@ async def _run_instruction_plan(
     navigated: list[tuple[str, str, str]] = []
     home_url = start_url or page.url
     for target in nav_targets:
-        if home_url and page.url.split("#")[0].rstrip("/") != home_url.split("#")[0].rstrip("/"):
-            try:
-                await page.goto(home_url, timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
-                await _wait_for_spa(page)
-            except Exception:
-                pass
+        on_home = home_url and page.url.split("#")[0].rstrip("/") == home_url.split("#")[0].rstrip("/")
+        if not on_home:
+            if intent.menu_list_navigation:
+                if not await _return_to_homepage_via_ui(page, home_url, origin, emit):
+                    await emit({
+                        "type": "warning",
+                        "message": f"Skipped \"{target}\" — could not return to homepage via UI click",
+                        "url": page.url,
+                    })
+                    continue
+            else:
+                try:
+                    await page.goto(home_url, timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+                    await _wait_for_spa(page)
+                except Exception:
+                    pass
         if not await _open_named_target(
             page, target, origin, emit, menu_list_mode=intent.menu_list_navigation,
         ):
@@ -1561,7 +1821,7 @@ async def _run_instruction_plan(
         title = await page.title()
         navigated.append((target, page.url, title or target))
 
-    if intent.wants_form_submit or intent.form_fields:
+    if (intent.wants_form_submit or intent.form_fields) and not intent.menu_list_navigation:
         completed = await _execute_form_workflow(
             page, intent, origin, emit, proposed_cases,
             start_url=start_url, navigation_log=navigation_log or [],
@@ -2189,22 +2449,29 @@ def _build_combined_navigation_test_case(
             "expected": "Application homepage loads without errors",
         })
     order += 1
+    steps.append(_popup_dismiss_step(order))
+    order += 1
 
     for idx, (target, _page_url, title) in enumerate(navigated):
         if idx > 0:
+            brand = urlparse(start_url).netloc.replace("www.", "").split(".")[0].title() or "Home"
             steps.append({
                 "order": order,
-                "action": "navigate",
-                "description": f"Return to homepage ({start_url})",
-                "url": start_url,
+                "action": "click",
+                "description": "Return to homepage via site logo or Home link",
+                "element": brand,
+                "interaction": "home",
                 "expected": "Homepage is displayed before opening the next menu",
             })
+            order += 1
+            steps.append(_popup_dismiss_step(order))
             order += 1
         steps.append({
             "order": order,
             "action": "click",
-            "description": f"Open '{target}' from main menu",
+            "description": f"Click '{target}' in the main navigation menu",
             "element": target,
+            "interaction": "menu",
             "expected": f"{target} category or module page opens",
         })
         order += 1
@@ -2215,6 +2482,8 @@ def _build_combined_navigation_test_case(
             "description": f"Verify {target} page loads ({page_title})",
             "expected": f"{target} content is displayed",
         })
+        order += 1
+        steps.append(_popup_dismiss_step(order))
         order += 1
 
     labels = [t for t, _, _ in navigated]
@@ -2235,7 +2504,8 @@ def _build_combined_navigation_test_case(
         "steps": steps,
         "expected_results": [
             f"Journey starts from {start_url}",
-            "Each menu is opened from the homepage (not via deep links)",
+            "Login, location, and cookie popups are dismissed when they appear",
+            "Each menu is opened from the homepage via UI clicks (not deep links)",
             "All requested menus load without errors",
         ],
     }
@@ -2269,8 +2539,9 @@ def _menu_module_test(module_name: str, url: str, title: str, *, logged_in: bool
             {
                 "order": 2,
                 "action": "click",
-                "description": f"Open '{module_name}' from main menu",
+                "description": f"Click '{module_name}' in the main navigation menu",
                 "element": module_name,
+                "interaction": "menu",
                 "expected": f"{module_name} category or module page opens",
             },
             {
@@ -2364,7 +2635,7 @@ def _button_click_test(from_url: str, btn: dict, result_title: str) -> dict:
 def _instruction_session_test(start_url: str, log: list[dict], goals: str | None) -> dict:
     """One test case summarizing only what the agent did per user instructions."""
     skip_types = {"status", "warning", "error", "observe", "agent_start", "agent_complete"}
-    action_types = {"navigate", "click", "fill", "verify", "inspect"}
+    action_types = {"navigate", "click", "fill", "verify", "inspect", "dismiss"}
     nav_events = [
         e for e in log
         if e.get("type") in action_types

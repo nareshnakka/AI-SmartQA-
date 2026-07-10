@@ -26,7 +26,7 @@ def normalize_test_steps(steps: list | None) -> list[dict]:
                 "order": order_num,
                 "description": desc,
             }
-            for key in ("action", "url", "element", "expected", "field", "target"):
+            for key in ("action", "url", "element", "expected", "field", "target", "interaction"):
                 if raw.get(key):
                     item[key] = raw[key]
             if raw.get("disabled"):
@@ -55,7 +55,7 @@ def steps_for_storage(steps: list | None) -> list[dict]:
     stored: list[dict] = []
     for item in normalize_test_steps(steps):
         row: dict = {"order": item["order"], "description": item["description"]}
-        for key in ("action", "url", "field", "element", "target", "expected"):
+        for key in ("action", "url", "field", "element", "target", "expected", "interaction"):
             if item.get(key):
                 row[key] = item[key]
         if item.get("disabled"):

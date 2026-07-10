@@ -105,6 +105,7 @@ _NAV_TARGET_BLOCKLIST = frozenset(
         "enquiry", "inquiry", "product", "demo", "session", "prompt submit",
         "category", "categories", "external links", "external link", "for each",
         "each menu", "the category", "application", "dashboard", "homepage",
+        "rules", "expected outcome", "one combined test case", "each step",
     }
 )
 
@@ -114,7 +115,16 @@ _NAV_BOILERPLATE = re.compile(
 )
 
 _MENU_BLOCK_END = re.compile(
-    r"(?i)^(?:for\s+each|stay\s+on|do\s+not|don't|verify\s+the|only\s+)",
+    r"(?i)^(?:for\s+each|stay\s+on|do\s+not|don't|verify\s+the|only\s+|rules\b|"
+    r"expected\s+outcome|also\s+verify|create\s+one|one\s+combined|each\s+step|"
+    r"close\s+any|skip\s+broken|if\s+a\s+menu|if\s+the\s+menu|return\s+to|"
+    r"start\s+from|click\s+the|navigate\s+each)",
+)
+
+_MENU_INSTRUCTION_LINE = re.compile(
+    r"(?i)\b(?:starting\s+from|navigation\s+journey|end-to-end|homepage|test\s+case|"
+    r"in\s+the\s+list\s+above|top\s+navigation|category\s+page|product\s+grid|"
+    r"main\s+menu\s+navigation|deep-link|flyout|submenu|checkout|third-party)\b",
 )
 
 _NAV_NOISE_SUFFIX = re.compile(
@@ -136,6 +146,24 @@ _MENU_LINE_VERBS = re.compile(
 )
 
 _NUMBERED_STEP = re.compile(r"^\d+\.\s+")
+
+
+def _looks_like_menu_instruction_line(line: str) -> bool:
+    """True when a line is prompt guidance, not a menu label."""
+    stripped = line.strip().lstrip("-*• ")
+    if not stripped:
+        return False
+    if _NUMBERED_STEP.match(stripped):
+        return True
+    if _MENU_BLOCK_END.match(stripped):
+        return True
+    if _MENU_INSTRUCTION_LINE.search(stripped):
+        return True
+    if stripped.endswith(":") and len(stripped.split()) <= 4:
+        return True
+    if len(stripped.split()) > 8:
+        return True
+    return False
 
 
 def normalize_nav_target(label: str) -> str:
@@ -239,6 +267,8 @@ def extract_menu_list_targets(text: str) -> list[str]:
     for line in text.splitlines():
         stripped = line.strip().lstrip("-*• ")
         if not stripped:
+            if in_menu_block and targets:
+                in_menu_block = False
             continue
 
         header_match = _MENU_LIST_HEADER.match(stripped)
@@ -251,9 +281,8 @@ def extract_menu_list_targets(text: str) -> list[str]:
 
         if in_menu_block:
             if (
-                _NUMBERED_STEP.match(stripped)
+                _looks_like_menu_instruction_line(stripped)
                 or _is_prompt_meta_line(stripped)
-                or _MENU_BLOCK_END.match(stripped)
                 or _FORM_SUBMIT_HINT.search(stripped)
             ):
                 in_menu_block = False
@@ -401,9 +430,16 @@ def extract_form_fields(text: str) -> list[FormFieldSpec]:
             continue
         if _is_prompt_meta_line(line):
             continue
+        if _NUMBERED_STEP.match(line):
+            continue
+        if _looks_like_menu_instruction_line(line):
+            continue
         match = re.match(r"^([A-Za-z][\w\s-]{0,30}?)\s*[:=]\s*(.+)$", line)
         if match:
-            add(match.group(1), match.group(2))
+            label, value = match.group(1), match.group(2)
+            if re.search(r"https?://|//www\.", value, re.I):
+                continue
+            add(label, value)
             continue
         match = re.match(r"^([A-Za-z][\w\s]{0,30}?)\s+['\"]([^'\"]+)['\"]\s*$", line)
         if match:
@@ -467,6 +503,10 @@ def parse_discovery_prompt(text: str | None) -> DiscoveryIntent:
         len(intent.form_fields) >= 1
         and bool(re.search(r"\b(?:submit|send|form|enquiry|inquiry|contact)\b", raw, re.I))
     ) or len(intent.form_fields) >= 2
+
+    if intent.menu_list_navigation:
+        intent.wants_form_submit = False
+        intent.form_fields = []
 
     cred_span: tuple[int, int] | None = None
     for pattern in _CRED_PATTERNS:
