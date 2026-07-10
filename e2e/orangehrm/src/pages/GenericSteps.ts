@@ -222,27 +222,101 @@ async function dismissPopups(page: Page): Promise<number> {
   return total;
 }
 
+async function isHomeUrl(current: string, homeUrl: string): Promise<boolean> {
+  try {
+    const c = new URL(current);
+    const h = new URL(homeUrl);
+    const cn = c.hostname.replace(/^www\./, '');
+    const hn = h.hostname.replace(/^www\./, '');
+    if (cn !== hn) return false;
+    const path = (c.pathname || '/').replace(/^\/+|\/+$/g, '');
+    const homePath = (h.pathname || '/').replace(/^\/+|\/+$/g, '');
+    if (!path) return true;
+    return !!homePath && path === homePath;
+  } catch {
+    return false;
+  }
+}
+
+async function clickHomeLogoJs(page: Page, baseUrl: string): Promise<boolean> {
+  const clicked = await page.evaluate((homeUrl) => {
+    const norm = (u: string) => {
+      try {
+        const x = new URL(u, homeUrl);
+        const p = (x.pathname || '/').replace(/\/+$/, '') || '/';
+        return x.origin + p;
+      } catch {
+        return '';
+      }
+    };
+    const homeKey = norm(homeUrl);
+    const isHomeHref = (href: string) => !!href && norm(href) === homeKey;
+    const tryClick = (el: Element | null) => {
+      if (!el) return false;
+      const r = (el as HTMLElement).getBoundingClientRect();
+      if (r.width < 4 || r.height < 4) return false;
+      (el as HTMLElement).click();
+      return true;
+    };
+    const header =
+      document.querySelector('header') ||
+      document.querySelector('[role=banner]') ||
+      document.querySelector('[class*="header" i]');
+    if (header) {
+      for (const a of header.querySelectorAll('a[href]')) {
+        const href = a.getAttribute('href') || (a as HTMLAnchorElement).href || '';
+        if (isHomeHref(href) && tryClick(a)) return true;
+      }
+      const imgLink = header.querySelector('a img, a svg, a [class*="logo" i]');
+      if (imgLink) {
+        const a = imgLink.closest('a') || imgLink;
+        if (tryClick(a)) return true;
+      }
+    }
+    for (const a of document.querySelectorAll('a[href]')) {
+      const href = a.getAttribute('href') || '';
+      if ((href === '/' || isHomeHref(href)) && tryClick(a)) return true;
+    }
+    return false;
+  }, baseUrl);
+  if (!clicked) return false;
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  return isHomeUrl(page.url(), baseUrl);
+}
+
 async function clickHome(page: Page, baseUrl: string) {
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await page.waitForTimeout(200);
+  if (await clickHomeLogoJs(page, baseUrl)) {
+    await publishLiveFrame(page);
+    console.log('✓ Returned to homepage via site logo');
+    return;
+  }
   const brand = siteBrand(baseUrl);
   const candidates = [
     page.getByRole('link', { name: new RegExp(`^${escapeRegExp(brand)}$`, 'i') }).first(),
-    page.getByRole('link', { name: /home/i }).first(),
+    page.getByRole('link', { name: /^home$/i }).first(),
     page.locator("header a[href='/']").first(),
+    page.locator('header a:has(img), header a:has(svg)').first(),
     page.locator(`a:has(img[alt*='logo' i]), a:has(img[alt*='${brand}' i])`).first(),
   ];
   for (const loc of candidates) {
     if ((await loc.count()) > 0) {
       await loc.click({ timeout: 15_000 });
       await page.waitForLoadState('domcontentloaded').catch(() => {});
-      await publishLiveFrame(page);
-      console.log(`✓ Returned to homepage via UI click`);
-      return;
+      if (await isHomeUrl(page.url(), baseUrl)) {
+        await publishLiveFrame(page);
+        console.log('✓ Returned to homepage via UI click');
+        return;
+      }
     }
   }
   throw new Error('Could not return to homepage via logo or Home link — use UI navigation, not URLs');
 }
 
 async function clickMenuLabel(page: Page, label: string) {
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await page.waitForTimeout(200);
   const escaped = escapeRegExp(label);
   const pattern = new RegExp(escaped, 'i');
   const scopes = [

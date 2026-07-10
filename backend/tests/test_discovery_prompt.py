@@ -176,6 +176,15 @@ Expected outcome:
     assert not any("create one" in t.lower() for t in nav)
 
 
+def test_is_home_url():
+    from app.runners.qa_agent import _is_home_url
+
+    home = "https://www.flipkart.com"
+    assert _is_home_url("https://www.flipkart.com/", home) is True
+    assert _is_home_url("https://www.flipkart.com", home) is True
+    assert _is_home_url("https://www.flipkart.com/fashion/men", home) is False
+
+
 def test_split_test_cases_when_explicitly_requested():
     intent = parse_discovery_prompt(
         "Explore Flipkart and create possible test cases for each main menu"

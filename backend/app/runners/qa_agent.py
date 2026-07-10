@@ -500,6 +500,102 @@ async def _collect_nav_link_candidates(page, origin: str) -> list[dict]:
     return out
 
 
+def _is_home_url(current: str, home: str) -> bool:
+    """True when current URL is the application homepage (not a deep category page)."""
+    try:
+        c = urlparse(current)
+        h = urlparse(home)
+        cn = c.netloc.lower().removeprefix("www.")
+        hn = h.netloc.lower().removeprefix("www.")
+        if cn != hn:
+            return False
+        path = (c.path or "/").strip("/")
+        home_path = (h.path or "/").strip("/")
+        if not path:
+            return True
+        return bool(home_path) and path == home_path
+    except Exception:
+        return False
+
+
+async def _scroll_to_top(page) -> None:
+    try:
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
+async def _header_has_menu_target(page, target: str) -> bool:
+    """True when the top navigation still shows the menu label (sticky header sites)."""
+    from app.runners.discovery_prompt import normalize_nav_target
+
+    label = normalize_nav_target(target)
+    if not label:
+        return False
+    pattern = re.compile(re.escape(label), re.I)
+    for sel in ("header", "nav", "[role=navigation]", "[class*='header' i]"):
+        try:
+            scope = page.locator(sel).first
+            if await scope.count() and await scope.get_by_text(pattern).count():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _click_home_logo_via_js(page, home_url: str) -> bool:
+    """Click site logo / root link via DOM (works when logo is image-only, e.g. Flipkart)."""
+    try:
+        clicked = await page.evaluate(
+            """(homeUrl) => {
+                const norm = (u) => {
+                    try {
+                        const x = new URL(u, homeUrl);
+                        const p = (x.pathname || '/').replace(/\\/+$/, '') || '/';
+                        return x.origin + p;
+                    } catch { return ''; }
+                };
+                const homeKey = norm(homeUrl);
+                const isHomeHref = (href) => !!href && norm(href) === homeKey;
+                const tryClick = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 4 || r.height < 4) return false;
+                    el.click();
+                    return true;
+                };
+                const header = document.querySelector('header')
+                    || document.querySelector('[role=banner]')
+                    || document.querySelector('[class*="header" i]');
+                if (header) {
+                    for (const a of header.querySelectorAll('a[href]')) {
+                        const href = a.getAttribute('href') || a.href || '';
+                        if (isHomeHref(href) && tryClick(a)) return true;
+                    }
+                    const imgLink = header.querySelector('a img, a svg, a [class*="logo" i]');
+                    if (imgLink) {
+                        const a = imgLink.closest('a') || imgLink;
+                        if (tryClick(a)) return true;
+                    }
+                }
+                for (const a of document.querySelectorAll('a[href]')) {
+                    const href = a.getAttribute('href') || '';
+                    if (href === '/' && tryClick(a)) return true;
+                    if (isHomeHref(href) && tryClick(a)) return true;
+                }
+                return false;
+            }""",
+            home_url,
+        )
+        if clicked:
+            await _wait_for_spa(page)
+            return _is_home_url(page.url, home_url)
+    except Exception:
+        pass
+    return False
+
+
 def _site_brand_label(origin: str) -> str:
     try:
         host = urlparse(origin).netloc.lower().replace("www.", "")
@@ -518,25 +614,37 @@ async def _return_to_homepage_via_ui(page, home_url: str, origin: str, emit) -> 
         "url": page.url,
         "element": brand,
     })
+    await _scroll_to_top(page)
     await _dismiss_blocking_popups(page, emit)
 
+    if await _click_home_logo_via_js(page, home_url):
+        await emit({
+            "type": "navigate",
+            "message": "Returned to homepage via site logo",
+            "url": page.url,
+        })
+        return True
+
+    home_norm = home_url.split("#")[0].rstrip("/")
     candidates: list[tuple[str, object]] = []
     try:
         candidates.append(("brand link", page.get_by_role("link", name=re.compile(re.escape(brand), re.I)).first))
         candidates.append(("home link", page.get_by_role("link", name=re.compile(r"^home$", re.I)).first))
-        candidates.append(("header root", page.locator("header a[href='/'], header a[href='" + home_url + "']").first))
-        candidates.append(("logo image", page.locator("a:has(img[alt*='logo' i]), a:has(img[alt*='" + brand + "' i])").first))
+        candidates.append(("header root", page.locator("header a[href='/']").first))
+        candidates.append(("logo image", page.locator(
+            "header a:has(img), header a:has(svg), a:has(img[alt*='logo' i]), a:has(img[alt*='" + brand + "' i])"
+        ).first))
+        candidates.append(("breadcrumb home", page.locator("a").filter(has_text=re.compile(r"^home$", re.I)).first))
     except Exception:
         pass
 
-    home_norm = home_url.split("#")[0].rstrip("/")
     for label, loc in candidates:
         try:
             if not await loc.count():
                 continue
             if await _safe_click(page, loc):
                 await _wait_for_spa(page)
-                if page.url.split("#")[0].rstrip("/") == home_norm or _same_origin(origin, page.url):
+                if _is_home_url(page.url, home_url):
                     await emit({
                         "type": "navigate",
                         "message": f"Returned to homepage via {label}",
@@ -548,7 +656,7 @@ async def _return_to_homepage_via_ui(page, home_url: str, origin: str, emit) -> 
 
     await emit({
         "type": "warning",
-        "message": "Could not return to homepage via UI click — menu journey requires logo/Home navigation",
+        "message": "Could not return to homepage via UI click — will use sticky header if menu is visible",
         "url": page.url,
     })
     return False
@@ -1640,6 +1748,7 @@ async def _open_named_target(page, target: str, origin: str, emit, *, menu_list_
         "element": target_clean,
     })
     await _dismiss_blocking_popups(page, emit)
+    await _scroll_to_top(page)
 
     before_url = _normalize_url(page.url)
     clicked = await _click_menu_item(
@@ -1786,16 +1895,26 @@ async def _run_instruction_plan(
     navigated: list[tuple[str, str, str]] = []
     home_url = start_url or page.url
     for target in nav_targets:
-        on_home = home_url and page.url.split("#")[0].rstrip("/") == home_url.split("#")[0].rstrip("/")
+        on_home = _is_home_url(page.url, home_url)
         if not on_home:
             if intent.menu_list_navigation:
-                if not await _return_to_homepage_via_ui(page, home_url, origin, emit):
-                    await emit({
-                        "type": "warning",
-                        "message": f"Skipped \"{target}\" — could not return to homepage via UI click",
-                        "url": page.url,
-                    })
-                    continue
+                returned = await _return_to_homepage_via_ui(page, home_url, origin, emit)
+                if not returned:
+                    if await _header_has_menu_target(page, target):
+                        await emit({
+                            "type": "status",
+                            "message": "Sticky navigation visible — opening next menu from current page",
+                            "url": page.url,
+                        })
+                        await _scroll_to_top(page)
+                        await _dismiss_blocking_popups(page, emit)
+                    else:
+                        await emit({
+                            "type": "warning",
+                            "message": f"Skipped \"{target}\" — homepage and top navigation not reachable",
+                            "url": page.url,
+                        })
+                        continue
             else:
                 try:
                     await page.goto(home_url, timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
