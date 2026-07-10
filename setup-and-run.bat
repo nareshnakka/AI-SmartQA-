@@ -75,8 +75,9 @@ start "QEOS Backend" cmd /k ""%SCRIPTS%\restart-backend.bat""
 timeout /t 4 /nobreak >nul
 start "QEOS Frontend" cmd /k ""%SCRIPTS%\restart-frontend.bat""
 
-call :wait_for_app
-start "" "%APP_URL%"
+call "%SCRIPTS%\lib\wait-for-servers.bat" %BACKEND_PORT% %FRONTEND_PORT%
+echo Opening app in your default browser...
+call "%SCRIPTS%\lib\open-app.bat" %FRONTEND_PORT%
 
 echo.
 echo ============================================================
@@ -291,27 +292,6 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Frontend packages installed.
-exit /b 0
-
-:wait_for_app
-echo Waiting for servers to respond (up to 90 seconds)...
-set /a WAIT_COUNT=0
-:wait_loop
-set /a WAIT_COUNT+=1
-if !WAIT_COUNT! GTR 45 goto :wait_done
-powershell -NoProfile -Command "try { $h = Invoke-WebRequest -Uri 'http://127.0.0.1:%BACKEND_PORT%/health' -TimeoutSec 2 -UseBasicParsing; if ($h.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
-if not errorlevel 1 (
-  powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '%APP_URL%' -TimeoutSec 2 -UseBasicParsing | Out-Null; exit 0 } catch { exit 1 }" >nul 2>&1
-  if not errorlevel 1 (
-    echo Both backend and frontend are up.
-    exit /b 0
-  )
-)
-echo   ... still starting (!WAIT_COUNT!/45)
-timeout /t 2 /nobreak >nul
-goto :wait_loop
-:wait_done
-echo Servers may still be starting - opening browser anyway.
 exit /b 0
 
 :kill_port

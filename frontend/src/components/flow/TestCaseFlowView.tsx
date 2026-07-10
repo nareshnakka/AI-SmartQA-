@@ -237,7 +237,7 @@ export function parseStepsFromScript(content: string): FlowStep[] {
 
 /** Build flow steps from string[] test case steps */
 export function buildFlowSteps(
-  rawSteps: (string | { description?: string; action?: string; url?: string; order?: number; disabled?: boolean })[],
+  rawSteps: (string | { description?: string; action?: string; url?: string; order?: number; disabled?: boolean; expected?: string })[],
   expected?: string[],
   stepStatuses?: { order: number; status: string; description?: string; expected?: string }[]
 ): FlowStep[] {
@@ -252,14 +252,30 @@ export function buildFlowSteps(
     return orderA - orderB || a.i - b.i;
   });
 
+  let verifyExpectedIdx = 0;
+
   return indexed.map(({ s, i }, sortedIndex) => {
     const order = sortedIndex + 1;
     const st = statusMap.get(order);
+    const action = typeof s === "object" ? s.action : undefined;
+    const objectExpected = typeof s === "object" ? s.expected : undefined;
+
+    let stepExpected: string | null = st?.expected ?? objectExpected ?? null;
+    if (!stepExpected && typeof s === "string") {
+      stepExpected = expected?.[i] ?? expected?.[sortedIndex] ?? null;
+    }
+    if (!stepExpected && action === "verify") {
+      stepExpected = expected?.[verifyExpectedIdx] ?? null;
+    }
+    if (action === "verify") {
+      verifyExpectedIdx += 1;
+    }
+
     if (typeof s === "string") {
       return {
         order,
         description: st?.description ?? s,
-        expected: st?.expected ?? expected?.[i] ?? expected?.[sortedIndex] ?? null,
+        expected: stepExpected,
         status: (st?.status as FlowStepStatus) ?? "pending",
         disabled: false,
       };
@@ -270,7 +286,7 @@ export function buildFlowSteps(
       description: st?.description ?? s.description ?? String(s),
       action: s.action,
       url: s.url,
-      expected: st?.expected ?? expected?.[i] ?? expected?.[sortedIndex] ?? null,
+      expected: stepExpected,
       status: disabled ? "skipped" : ((st?.status as FlowStepStatus) ?? "pending"),
       disabled,
     };
@@ -345,13 +361,19 @@ export function applyDebugFlowSteps(
   const runFinished = opts.runStatus && opts.runStatus !== "running";
   let steps = baseSteps;
 
-  // Merge live or final step statuses from backend (never fake-advance locally)
+  // Merge live or final step statuses from backend (preserve action/url/expected from base steps)
   if (opts.resultSteps?.length) {
-    steps = buildFlowSteps(
-      baseSteps.map((s) => s.description),
-      baseSteps.map((s) => s.expected ?? ""),
-      opts.resultSteps
-    );
+    const statusMap = new Map(opts.resultSteps.map((s) => [s.order, s]));
+    steps = baseSteps.map((s, i) => {
+      const order = s.order ?? i + 1;
+      const st = statusMap.get(order);
+      return {
+        ...s,
+        status: (st?.status as FlowStepStatus) ?? s.status ?? "pending",
+        description: st?.description ?? s.description,
+        expected: st?.expected ?? s.expected ?? null,
+      };
+    });
   }
 
   const activeStepIndex =

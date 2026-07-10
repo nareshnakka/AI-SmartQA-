@@ -40,6 +40,8 @@ for /L %%W in (1,1,60) do (
     echo.
     echo App ready: http://localhost:%PORT%
     echo API health: http://127.0.0.1:8000/health
+    echo Opening app in your default browser...
+    call "%SCRIPTS%lib\open-app.bat" %PORT%
     exit /b 0
   )
 )

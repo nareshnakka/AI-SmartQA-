@@ -10,6 +10,8 @@ from app.integrations.manager import get_integration_manager
 from app.plugins.loader import discover_plugins
 from app.services.search import SearchService
 
+from app.version import version_info
+
 router = APIRouter(prefix="/platform", tags=["Platform"])
 
 
@@ -17,10 +19,13 @@ router = APIRouter(prefix="/platform", tags=["Platform"])
 async def platform_manifest():
     """Single source of truth for UI — features, integrations, agents."""
     extensions = get_extension_registry()
+    app_version = version_info()
     return {
         "name": "QEOS",
-        "version": "0.2.0",
-        "tagline": "Quality Engineering Operating System",
+        "version": app_version["feature_version"],
+        "build": app_version["build"],
+        "version_label": app_version["label"],
+        "tagline": app_version["tagline"],
         **extensions.to_manifest(),
     }
 

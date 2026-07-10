@@ -381,7 +381,9 @@ async def _collect_nav_link_candidates(page, origin: str) -> list[dict]:
     return out
 
 
-async def _click_menu_item(page, text: str, *, origin: str | None = None) -> bool:
+async def _click_menu_item(
+    page, text: str, *, origin: str | None = None, min_score: int = 58, click_only: bool = False,
+) -> bool:
     from app.runners.discovery_prompt import normalize_nav_target
 
     if SKIP_TEXT.search(text):
@@ -402,18 +404,26 @@ async def _click_menu_item(page, text: str, *, origin: str | None = None) -> boo
             best_score = score
             best = item
 
-    if best and best_score >= 58:
-        try:
-            await page.goto(best["href"], timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+    if best and best_score >= min_score:
+        loc = page.get_by_role("link", name=best["text"], exact=True)
+        if not await loc.count():
+            loc = page.get_by_role("link", name=best["text"], exact=False)
+        if await loc.count() and await _safe_click(page, loc.first):
             await _wait_for_spa(page)
             if _is_allowed_nav_url(page.url, origin):
                 return True
-        except Exception:
-            pass
-        loc = page.get_by_role("link", name=best["text"], exact=True)
-        if await loc.count() and await _safe_click(page, loc):
-            await _wait_for_spa(page)
-            return _is_allowed_nav_url(page.url, origin)
+        if not click_only:
+            try:
+                await page.goto(best["href"], timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+                await _wait_for_spa(page)
+                if _is_allowed_nav_url(page.url, origin):
+                    return True
+            except Exception:
+                pass
+            loc = page.get_by_role("link", name=best["text"], exact=True)
+            if await loc.count() and await _safe_click(page, loc):
+                await _wait_for_spa(page)
+                return _is_allowed_nav_url(page.url, origin)
 
     for selector in [".oxd-main-menu-item", "[role=menuitem]", "nav a", ".sidebar a", "header nav a"]:
         loc = page.locator(selector).filter(has_text=re.compile(rf"^{re.escape(target)}$", re.I))
@@ -428,6 +438,40 @@ async def _click_menu_item(page, text: str, *, origin: str | None = None) -> boo
         if await _safe_click(page, loc):
             await _wait_for_spa(page)
             return _is_allowed_nav_url(page.url, origin)
+
+    needles: list[str] = [target]
+    if "," in target:
+        needles.append(target.split(",")[0].strip())
+    words = target.split()
+    if words:
+        needles.append(words[0])
+    seen_needles: set[str] = set()
+    for needle in needles:
+        key = needle.lower().strip()
+        if len(key) < 3 or key in seen_needles:
+            continue
+        seen_needles.add(key)
+        pattern = re.compile(re.escape(needle), re.I)
+        for selector in ("nav a", "header a", "[role=navigation] a", "footer a", "a[href]"):
+            loc = page.locator(selector).filter(has_text=pattern)
+            count = await loc.count()
+            for i in range(min(count, 10)):
+                item = loc.nth(i)
+                try:
+                    if not await item.is_visible():
+                        continue
+                    href = await item.get_attribute("href") or ""
+                    if href and not _is_allowed_nav_url(href, origin):
+                        continue
+                    text_val = (await item.inner_text() or "").strip()
+                    if SKIP_TEXT.search(text_val):
+                        continue
+                    if await _safe_click(page, item):
+                        await _wait_for_spa(page)
+                        if _is_allowed_nav_url(page.url, origin):
+                            return True
+                except Exception:
+                    continue
 
     return False
 
@@ -498,7 +542,11 @@ async def _navigate_with_playwright(
     if strict_follow:
         target_cap = max(len(explicit_targets), 1) + (1 if login_user else 0)
         max_pages = min(max_pages, max(target_cap + 1, 3))
-        max_steps = min(max_steps, max(len(explicit_targets) * 8 + 10, 15))
+        step_budget = max(len(explicit_targets) * 6 + 10, 15)
+        if intent.menu_list_navigation:
+            step_budget = max(len(explicit_targets) * 8 + 15, step_budget)
+            max_pages = min(max_pages, max(len(explicit_targets) + 2, 5))
+        max_steps = min(max_steps, step_budget)
     start_url, origin = _agent_urls(base_url)
 
     navigation_log: list[dict] = []
@@ -561,7 +609,7 @@ async def _navigate_with_playwright(
             await _wait_for_spa(page)
 
         form_completed = False
-        instruction_mode = strict_follow and not intent.broad_exploration
+        instruction_mode = (strict_follow and not intent.broad_exploration) or intent.menu_list_navigation
 
         if instruction_mode:
             from app.runners.discovery_prompt import has_actionable_instructions, navigation_targets
@@ -691,7 +739,8 @@ async def _navigate_with_playwright(
                             await _wait_for_spa(page)
                             step_count += 1
                             mod_title = await page.title()
-                            proposed_cases.append(_menu_module_test(menu_text, page.url, mod_title))
+                            if not (intent.menu_list_navigation and not intent.split_test_cases):
+                                proposed_cases.append(_menu_module_test(menu_text, page.url, mod_title))
                             await emit({
                                 "type": "navigate",
                                 "message": f"Module opened: {menu_text} — {mod_title}",
@@ -799,6 +848,7 @@ async def _navigate_with_playwright(
         })
 
     # Deduplicate proposed cases by title
+    proposed_cases = _consolidate_menu_list_cases(proposed_cases, start_url, intent)
     seen_titles: set[str] = set()
     unique_cases: list[dict] = []
     for case in proposed_cases:
@@ -811,7 +861,19 @@ async def _navigate_with_playwright(
     has_form_flow = any(c.get("flow_kind") == "form_submit" for c in unique_cases)
     form_intent = bool(intent.form_fields) or intent.wants_form_submit
     unique_cases = [c for c in unique_cases if _case_looks_valid(c, origin)]
-    if len(navigation_log) > 3 and strict_follow and not has_form_flow and not form_intent:
+    has_menu_cases = any(
+        (c.get("title") or "").startswith("Module flow —")
+        or c.get("flow_kind") == "menu_journey"
+        for c in unique_cases
+    )
+    if (
+        len(navigation_log) > 3
+        and strict_follow
+        and not has_form_flow
+        and not form_intent
+        and not has_menu_cases
+        and not intent.menu_list_navigation
+    ):
         unique_cases.insert(0, _instruction_session_test(start_url, navigation_log, intent.goals or nav_requirements))
     elif len(navigation_log) > 3 and not strict_follow:
         unique_cases.insert(0, _full_session_test(start_url, navigation_log))
@@ -827,6 +889,54 @@ async def _navigate_with_playwright(
         "flow_map": _flows_from_cases(unique_cases, start_url),
         "apis": _apis_from_log(navigation_log),
     }
+
+
+def _consolidate_menu_list_cases(cases: list[dict], start_url: str, intent) -> list[dict]:
+    """Merge per-menu Module flow cases into one journey when user listed menus in the prompt."""
+    if not intent.menu_list_navigation or intent.split_test_cases:
+        return cases
+
+    module_cases = [c for c in cases if (c.get("title") or "").startswith("Module flow —")]
+    journey_cases = [c for c in cases if c.get("flow_kind") == "menu_journey"]
+
+    if journey_cases and module_cases:
+        return [c for c in cases if not (c.get("title") or "").startswith("Module flow —")]
+
+    if len(module_cases) < 2:
+        return cases
+
+    navigated: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for name in intent.explicit_targets or []:
+        key = name.lower()
+        if key in seen:
+            continue
+        match = next(
+            (c for c in module_cases if c.get("module") == name or c.get("title") == f"Module flow — {name}"),
+            None,
+        )
+        if match:
+            seen.add(key)
+            navigated.append((name, start_url, match.get("screen") or name))
+
+    for case in module_cases:
+        name = (case.get("title") or "").replace("Module flow — ", "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        navigated.append((name, start_url, case.get("screen") or name))
+
+    if not navigated:
+        return cases
+
+    others = [c for c in cases if not (c.get("title") or "").startswith("Module flow —")]
+    return others + [
+        _build_combined_navigation_test_case(
+            start_url,
+            navigated,
+            journey_name="Main menu navigation journey",
+        )
+    ]
 
 
 async def _attempt_login(page, username: str, password: str, emit) -> bool:
@@ -1288,7 +1398,7 @@ async def _try_same_origin_contact_paths(page, origin: str, emit) -> bool:
     return False
 
 
-async def _open_named_target(page, target: str, origin: str, emit) -> bool:
+async def _open_named_target(page, target: str, origin: str, emit, *, menu_list_mode: bool = False) -> bool:
     """Navigate to a page or module named in the user's prompt."""
     from app.runners.discovery_prompt import normalize_nav_target
 
@@ -1303,7 +1413,11 @@ async def _open_named_target(page, target: str, origin: str, emit) -> bool:
         "element": target_clean,
     })
 
-    if await _click_menu_item(page, target_clean, origin=origin):
+    if await _click_menu_item(
+        page, target_clean, origin=origin,
+        min_score=50 if menu_list_mode else 58,
+        click_only=menu_list_mode,
+    ):
         title = await page.title()
         await emit({
             "type": "navigate",
@@ -1323,39 +1437,54 @@ async def _open_named_target(page, target: str, origin: str, emit) -> bool:
             best_score = score
             best = link
 
-    if best and best_score >= 58:
-        try:
-            await emit({
-                "type": "navigate",
-                "message": f"Following link \"{best['text']}\" → {best['href']}",
-                "url": page.url,
-                "target": best["href"],
-                "element": best["text"],
-            })
-            await page.goto(best["href"], timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
-            await _wait_for_spa(page)
-            if _is_allowed_nav_url(page.url, origin):
-                title = await page.title()
+    if best and best_score >= (50 if menu_list_mode else 58):
+        if menu_list_mode:
+            loc = page.get_by_role("link", name=best["text"], exact=False)
+            if await loc.count() and await _safe_click(page, loc.first):
+                await _wait_for_spa(page)
+                if _is_allowed_nav_url(page.url, origin):
+                    title = await page.title()
+                    await emit({
+                        "type": "navigate",
+                        "message": f"Opened {target_clean} via menu click — {title or page.url}",
+                        "url": page.url,
+                        "title": title,
+                    })
+                    return True
+        else:
+            try:
                 await emit({
                     "type": "navigate",
-                    "message": f"Opened {target_clean} — {title or page.url}",
+                    "message": f"Following link \"{best['text']}\" → {best['href']}",
                     "url": page.url,
-                    "title": title,
+                    "target": best["href"],
+                    "element": best["text"],
                 })
-                return True
-            await emit({
-                "type": "warning",
-                "message": f"Skipped \"{best['text']}\" — left the application (external site)",
-                "url": page.url,
-            })
-        except Exception as exc:
-            await emit({
-                "type": "warning",
-                "message": f"Could not follow link \"{best['text']}\": {str(exc)[:120]}",
-                "url": best["href"],
-            })
+                await page.goto(best["href"], timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+                await _wait_for_spa(page)
+                if _is_allowed_nav_url(page.url, origin):
+                    title = await page.title()
+                    await emit({
+                        "type": "navigate",
+                        "message": f"Opened {target_clean} — {title or page.url}",
+                        "url": page.url,
+                        "title": title,
+                    })
+                    return True
+                await emit({
+                    "type": "warning",
+                    "message": f"Skipped \"{best['text']}\" — left the application (external site)",
+                    "url": page.url,
+                })
+            except Exception as exc:
+                await emit({
+                    "type": "warning",
+                    "message": f"Could not follow link \"{best['text']}\": {str(exc)[:120]}",
+                    "url": best["href"],
+                })
 
-    if await _try_same_origin_contact_paths(page, origin, emit):
+    contact_related = bool(re.search(r"\bcontact|enquiry|inquiry|get\s+in\s+touch\b", target_clean, re.I))
+    if contact_related and await _try_same_origin_contact_paths(page, origin, emit):
         title = await page.title()
         await emit({
             "type": "navigate",
@@ -1400,18 +1529,28 @@ async def _run_instruction_plan(
 
     completed = False
     nav_targets = navigation_targets(intent)
-    if _is_contact_form_url(start_url) or _is_contact_form_url(page.url):
-        nav_targets = []
-    elif await _page_ready_for_contact_form(page):
-        nav_targets = []
+    if (intent.wants_form_submit or intent.form_fields) and not intent.menu_list_navigation:
+        if _is_contact_form_url(start_url) or _is_contact_form_url(page.url) or await _page_ready_for_contact_form(page):
+            nav_targets = []
 
+    navigated: list[tuple[str, str, str]] = []
+    home_url = start_url or page.url
     for target in nav_targets:
-        if not await _open_named_target(page, target, origin, emit):
+        if home_url and page.url.split("#")[0].rstrip("/") != home_url.split("#")[0].rstrip("/"):
+            try:
+                await page.goto(home_url, timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+                await _wait_for_spa(page)
+            except Exception:
+                pass
+        if not await _open_named_target(
+            page, target, origin, emit, menu_list_mode=intent.menu_list_navigation,
+        ):
             await emit({
                 "type": "warning",
-                "message": f"Skipped navigation to \"{target}\" — continuing on current page",
+                "message": f"Skipped navigation to \"{target}\" — continuing with remaining menus",
                 "url": page.url,
             })
+            continue
         if not _is_allowed_nav_url(page.url, origin):
             await emit({
                 "type": "error",
@@ -1419,21 +1558,35 @@ async def _run_instruction_plan(
                 "url": page.url,
             })
             break
+        title = await page.title()
+        navigated.append((target, page.url, title or target))
 
     if intent.wants_form_submit or intent.form_fields:
         completed = await _execute_form_workflow(
             page, intent, origin, emit, proposed_cases,
             start_url=start_url, navigation_log=navigation_log or [],
         )
-    elif nav_targets:
-        title = await page.title()
-        for target in nav_targets:
-            proposed_cases.append(_menu_module_test(target, page.url, title))
+    elif navigated:
+        home = start_url or home_url
+        if intent.split_test_cases:
+            for target, _url, title in navigated:
+                proposed_cases.append(
+                    _menu_module_test(target, home, title, logged_in=logged_in, home_url=home)
+                )
+        else:
+            proposed_cases.append(
+                _build_combined_navigation_test_case(
+                    home,
+                    navigated,
+                    journey_name="Main menu navigation journey",
+                    logged_in=logged_in,
+                )
+            )
         await emit({
             "type": "verify",
-            "message": f"Completed navigation to: {', '.join(nav_targets)}",
+            "message": f"Completed navigation to: {', '.join(t for t, _, _ in navigated)}",
             "url": page.url,
-            "title": title,
+            "title": navigated[-1][2],
         })
         completed = True
     elif logged_in and intent.should_login:
@@ -2008,7 +2161,94 @@ async def _probe_form(page, page_title: str, emit) -> dict | None:
     }
 
 
-def _menu_module_test(module_name: str, url: str, title: str) -> dict:
+def _build_combined_navigation_test_case(
+    start_url: str,
+    navigated: list[tuple[str, str, str]],
+    *,
+    journey_name: str = "Navigation journey",
+    logged_in: bool = False,
+) -> dict:
+    """One end-to-end test case: start at base URL, open each menu from the homepage in order."""
+    steps: list[dict] = []
+    order = 1
+
+    if logged_in:
+        steps.append({
+            "order": order,
+            "action": "navigate",
+            "description": "Login and reach application dashboard",
+            "url": start_url,
+            "expected": "Dashboard loads successfully",
+        })
+    else:
+        steps.append({
+            "order": order,
+            "action": "navigate",
+            "description": f"Navigate to {start_url}",
+            "url": start_url,
+            "expected": "Application homepage loads without errors",
+        })
+    order += 1
+
+    for idx, (target, _page_url, title) in enumerate(navigated):
+        if idx > 0:
+            steps.append({
+                "order": order,
+                "action": "navigate",
+                "description": f"Return to homepage ({start_url})",
+                "url": start_url,
+                "expected": "Homepage is displayed before opening the next menu",
+            })
+            order += 1
+        steps.append({
+            "order": order,
+            "action": "click",
+            "description": f"Open '{target}' from main menu",
+            "element": target,
+            "expected": f"{target} category or module page opens",
+        })
+        order += 1
+        page_title = title or target
+        steps.append({
+            "order": order,
+            "action": "verify",
+            "description": f"Verify {target} page loads ({page_title})",
+            "expected": f"{target} content is displayed",
+        })
+        order += 1
+
+    labels = [t for t, _, _ in navigated]
+    title_suffix = ", ".join(labels[:4])
+    if len(labels) > 4:
+        title_suffix += f" (+{len(labels) - 4} more)"
+
+    return {
+        "id": _new_id(),
+        "title": f"{journey_name} — {title_suffix}",
+        "type": "e2e",
+        "priority": "high",
+        "source": "qa_agent",
+        "risk": "high",
+        "module": labels[0] if labels else "Navigation",
+        "screen": journey_name,
+        "flow_kind": "menu_journey",
+        "steps": steps,
+        "expected_results": [
+            f"Journey starts from {start_url}",
+            "Each menu is opened from the homepage (not via deep links)",
+            "All requested menus load without errors",
+        ],
+    }
+
+
+def _menu_module_test(module_name: str, url: str, title: str, *, logged_in: bool = False, home_url: str = "") -> dict:
+    start_url = home_url or url
+    entry_step = (
+        "Login and reach application dashboard"
+        if logged_in
+        else f"Navigate to {start_url}"
+    )
+    page_title = title or module_name
     return {
         "id": _new_id(),
         "title": f"Module flow — {module_name}",
@@ -2017,12 +2257,34 @@ def _menu_module_test(module_name: str, url: str, title: str) -> dict:
         "source": "qa_agent",
         "risk": "high",
         "module": module_name,
-        "screen": title or module_name,
+        "screen": page_title,
         "steps": [
-            {"order": 1, "action": "navigate", "description": "Login and reach application dashboard", "url": url},
-            {"order": 2, "action": "click", "description": f"Open '{module_name}' from main menu", "element": module_name},
-            {"order": 3, "action": "verify", "description": f"Verify {module_name} module loads ({title or module_name})", "expected": title or module_name},
-            {"order": 4, "action": "verify", "description": f"Verify key lists, forms, or actions are visible in {module_name}"},
+            {
+                "order": 1,
+                "action": "navigate",
+                "description": entry_step,
+                "url": start_url,
+                "expected": "Application homepage loads without errors",
+            },
+            {
+                "order": 2,
+                "action": "click",
+                "description": f"Open '{module_name}' from main menu",
+                "element": module_name,
+                "expected": f"{module_name} category or module page opens",
+            },
+            {
+                "order": 3,
+                "action": "verify",
+                "description": f"Verify {module_name} module loads ({page_title})",
+                "expected": f"Page title contains expected content for {module_name}",
+            },
+            {
+                "order": 4,
+                "action": "verify",
+                "description": f"Verify key lists, forms, or actions are visible in {module_name}",
+                "expected": f"Primary {module_name} content is displayed",
+            },
         ],
         "expected_results": [
             f"{module_name} module opens without errors",

@@ -5,11 +5,12 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import agents, audit, auth, automation, copilot, discovery, environments, executions, integrations, intelligence, llm, modules, monitoring, naming_patterns, performance, pipelines, platform, projects, quality_studio, reports, test_generation
+from app.api import agents, audit, auth, automation, copilot, discovery, environments, executions, integrations, intelligence, llm, modules, monitoring, naming_patterns, performance, pipelines, platform, projects, quality_studio, reports, test_generation, updates
 from app.config import settings
 from app.core.security import AuthMiddleware
 from app.db.session import init_db
 from app.models.schemas import HealthResponse
+from app.version import version_info, version_label
 from app.plugins.loader import discover_plugins
 from app.services.integration_store import hydrate_integration_manager
 
@@ -50,7 +51,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     description="Enterprise AI Quality Engineering Operating System",
-    version="2.1.0",
+    version=version_label(),
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -89,6 +90,7 @@ app.include_router(integrations.router, prefix="/api/v1")
 app.include_router(llm.router, prefix="/api/v1")
 app.include_router(intelligence.router, prefix="/api/v1")
 app.include_router(platform.router, prefix="/api/v1")
+app.include_router(updates.router, prefix="/api/v1")
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
@@ -99,9 +101,12 @@ async def health_check():
     # Fast on-disk check — never use sync Playwright on the uvicorn event loop.
     pw_ok, pw_hint = _playwright_browsers_on_disk()
     caps = get_runner_capabilities()
+    info = version_info()
     return HealthResponse(
         status="healthy",
-        version="2.1.0",
+        version=info["feature_version"],
+        version_label=info["label"],
+        build=info["build"],
         timestamp=datetime.now(timezone.utc),
         execution_executor="asset_live_v2",
         playwright_python=playwright_python_available(),

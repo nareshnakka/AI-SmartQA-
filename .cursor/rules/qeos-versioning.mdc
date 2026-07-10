@@ -1,0 +1,34 @@
+---
+description: QEOS app version and build numbering for every release
+alwaysApply: true
+---
+
+# QEOS version management
+
+The app version is defined in **`version.json`** at the repository root. Always update this file when shipping changes.
+
+## Display format
+
+Shown in the sidebar under the QEOS title:
+
+`Quality Engineering OS (V2.0-Build 1)`
+
+## When to bump
+
+| Change type | Update | Example |
+|-------------|--------|---------|
+| **New feature** | Increment `major` or `minor` in `version.json`, reset `build` to `1` | `2.0` → `2.1`, build `1` |
+| **Bug fix / patch** | Increment `build` only | build `1` → `2` |
+
+## Rules
+
+1. Edit **only** `version.json` for version changes (backend and frontend read it automatically).
+2. Do **not** hardcode version strings in UI, API, or docs — use `app/version.py` (backend) or `@/config/version` (frontend).
+3. After a feature release, the next fix starts at `build: 1` for that feature version.
+4. Current starting baseline: **V2.0-Build 1**.
+
+## Files wired to version.json
+
+- `frontend/src/config/version.ts` — sidebar label
+- `backend/app/version.py` — health check and platform manifest
+- `backend/app/main.py` — FastAPI app metadata

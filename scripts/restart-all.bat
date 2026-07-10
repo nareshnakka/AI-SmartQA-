@@ -19,6 +19,10 @@ ping 127.0.0.1 -n 4 >nul
 echo Opening frontend window...
 start "QEOS Frontend" cmd /k call "%SCRIPTS%restart-frontend.bat"
 
+call "%SCRIPTS%lib\wait-for-servers.bat"
+echo Opening app in your default browser...
+call "%SCRIPTS%lib\open-app.bat"
+
 echo.
 echo Backend:  http://127.0.0.1:8000/health
 echo Frontend: http://localhost:3000

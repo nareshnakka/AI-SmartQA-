@@ -3,8 +3,10 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import clsx from "clsx";
-import { ChevronRight, Bell, HelpCircle, LogOut } from "lucide-react";
+import { ChevronRight, HelpCircle, LogOut } from "lucide-react";
+import { NotificationBell } from "@/components/NotificationBell";
 import { useEffect, useState } from "react";
+import { APP_TAGLINE, formatAppVersionLabel } from "@/config/version";
 import { NAVIGATION } from "@/config/navigation";
 import { getIcon } from "@/config/icons";
 import { GlobalSearch } from "@/components/GlobalSearch";
@@ -27,7 +29,9 @@ export function Sidebar() {
           </div>
           <div>
             <span className="text-sm font-semibold text-white tracking-tight">QEOS</span>
-            <span className="block text-[10px] text-gray-500 leading-none mt-0.5">Quality Engineering OS</span>
+            <span className="block text-[10px] text-gray-500 leading-tight mt-0.5">
+              {APP_TAGLINE} ({formatAppVersionLabel()})
+            </span>
           </div>
         </Link>
       </div>
@@ -163,9 +167,7 @@ export function TopBar({ title }: { title?: string }) {
         <a href={`${BACKEND_URL}/docs`} target="_blank" rel="noopener noreferrer" className="ds-btn-ghost p-2" title="API Docs">
           <HelpCircle className="w-4 h-4" />
         </a>
-        <button className="ds-btn-ghost p-2 relative" title="Notifications" suppressHydrationWarning>
-          <Bell className="w-4 h-4" />
-        </button>
+        <NotificationBell />
       </div>
     </header>
   );

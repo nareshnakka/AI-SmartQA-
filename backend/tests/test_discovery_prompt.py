@@ -92,8 +92,95 @@ def test_contact_us_tab_normalizes_target():
     assert not any("view the contact" in t.lower() for t in nav)
 
 
+def test_flipkart_menu_list_targets():
+    prompt = """no login
+
+Navigate each of the below menus:
+For You
+Fashion
+Mobiles
+Beauty
+Electronics
+Home
+Appliances
+Toys, Baby & Kids
+Food & Health
+Auto Accessories
+2 Wheelers
+Sports & Fitness
+Books & Media
+Furniture
+
+For each menu, open the category and verify the page loads.
+Stay on flipkart.com only — do not open external links."""
+    intent = parse_discovery_prompt(prompt)
+    from app.runners.discovery_prompt import navigation_targets
+
+    nav = navigation_targets(intent)
+    assert intent.strict_follow is True
+    assert intent.broad_exploration is False
+    assert intent.menu_list_navigation is True
+    assert intent.split_test_cases is False
+    assert "for you" in {t.lower() for t in nav}
+    assert "fashion" in {t.lower() for t in nav}
+    assert "mobiles" in {t.lower() for t in nav}
+    assert "furniture" in {t.lower() for t in nav}
+    assert "category" not in {t.lower() for t in nav}
+    assert "external links" not in {t.lower() for t in nav}
+    assert "stay on flipkart.com only" not in {t.lower() for t in nav}
+    assert len(nav) == 14
+
+
+def test_split_test_cases_when_explicitly_requested():
+    intent = parse_discovery_prompt(
+        "Explore Flipkart and create possible test cases for each main menu"
+    )
+    assert intent.split_test_cases is True
+
+
+def test_combined_menu_journey_test_case():
+    from app.runners.qa_agent import _build_combined_navigation_test_case
+
+    case = _build_combined_navigation_test_case(
+        "https://www.flipkart.com",
+        [
+            ("For You", "https://www.flipkart.com/x", "For You Page"),
+            ("Fashion", "https://www.flipkart.com/fashion", "Fashion Page"),
+        ],
+    )
+    assert case["flow_kind"] == "menu_journey"
+    assert len(case["steps"]) == 6  # home, click+verify, return home, click+verify
+    assert case["steps"][0]["url"] == "https://www.flipkart.com"
+    assert case["steps"][0]["action"] == "navigate"
+    assert case["steps"][1]["action"] == "click"
+    assert case["steps"][1]["element"] == "For You"
+    assert case["steps"][2]["action"] == "verify"
+    assert case["steps"][3]["url"] == "https://www.flipkart.com"
+    assert case["steps"][3]["description"].lower().find("homepage") >= 0
+    assert case["steps"][4]["element"] == "Fashion"
+
+
+def test_consolidate_module_flow_into_journey():
+    from app.runners.discovery_prompt import parse_discovery_prompt
+    from app.runners.qa_agent import _consolidate_menu_list_cases, _menu_module_test
+
+    intent = parse_discovery_prompt(
+        "Navigate each of the below menus:\nFor You\nFashion\nMobiles"
+    )
+    cases = [
+        _menu_module_test("For You", "https://www.flipkart.com", "For You Page", home_url="https://www.flipkart.com"),
+        _menu_module_test("Fashion", "https://www.flipkart.com/fashion", "Fashion Page", home_url="https://www.flipkart.com"),
+        _menu_module_test("Mobiles", "https://www.flipkart.com/mobiles", "Mobiles Page", home_url="https://www.flipkart.com"),
+    ]
+    merged = _consolidate_menu_list_cases(cases, "https://www.flipkart.com", intent)
+    assert len(merged) == 1
+    assert merged[0]["flow_kind"] == "menu_journey"
+    assert merged[0]["title"].startswith("Main menu navigation journey")
+    assert len(merged[0]["steps"]) >= 7
+
+
 def test_sanitize_prompt_strips_base_url_line():
-    from app.runners.discovery_prompt import parse_discovery_prompt, sanitize_prompt_text
+    from app.runners.discovery_prompt import sanitize_prompt_text
 
     raw = """Base URL: https://www.vivilextech.com/contact-us.html
 Prompt:

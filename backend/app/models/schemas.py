@@ -95,6 +95,8 @@ class UserRole(str, Enum):
 class HealthResponse(BaseModel):
     status: str
     version: str
+    version_label: str = ""
+    build: int = 1
     timestamp: datetime
     execution_executor: str = "asset_live_v2"
     playwright_python: bool = False

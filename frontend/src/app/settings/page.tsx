@@ -15,14 +15,14 @@ export default function SettingsPage() {
   const { projectId, activeProject, ready } = useActiveProject();
   const [tab, setTab] = useState<SettingsTab>("platform");
   const [providers, setProviders] = useState<{ name: string; available: boolean; models: string[] }[]>([]);
-  const [manifest, setManifest] = useState<{ version: string; extensions: { id: string; point: string; name: string }[] } | null>(null);
+  const [manifest, setManifest] = useState<{ version: string; version_label?: string; build?: number; extensions: { id: string; point: string; name: string }[] } | null>(null);
   const [capabilities, setCapabilities] = useState<Record<string, boolean>>({});
   const [authStatus, setAuthStatus] = useState<{ auth_enabled: boolean; user_count: number; default_admin?: string; sso_configured?: boolean } | null>(null);
 
   useEffect(() => {
     Promise.allSettled([
       apiFetch<{ providers: { name: string; available: boolean; models: string[] }[] }>("/api/v1/llm/providers"),
-      apiFetch<{ version: string; extensions: { id: string; point: string; name: string }[] }>("/api/v1/platform/manifest"),
+      apiFetch<{ version: string; version_label?: string; build?: number; extensions: { id: string; point: string; name: string }[] }>("/api/v1/platform/manifest"),
       apiFetch<Record<string, boolean>>("/api/v1/platform/capabilities"),
       apiFetch<{ auth_enabled: boolean; user_count: number; default_admin?: string; sso_configured?: boolean }>("/api/v1/auth/status"),
     ]).then(([p, m, c, a]) => {
@@ -165,7 +165,7 @@ export default function SettingsPage() {
             <div>
               <h2 className="text-sm font-semibold">Registered Extensions</h2>
               <p className="text-xs text-[var(--text-tertiary)]">
-                Platform v{manifest?.version ?? "0.2.0"} — {manifest?.extensions.length ?? 0} extensions
+                Platform {manifest?.version_label ?? `v${manifest?.version ?? "2.0"}`} — {manifest?.extensions.length ?? 0} extensions
               </p>
             </div>
           </div>

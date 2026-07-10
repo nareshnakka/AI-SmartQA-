@@ -110,7 +110,7 @@ if exist "%SCRIPTS%\restart-all-auto.bat" (
     echo [WARNING] Restart had a problem. Try running setup-and-run.bat
   ) else (
     echo.
-    echo App is ready: http://localhost:3000
+    echo App is ready and should open in your browser: http://localhost:3000
   )
 ) else (
   echo Run setup-and-run.bat to start the app.

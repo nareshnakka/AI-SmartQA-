@@ -32,6 +32,15 @@ _STRICT_HINT = re.compile(
     re.I,
 )
 
+_MULTIPLE_CASES_HINT = re.compile(
+    r"\b(?:create\s+(?:all\s+)?(?:possible\s+)?(?:separate\s+)?test\s+cases?|"
+    r"generate\s+(?:all\s+)?(?:possible\s+)?test\s+cases?|"
+    r"individual\s+test\s+cases?|one\s+test\s+(?:case\s+)?per|"
+    r"separate\s+(?:test\s+)?cases?\s+(?:for|per)\s+each|multiple\s+test\s+cases?|"
+    r"propose\s+(?:all\s+)?(?:possible\s+)?test\s+cases?)\b",
+    re.I,
+)
+
 _CRED_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
         r"login\s+(?:as|with)\s+['\"]?([^/\s'\"]+)['\"]?/['\"]?(\S+)['\"]?",
@@ -94,7 +103,18 @@ _NAV_TARGET_BLOCKLIST = frozenset(
         "debug", "prompt", "test", "flow", "base", "url", "base url", "submit",
         "form", "instructions", "instruction", "agent", "discovery", "strict",
         "enquiry", "inquiry", "product", "demo", "session", "prompt submit",
+        "category", "categories", "external links", "external link", "for each",
+        "each menu", "the category", "application", "dashboard", "homepage",
     }
+)
+
+_NAV_BOILERPLATE = re.compile(
+    r"(?i)(?:stay\s+on|do\s+not\s+open|external\s+links?|^for\s+each\b|open\s+the\s+category|"
+    r"verify\s+the\s+page|flipkart\.com|\.com\s+only)",
+)
+
+_MENU_BLOCK_END = re.compile(
+    r"(?i)^(?:for\s+each|stay\s+on|do\s+not|don't|verify\s+the|only\s+)",
 )
 
 _NAV_NOISE_SUFFIX = re.compile(
@@ -102,6 +122,20 @@ _NAV_NOISE_SUFFIX = re.compile(
     re.I,
 )
 _NAV_NOISE_AFTER_AND = re.compile(r"\s+and\s+.*$", re.I)
+
+_MENU_LIST_HEADER = re.compile(
+    r"(?i)^(?:navigate\s+(?:to\s+)?(?:each\s+of\s+)?(?:the\s+)?(?:below\s+)?menus?|"
+    r"menus?\s+to\s+navigate|open\s+each\s+menu|visit\s+each\s+menu|"
+    r"navigate\s+each\s+(?:of\s+)?(?:the\s+)?(?:below\s+)?(?:menu|category|categories))"
+    r"\s*:?\s*(.*)$",
+)
+
+_MENU_LINE_VERBS = re.compile(
+    r"^(?:navigate\s+to|open|go\s+to|visit|click|check|test|verify)\s+",
+    re.I,
+)
+
+_NUMBERED_STEP = re.compile(r"^\d+\.\s+")
 
 
 def normalize_nav_target(label: str) -> str:
@@ -159,6 +193,9 @@ class DiscoveryIntent:
     """When True, user explicitly asked to explore broadly (overrides strict_follow)."""
     broad_exploration: bool = False
     explicit_targets: list[str] = field(default_factory=list)
+    menu_list_navigation: bool = False
+    """When True, generate separate test cases per target (broad exploration or explicit request)."""
+    split_test_cases: bool = False
     wants_form_submit: bool = False
     form_fields: list[FormFieldSpec] = field(default_factory=list)
 
@@ -167,19 +204,100 @@ def _clean_token(value: str) -> str:
     return value.strip().strip("\"'`,;")
 
 
+def _split_menu_tokens(value: str) -> list[str]:
+    parts = re.split(r"[,;|]", value)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _is_nav_boilerplate(label: str) -> bool:
+    key = label.strip().lower()
+    if not key or key in _NAV_TARGET_BLOCKLIST:
+        return True
+    if _NAV_BOILERPLATE.search(key):
+        return True
+    if key.startswith("stay on ") or key.startswith("for each"):
+        return True
+    return False
+
+
+def extract_menu_list_targets(text: str) -> list[str]:
+    """Parse explicit menu lists, e.g. 'Navigate each menu:' followed by one menu per line."""
+    targets: list[str] = []
+    seen: set[str] = set()
+    in_menu_block = False
+
+    def add(label: str) -> None:
+        t = normalize_nav_target(label.strip().strip(".,;"))
+        if len(t) < 2 or _is_nav_boilerplate(t):
+            return
+        key = t.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(t)
+
+    for line in text.splitlines():
+        stripped = line.strip().lstrip("-*• ")
+        if not stripped:
+            continue
+
+        header_match = _MENU_LIST_HEADER.match(stripped)
+        if header_match:
+            in_menu_block = True
+            remainder = header_match.group(1).strip()
+            for token in _split_menu_tokens(remainder):
+                add(token)
+            continue
+
+        if in_menu_block:
+            if (
+                _NUMBERED_STEP.match(stripped)
+                or _is_prompt_meta_line(stripped)
+                or _MENU_BLOCK_END.match(stripped)
+                or _FORM_SUBMIT_HINT.search(stripped)
+            ):
+                in_menu_block = False
+                continue
+            cleaned = _MENU_LINE_VERBS.sub("", stripped).strip().rstrip(".,;")
+            if cleaned:
+                add(cleaned)
+            continue
+
+        inline_match = re.search(
+            r"(?i)\b(?:navigate|open|visit)\s+each\s+(?:of\s+)?(?:the\s+)?menus?\s*:\s*(.+)$",
+            stripped,
+        )
+        if inline_match:
+            in_menu_block = True
+            for token in _split_menu_tokens(inline_match.group(1)):
+                add(token)
+
+    return targets
+
+
+def _extract_menu_list_targets(text: str, add) -> None:
+    for target in extract_menu_list_targets(text):
+        add(target)
+
+
 def extract_explicit_targets(text: str) -> list[str]:
     """Module/page names the user named in their instructions."""
     if not text:
         return []
+
+    menu_list = extract_menu_list_targets(text)
+    if menu_list:
+        return menu_list
+
     targets: list[str] = []
     seen: set[str] = set()
 
     def add(label: str) -> None:
         t = normalize_nav_target(label.strip().strip(".,;"))
-        if len(t) < 2:
+        if len(t) < 2 or _is_nav_boilerplate(t):
             return
         key = t.lower()
-        if key in seen or key in _NAV_TARGET_BLOCKLIST:
+        if key in seen:
             return
         if key.startswith("http") or "://" in key:
             return
@@ -340,7 +458,10 @@ def parse_discovery_prompt(text: str | None) -> DiscoveryIntent:
     intent.skip_login = bool(_LOGIN_SKIP.search(raw))
     intent.should_login = bool(_LOGIN_HINT.search(raw)) and not intent.skip_login
     intent.broad_exploration = bool(_BROAD_EXPLORE.search(raw))
-    intent.explicit_targets = extract_explicit_targets(cleaned or raw)
+    intent.split_test_cases = bool(_MULTIPLE_CASES_HINT.search(raw)) or intent.broad_exploration
+    menu_list = extract_menu_list_targets(cleaned or raw)
+    intent.menu_list_navigation = len(menu_list) >= 2
+    intent.explicit_targets = menu_list if menu_list else extract_explicit_targets(cleaned or raw)
     intent.form_fields = filter_form_fields(extract_form_fields(cleaned or raw))
     intent.wants_form_submit = bool(_FORM_SUBMIT_HINT.search(raw)) or (
         len(intent.form_fields) >= 1
