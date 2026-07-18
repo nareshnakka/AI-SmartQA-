@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     github_webhook_secret: str = ""
     github_client_id: str = ""
     github_client_secret: str = ""
+    # Report Bug — file GitHub issues (+ attachments) from remote installs
+    qeos_github_bug_token: str = ""
+    qeos_github_bug_repo: str = ""  # optional owner/repo override, e.g. nareshnakka/AI-SmartQA-
+    qeos_github_bug_labels: str = "bug,qeos"
 
     bitbucket_client_id: str = ""
     bitbucket_client_secret: str = ""

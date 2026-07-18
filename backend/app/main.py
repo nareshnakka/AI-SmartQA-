@@ -5,7 +5,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import agents, audit, auth, automation, copilot, cursor, discovery, environments, executions, integrations, intelligence, llm, modules, monitoring, naming_patterns, performance, pipelines, platform, projects, quality_studio, reports, test_generation, updates
+from app.api import agents, audit, auth, automation, copilot, cursor, discovery, environments, executions, integrations, intelligence, llm, modules, monitoring, naming_patterns, performance, pipelines, platform, projects, quality_studio, reports, support, test_generation, updates
 from app.config import settings
 from app.core.security import AuthMiddleware
 from app.db.session import init_db
@@ -13,10 +13,12 @@ from app.models.schemas import HealthResponse
 from app.version import version_info, version_label
 from app.plugins.loader import discover_plugins
 from app.services.integration_store import hydrate_integration_manager
+from app.services.log_buffer import structlog_buffer_processor
 
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),
+        structlog_buffer_processor,
         structlog.processors.JSONRenderer(),
     ],
 )
@@ -92,6 +94,7 @@ app.include_router(llm.router, prefix="/api/v1")
 app.include_router(intelligence.router, prefix="/api/v1")
 app.include_router(platform.router, prefix="/api/v1")
 app.include_router(updates.router, prefix="/api/v1")
+app.include_router(support.router, prefix="/api/v1")
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])

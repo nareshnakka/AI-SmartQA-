@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import clsx from "clsx";
 import { ChevronRight, HelpCircle, LogOut } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
+import { ReportBugButton } from "@/components/ReportBugButton";
 import { useEffect, useState } from "react";
 import { APP_TAGLINE, formatAppVersionLabel } from "@/config/version";
 import { NAVIGATION } from "@/config/navigation";
@@ -167,6 +168,7 @@ export function TopBar({ title }: { title?: string }) {
         <a href={`${BACKEND_URL}/docs`} target="_blank" rel="noopener noreferrer" className="ds-btn-ghost p-2" title="API Docs">
           <HelpCircle className="w-4 h-4" />
         </a>
+        <ReportBugButton />
         <NotificationBell />
       </div>
     </header>

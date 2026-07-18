@@ -41,6 +41,7 @@ temp/
 *.db-wal
 data/cursor_credentials.json
 data/update_backups/
+bug-reports/
 *.db-wal
 qeos.db
 postgres_data/
