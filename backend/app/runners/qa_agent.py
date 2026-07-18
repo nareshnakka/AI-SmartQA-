@@ -895,6 +895,22 @@ async def _navigate_with_playwright(
             if hasattr(result, "__await__"):
                 await result
 
+    if settings.discovery_cursor_advisor_enabled:
+        from app.services.cursor_discovery_advisor import apply_cursor_discovery_plan
+
+        intent = await apply_cursor_discovery_plan(intent, start_url, emit)
+        nav_requirements = intent.goals or requirements
+        strict_follow = intent.strict_follow and not intent.broad_exploration
+        explicit_targets = intent.explicit_targets
+        if strict_follow:
+            target_cap = max(len(explicit_targets), 1) + (1 if login_user else 0)
+            max_pages = min(max_pages, max(target_cap + 1, 3))
+            step_budget = max(len(explicit_targets) * 6 + 10, 15)
+            if intent.menu_list_navigation:
+                step_budget = max(len(explicit_targets) * 8 + 15, step_budget)
+                max_pages = min(max_pages, max(len(explicit_targets) + 2, 5))
+            max_steps = min(max_steps, step_budget)
+
     proposed_cases: list[dict] = []
     visited_urls: set[str] = set()
     visited_menus: set[str] = set()
@@ -1841,6 +1857,37 @@ async def _open_named_target(page, target: str, origin: str, emit, *, menu_list_
                     "message": f"Could not follow link \"{best['text']}\": {str(exc)[:120]}",
                     "url": best["href"],
                 })
+
+    if menu_list_mode and settings.discovery_cursor_advisor_enabled:
+        from app.services.cursor_discovery_advisor import suggest_menu_click_aliases
+
+        visible_links = [
+            link["text"] for link in await _collect_nav_link_candidates(page, origin) if link.get("text")
+        ]
+        aliases = await suggest_menu_click_aliases(target_clean, visible_links, origin or page.url)
+        for alias in aliases:
+            await emit({
+                "type": "status",
+                "message": f"Cursor advisor — retrying menu click as \"{alias}\"",
+                "url": page.url,
+                "element": alias,
+            })
+            if await _click_menu_item(
+                page, alias, origin=origin, min_score=45, click_only=True,
+            ):
+                if _normalize_url(page.url) == before_url:
+                    if not await _click_mega_menu_item(page, alias, origin):
+                        continue
+                if _normalize_url(page.url) != before_url or await _header_has_menu_target(page, target_clean):
+                    await _dismiss_blocking_popups(page, emit)
+                    title = await page.title()
+                    await emit({
+                        "type": "navigate",
+                        "message": f"Opened {target_clean} via Cursor alias \"{alias}\" — {title or page.url}",
+                        "url": page.url,
+                        "title": title,
+                    })
+                    return True
 
     contact_related = bool(re.search(r"\bcontact|enquiry|inquiry|get\s+in\s+touch\b", target_clean, re.I))
     if contact_related and await _try_same_origin_contact_paths(page, origin, emit):

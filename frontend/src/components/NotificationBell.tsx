@@ -12,6 +12,13 @@ type RunningItem = {
   status: string;
 };
 
+type ChangelogEntry = {
+  sha?: string;
+  message?: string;
+  author?: string;
+  date?: string;
+};
+
 type AppNotification = {
   id: string;
   type: string;
@@ -25,6 +32,12 @@ type AppNotification = {
     current_commit?: string;
     remote_commit?: string;
     commits_behind?: number;
+    current_version?: string;
+    remote_version?: string;
+    changelog?: ChangelogEntry[];
+    auto_update_enabled?: boolean;
+    auto_status?: string;
+    data_preserved?: boolean;
   };
 };
 
@@ -38,6 +51,10 @@ type UpdatesStatus = {
     current_commit?: string;
     remote_commit?: string;
     commits_behind?: number;
+    current_version?: string;
+    remote_version?: string;
+    changelog?: ChangelogEntry[];
+    auto_update_enabled?: boolean;
   };
   running_activity: {
     has_active: boolean;
@@ -46,9 +63,17 @@ type UpdatesStatus = {
   };
   notifications: AppNotification[];
   unread_count: number;
+  auto_install?: {
+    started?: boolean;
+    status?: string;
+    message?: string;
+    deferred?: boolean;
+  } | null;
+  poll_interval_sec?: number;
+  data_preserved?: boolean;
 };
 
-const POLL_MS = 5 * 60 * 1000;
+const DEFAULT_POLL_MS = 2 * 60 * 1000;
 
 function formatWhen(value?: string) {
   if (!value) return "";
@@ -64,15 +89,32 @@ export function NotificationBell() {
   const [installing, setInstalling] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [pollMs, setPollMs] = useState(DEFAULT_POLL_MS);
   const panelRef = useRef<HTMLDivElement>(null);
+  const autoToastShown = useRef<string | null>(null);
 
   const refresh = useCallback(async (fetchRemote = false) => {
     setLoading(true);
     try {
       const data = await apiFetch<UpdatesStatus>(
-        `/api/v1/updates/status?fetch=${fetchRemote ? "true" : "false"}`
+        `/api/v1/updates/status?fetch=${fetchRemote ? "true" : "false"}&auto_install=true`
       );
       setStatus(data);
+      setPollMs(Math.max(30_000, (data.poll_interval_sec || 120) * 1000));
+
+      const remote = data.update?.remote_commit || "";
+      if (data.auto_install?.started && remote && autoToastShown.current !== remote) {
+        autoToastShown.current = remote;
+        setMessage(
+          data.auto_install.message ||
+            "Update installing automatically. The app will restart. Your data is preserved."
+        );
+        setInstalling(true);
+        setOpen(true);
+      } else if (data.auto_install?.deferred && remote && autoToastShown.current !== `defer-${remote}`) {
+        autoToastShown.current = `defer-${remote}`;
+        setMessage(data.auto_install.message || "Update waiting until current work finishes.");
+      }
     } catch {
       setStatus(null);
     } finally {
@@ -82,9 +124,9 @@ export function NotificationBell() {
 
   useEffect(() => {
     void refresh(true);
-    const timer = window.setInterval(() => void refresh(true), POLL_MS);
+    const timer = window.setInterval(() => void refresh(true), pollMs);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, pollMs]);
 
   useEffect(() => {
     if (!open) return;
@@ -113,18 +155,21 @@ export function NotificationBell() {
         method: "POST",
         body: JSON.stringify({ force }),
       });
-      setMessage(result.message || "Update started. The app will restart shortly.");
+      setMessage(
+        result.message ||
+          "Update started. Your projects and settings are preserved. The app will restart shortly."
+      );
       setConfirmOpen(false);
-      setOpen(false);
+      setOpen(true);
     } catch (err) {
       const text = err instanceof Error ? err.message : "Update failed.";
       try {
-        const parsed = JSON.parse(text) as { detail?: { message?: string; running_activity?: UpdatesStatus["running_activity"] } };
+        const parsed = JSON.parse(text) as {
+          detail?: { message?: string; running_activity?: UpdatesStatus["running_activity"] };
+        };
         if (parsed.detail?.running_activity?.has_active) {
           setStatus((prev) =>
-            prev
-              ? { ...prev, running_activity: parsed.detail!.running_activity! }
-              : prev
+            prev ? { ...prev, running_activity: parsed.detail!.running_activity! } : prev
           );
           setConfirmOpen(true);
           return;
@@ -166,14 +211,14 @@ export function NotificationBell() {
         </button>
 
         {open && (
-          <div className="absolute right-0 mt-2 w-[360px] max-w-[90vw] ds-card shadow-lg border border-[var(--border-default)] z-50">
+          <div className="absolute right-0 mt-2 w-[400px] max-w-[90vw] ds-card shadow-lg border border-[var(--border-default)] z-50">
             <div className="ds-card-header flex items-center justify-between">
               <h2 className="text-sm font-semibold">Notifications</h2>
               <button type="button" className="ds-btn-ghost p-1" onClick={() => setOpen(false)} aria-label="Close">
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <div className="ds-card-body max-h-[420px] overflow-y-auto space-y-3">
+            <div className="ds-card-body max-h-[480px] overflow-y-auto space-y-3">
               {loading && !status && (
                 <div className="flex items-center gap-2 text-sm text-[var(--text-tertiary)]">
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -185,44 +230,75 @@ export function NotificationBell() {
                 <p className="text-sm text-[var(--text-tertiary)]">No new notifications.</p>
               )}
 
-              {notifications.map((item) => (
-                <div key={item.id} className="rounded-md border border-[var(--border-default)] p-3 bg-[var(--surface-sunken)]">
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <p className="text-sm font-medium text-[var(--text-primary)]">{item.title}</p>
-                      <p className="text-xs text-[var(--text-secondary)] mt-1">{item.message}</p>
-                      {item.meta?.branch && (
-                        <p className="text-[11px] text-[var(--text-tertiary)] mt-2">
-                          Branch {item.meta.branch}: {item.meta.current_commit} to {item.meta.remote_commit}
+              {notifications.map((item) => {
+                const changelog = item.meta?.changelog ?? [];
+                return (
+                  <div
+                    key={item.id}
+                    className="rounded-md border border-[var(--border-default)] p-3 bg-[var(--surface-sunken)]"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium text-[var(--text-primary)]">{item.title}</p>
+                        <p className="text-xs text-[var(--text-secondary)] mt-1 whitespace-pre-line">{item.message}</p>
+                        {(item.meta?.current_version || item.meta?.remote_version) && (
+                          <p className="text-[11px] text-[var(--text-tertiary)] mt-2 font-mono">
+                            {item.meta.current_version || "?"} → {item.meta.remote_version || "?"}
+                            {item.meta.branch ? ` · ${item.meta.branch}` : ""}
+                          </p>
+                        )}
+                        {changelog.length > 0 && (
+                          <ul className="mt-2 space-y-1 max-h-36 overflow-y-auto">
+                            {changelog.slice(0, 8).map((entry) => (
+                              <li
+                                key={`${entry.sha}-${entry.message}`}
+                                className="text-[11px] text-[var(--text-secondary)] flex gap-2"
+                              >
+                                <span className="font-mono text-[var(--text-tertiary)] shrink-0">
+                                  {entry.sha || "·······"}
+                                </span>
+                                <span className="truncate">{entry.message}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        <p className="text-[10px] text-[var(--text-tertiary)] mt-2">
+                          Projects, database, and settings are kept during updates.
                         </p>
-                      )}
-                      {item.created_at && (
-                        <p className="text-[10px] text-[var(--text-tertiary)] mt-1">{formatWhen(item.created_at)}</p>
-                      )}
+                        {item.created_at && (
+                          <p className="text-[10px] text-[var(--text-tertiary)] mt-1">{formatWhen(item.created_at)}</p>
+                        )}
+                      </div>
                     </div>
+                    {item.action?.kind === "install_update" && item.meta?.auto_status !== "started" && (
+                      <button
+                        type="button"
+                        className={clsx("ds-btn-primary mt-3 w-full text-sm", installing && "opacity-70")}
+                        onClick={onInstallClick}
+                        disabled={installing}
+                      >
+                        {installing ? (
+                          <span className="inline-flex items-center gap-2">
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Installing...
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-2">
+                            <Download className="w-4 h-4" />
+                            {item.action.label}
+                          </span>
+                        )}
+                      </button>
+                    )}
+                    {item.meta?.auto_status === "started" && (
+                      <p className="mt-3 text-xs text-emerald-700 flex items-center gap-2">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        Auto-install running — app will restart when ready.
+                      </p>
+                    )}
                   </div>
-                  {item.action?.kind === "install_update" && (
-                    <button
-                      type="button"
-                      className={clsx("ds-btn-primary mt-3 w-full text-sm", installing && "opacity-70")}
-                      onClick={onInstallClick}
-                      disabled={installing}
-                    >
-                      {installing ? (
-                        <span className="inline-flex items-center gap-2">
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          Installing...
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-2">
-                          <Download className="w-4 h-4" />
-                          {item.action.label}
-                        </span>
-                      )}
-                    </button>
-                  )}
-                </div>
-              ))}
+                );
+              })}
 
               {message && (
                 <p className="text-xs p-2 rounded-md bg-[var(--surface-raised)] text-[var(--text-secondary)]">{message}</p>
@@ -244,6 +320,7 @@ export function NotificationBell() {
             <div className="ds-card-body space-y-4">
               <p className="text-sm text-[var(--text-secondary)]">
                 Installing the update will stop the app and restart it. Active work may be interrupted.
+                Your database and settings will still be preserved.
               </p>
               <ul className="text-xs text-[var(--text-tertiary)] space-y-1 max-h-32 overflow-y-auto">
                 {(status?.running_activity?.items ?? []).map((item) => (

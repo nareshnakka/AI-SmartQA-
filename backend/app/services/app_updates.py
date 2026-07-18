@@ -1,11 +1,14 @@
-"""Check for GitHub app updates and trigger non-interactive install."""
+"""Check for GitHub app updates, build changelogs, and trigger non-interactive install."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +16,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db.models import DiscoverySessionModel, ExecutionRunModel, PerformanceRunModel
 from app.services.execution_worker import _running as active_execution_ids
 
@@ -20,6 +24,9 @@ logger = structlog.get_logger()
 
 _INSTALL_LOCK = asyncio.Lock()
 _install_in_progress = False
+_last_auto_install_remote: str | None = None
+_last_auto_install_at: float = 0.0
+AUTO_INSTALL_COOLDOWN_SEC = 300.0
 
 
 def find_repo_root() -> Path | None:
@@ -52,6 +59,69 @@ def _run_git(args: list[str], cwd: Path, timeout_sec: int = 30) -> subprocess.Co
 def _short_sha(value: str) -> str:
     value = (value or "").strip()
     return value[:7] if value else ""
+
+
+def _read_version_file(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _version_label(data: dict | None) -> str | None:
+    if not data:
+        return None
+    major = data.get("major", 0)
+    minor = data.get("minor", 0)
+    build = data.get("build", 0)
+    return f"V{major}.{minor}-Build {build}"
+
+
+def _changelog_sync(repo_root: Path, branch: str, limit: int = 12) -> list[dict]:
+    """Commit messages between local HEAD and origin/branch."""
+    log_proc = _run_git(
+        [
+            "log",
+            f"HEAD..origin/{branch}",
+            f"--max-count={limit}",
+            "--pretty=format:%h|%s|%an|%cI",
+        ],
+        repo_root,
+    )
+    if log_proc.returncode != 0:
+        return []
+
+    entries: list[dict] = []
+    for line in (log_proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        parts = line.split("|", 3)
+        if len(parts) < 2:
+            continue
+        entries.append(
+            {
+                "sha": parts[0],
+                "message": parts[1],
+                "author": parts[2] if len(parts) > 2 else "",
+                "date": parts[3] if len(parts) > 3 else "",
+            }
+        )
+    return entries
+
+
+def _remote_version_sync(repo_root: Path, branch: str) -> dict | None:
+    show = _run_git(["show", f"origin/{branch}:version.json"], repo_root)
+    if show.returncode != 0:
+        return None
+    try:
+        data = json.loads(show.stdout or "")
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 
 def _git_check_sync(repo_root: Path, fetch: bool) -> dict:
@@ -95,10 +165,16 @@ def _git_check_sync(repo_root: Path, fetch: bool) -> dict:
             behind = 0
 
     available = local_commit != remote_commit and behind > 0
+    local_version = _read_version_file(repo_root / "version.json")
+    remote_version = _remote_version_sync(repo_root, branch) if available else local_version
+    changelog = _changelog_sync(repo_root, branch) if available else []
+
     summary = "You are on the latest version."
     if available:
         commit_word = "commit" if behind == 1 else "commits"
-        summary = f"{behind} new {commit_word} available on {branch}."
+        from_label = _version_label(local_version) or _short_sha(local_commit)
+        to_label = _version_label(remote_version) or _short_sha(remote_commit)
+        summary = f"{behind} new {commit_word} available — {from_label} → {to_label}."
 
     origin_proc = _run_git(["remote", "get-url", "origin"], repo_root)
     remote_url = (origin_proc.stdout or "").strip() if origin_proc.returncode == 0 else ""
@@ -108,9 +184,16 @@ def _git_check_sync(repo_root: Path, fetch: bool) -> dict:
         "branch": branch,
         "current_commit": _short_sha(local_commit),
         "remote_commit": _short_sha(remote_commit),
+        "current_commit_full": local_commit,
+        "remote_commit_full": remote_commit,
         "commits_behind": behind,
         "remote_url": remote_url,
         "summary": summary,
+        "changelog": changelog,
+        "current_version": _version_label(local_version),
+        "remote_version": _version_label(remote_version),
+        "auto_update_enabled": bool(settings.qeos_auto_update_enabled),
+        "poll_interval_sec": int(settings.qeos_auto_update_poll_sec),
     }
 
 
@@ -124,6 +207,9 @@ async def check_for_updates(fetch: bool = True) -> dict:
             "checked_at": checked_at,
             "error": "This installation is not a Git repository.",
             "summary": "Updates are only available in a Git clone of QEOS.",
+            "changelog": [],
+            "auto_update_enabled": bool(settings.qeos_auto_update_enabled),
+            "poll_interval_sec": int(settings.qeos_auto_update_poll_sec),
         }
 
     loop = asyncio.get_running_loop()
@@ -136,6 +222,9 @@ async def check_for_updates(fetch: bool = True) -> dict:
             "checked_at": checked_at,
             "error": "Git is not installed on this machine.",
             "summary": "Install Git to enable in-app updates.",
+            "changelog": [],
+            "auto_update_enabled": bool(settings.qeos_auto_update_enabled),
+            "poll_interval_sec": int(settings.qeos_auto_update_poll_sec),
         }
     except subprocess.TimeoutExpired:
         return {
@@ -144,6 +233,9 @@ async def check_for_updates(fetch: bool = True) -> dict:
             "checked_at": checked_at,
             "error": "Timed out while checking GitHub for updates.",
             "summary": "Could not reach GitHub. Try again later.",
+            "changelog": [],
+            "auto_update_enabled": bool(settings.qeos_auto_update_enabled),
+            "poll_interval_sec": int(settings.qeos_auto_update_poll_sec),
         }
     except Exception as exc:
         logger.warning("update_check_failed", error=str(exc))
@@ -153,11 +245,17 @@ async def check_for_updates(fetch: bool = True) -> dict:
             "checked_at": checked_at,
             "error": str(exc),
             "summary": "Update check failed.",
+            "changelog": [],
+            "auto_update_enabled": bool(settings.qeos_auto_update_enabled),
+            "poll_interval_sec": int(settings.qeos_auto_update_poll_sec),
         }
 
     result["supported"] = True
     result["checked_at"] = checked_at
     result["repo_root"] = str(repo_root)
+    result.setdefault("changelog", [])
+    result.setdefault("auto_update_enabled", bool(settings.qeos_auto_update_enabled))
+    result.setdefault("poll_interval_sec", int(settings.qeos_auto_update_poll_sec))
     if "error" in result:
         result.setdefault("summary", "Update check failed.")
     return result
@@ -239,6 +337,37 @@ async def get_running_activity(db: AsyncSession) -> dict:
     }
 
 
+def backup_user_data(repo_root: Path) -> dict:
+    """Copy critical user data to a timestamped backup folder before update."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_root = repo_root / "data" / "update_backups" / stamp
+    backup_root.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+
+    candidates = [
+        repo_root / ".env",
+        repo_root / "backend" / ".env",
+        repo_root / "backend" / "qeos.db",
+        repo_root / "qeos.db",
+        repo_root / "data" / "cursor_credentials.json",
+    ]
+    for src in candidates:
+        if not src.is_file():
+            continue
+        dest = backup_root / src.name
+        if src.parent.name == "backend" and src.name == ".env":
+            dest = backup_root / "backend.env"
+        if src.parent.name == "backend" and src.name == "qeos.db":
+            dest = backup_root / "backend.qeos.db"
+        try:
+            shutil.copy2(src, dest)
+            copied.append(str(dest.relative_to(repo_root)))
+        except OSError as exc:
+            logger.warning("update_backup_failed", path=str(src), error=str(exc))
+
+    return {"backup_dir": str(backup_root.relative_to(repo_root)), "copied": copied}
+
+
 def _spawn_install_process(repo_root: Path) -> None:
     script = repo_root / "update-and-install.bat"
     if not script.is_file():
@@ -306,13 +435,24 @@ async def install_update(force: bool = False) -> dict:
 
     try:
         loop = asyncio.get_running_loop()
+        backup = await loop.run_in_executor(None, lambda: backup_user_data(repo_root))
         await loop.run_in_executor(None, lambda: _spawn_install_process(repo_root))
-        logger.info("app_update_started", repo_root=str(repo_root), force=force)
+        logger.info(
+            "app_update_started",
+            repo_root=str(repo_root),
+            force=force,
+            backup=backup.get("backup_dir"),
+        )
         return {
             "started": True,
             "status": "started",
-            "message": "Update started. The app will restart when the download completes.",
+            "message": (
+                "Update started. Your projects, database, and settings are preserved. "
+                "The app will restart when the install completes."
+            ),
             "force": force,
+            "data_preserved": True,
+            "backup": backup,
         }
     except Exception as exc:
         _install_in_progress = False
@@ -322,3 +462,42 @@ async def install_update(force: bool = False) -> dict:
             "status": "error",
             "message": str(exc),
         }
+
+
+async def maybe_auto_install(db: AsyncSession, update: dict, activity: dict) -> dict | None:
+    """
+    Start an automatic update when enabled and safe.
+    Returns install result dict when started / deferred / skipped, else None.
+    """
+    global _last_auto_install_remote, _last_auto_install_at
+
+    if not settings.qeos_auto_update_enabled:
+        return None
+    if not update.get("available") or not update.get("supported"):
+        return None
+    if _install_in_progress:
+        return {"started": False, "status": "in_progress", "message": "Update already in progress."}
+
+    remote = str(update.get("remote_commit_full") or update.get("remote_commit") or "")
+    now = time.monotonic()
+    if remote and remote == _last_auto_install_remote and (now - _last_auto_install_at) < AUTO_INSTALL_COOLDOWN_SEC:
+        return {
+            "started": False,
+            "status": "cooldown",
+            "message": "Auto-update already attempted recently for this version.",
+        }
+
+    if activity.get("has_active") and settings.qeos_auto_update_defer_when_busy:
+        return {
+            "started": False,
+            "status": "deferred",
+            "message": "Update waiting until Discovery / tests finish — will install automatically.",
+            "deferred": True,
+        }
+
+    result = await install_update(force=False)
+    if result.get("started"):
+        _last_auto_install_remote = remote
+        _last_auto_install_at = now
+        result["auto"] = True
+    return result

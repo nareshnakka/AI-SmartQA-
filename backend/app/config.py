@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     discovery_max_pages: int = 15
     discovery_max_steps: int = 80
     discovery_agent_enabled: bool = True
+    # Cursor Cloud API — optional Discovery advisor (planning + stuck menu recovery)
+    cursor_api_key: str = ""
+    discovery_cursor_advisor_enabled: bool = True
+    cursor_discovery_model: str = "composer-2"
+    cursor_api_timeout_sec: int = 60
+    cursor_discovery_plan_timeout_sec: int = 90
+    # In-app updates — notify + auto-install from GitHub, then restart
+    qeos_auto_update_enabled: bool = True
+    qeos_auto_update_poll_sec: int = 120
+    qeos_auto_update_defer_when_busy: bool = True
     execution_timeout_sec: int = 300
     execution_artifacts_dir: str = "execution_artifacts"
     execution_video_enabled: bool = True

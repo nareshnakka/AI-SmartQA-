@@ -104,11 +104,43 @@ function DiscoveryPageContent() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [playwrightHint, setPlaywrightHint] = useState<string | null>(null);
+  const [cursorStatus, setCursorStatus] = useState<{
+    configured: boolean;
+    enabled: boolean;
+    available: boolean;
+    connected?: boolean;
+    signed_in?: boolean;
+    needs_api_key?: boolean;
+    api_keys_url?: string;
+    message?: string;
+    api_key_name?: string;
+  } | null>(null);
+  const [cursorConnecting, setCursorConnecting] = useState(false);
+  const [cursorConnectHint, setCursorConnectHint] = useState("");
+  const [cursorApiKeyInput, setCursorApiKeyInput] = useState("");
+  const [cursorApiKeySaving, setCursorApiKeySaving] = useState(false);
+  const cursorConnectPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const navLogRef = useRef<HTMLDivElement | null>(null);
   const proposedPanelRef = useRef<HTMLDivElement | null>(null);
   const runStartedAtRef = useRef<number | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
+
+  const refreshCursorStatus = useCallback(() => {
+    return apiFetch<{
+      configured: boolean;
+      enabled: boolean;
+      available: boolean;
+      connected?: boolean;
+      signed_in?: boolean;
+      needs_api_key?: boolean;
+      api_keys_url?: string;
+      message?: string;
+      api_key_name?: string;
+    }>("/api/v1/cursor/discovery-status")
+      .then(setCursorStatus)
+      .catch(() => setCursorStatus(null));
+  }, []);
 
   useEffect(() => {
     const loadHealth = () => {
@@ -131,10 +163,17 @@ function DiscoveryPageContent() {
         .catch(() => {});
     };
     loadHealth();
-    const onFocus = () => loadHealth();
+    refreshCursorStatus();
+    const onFocus = () => {
+      loadHealth();
+      refreshCursorStatus();
+    };
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-  }, []);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      if (cursorConnectPollRef.current) clearInterval(cursorConnectPollRef.current);
+    };
+  }, [refreshCursorStatus]);
 
   useEffect(() => {
     if (prevProjectRef.current === projectId) return;
@@ -475,6 +514,97 @@ function DiscoveryPageContent() {
     }
   };
 
+  const connectCursor = async () => {
+    setCursorConnecting(true);
+    setCursorConnectHint("");
+    if (cursorConnectPollRef.current) clearInterval(cursorConnectPollRef.current);
+
+    try {
+      const start = await apiFetch<{
+        session_id: string;
+        auth_url: string;
+        api_keys_url?: string;
+        instructions?: string;
+        message?: string;
+      }>("/api/v1/cursor/connect/start", { method: "POST" });
+
+      setCursorConnectHint(
+        start.instructions ||
+          "Complete sign-in in the browser — click Yes, Log In when Cursor asks."
+      );
+      window.open(start.auth_url, "_blank", "noopener,noreferrer");
+
+      cursorConnectPollRef.current = setInterval(async () => {
+        try {
+          const st = await apiFetch<{
+            status: string;
+            message?: string;
+            email?: string;
+            needs_api_key?: boolean;
+            api_keys_url?: string;
+          }>(`/api/v1/cursor/connect/status?session_id=${encodeURIComponent(start.session_id)}`);
+
+          if (st.status === "completed") {
+            if (cursorConnectPollRef.current) clearInterval(cursorConnectPollRef.current);
+            cursorConnectPollRef.current = null;
+            setCursorConnecting(false);
+            setCursorConnectHint(st.message || "");
+            await refreshCursorStatus();
+            if (st.needs_api_key) {
+              const keysUrl = st.api_keys_url || start.api_keys_url || "https://cursor.com/dashboard/api-keys";
+              window.open(keysUrl, "_blank", "noopener,noreferrer");
+              setMessage("Signed in — create an Agent API key in the dashboard tab, then paste it below.");
+            } else {
+              setMessage(st.message || "Cursor connected for Discovery.");
+            }
+          } else if (st.status === "failed" || st.status === "expired" || st.status === "cancelled") {
+            if (cursorConnectPollRef.current) clearInterval(cursorConnectPollRef.current);
+            cursorConnectPollRef.current = null;
+            setCursorConnecting(false);
+            setCursorConnectHint(st.message || "Cursor connection did not complete.");
+          } else if (st.message) {
+            setCursorConnectHint(st.message);
+          }
+        } catch {
+          /* keep polling */
+        }
+      }, 2500);
+    } catch (e) {
+      setCursorConnecting(false);
+      setCursorConnectHint(String(e));
+    }
+  };
+
+  const saveCursorApiKey = async () => {
+    const key = cursorApiKeyInput.trim();
+    if (!key) return;
+    setCursorApiKeySaving(true);
+    try {
+      const result = await apiFetch<{ message?: string }>("/api/v1/cursor/connect/api-key", {
+        method: "POST",
+        body: JSON.stringify({ api_key: key }),
+      });
+      setCursorApiKeyInput("");
+      await refreshCursorStatus();
+      setMessage(result.message || "Cursor Agent API key saved.");
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setCursorApiKeySaving(false);
+    }
+  };
+
+  const disconnectCursor = async () => {
+    try {
+      await apiFetch("/api/v1/cursor/connect", { method: "DELETE" });
+      await refreshCursorStatus();
+      setCursorConnectHint("");
+      setMessage("Cursor disconnected.");
+    } catch (e) {
+      setMessage(String(e));
+    }
+  };
+
   const eventIcon = (type: string) => {
     if (type === "navigate") return "🌐";
     if (type === "click") return "👆";
@@ -581,6 +711,105 @@ function DiscoveryPageContent() {
           <p className="font-medium">Playwright not ready — QA Agent will only do a basic HTTP crawl until this is fixed.</p>
           <p className="mt-1 text-xs">{playwrightHint}</p>
           <p className="mt-2 text-xs font-mono">update-and-install.bat → restart.bat</p>
+        </div>
+      )}
+
+      {cursorStatus && (
+        <div
+          className={`mb-4 rounded-lg border px-4 py-3 text-sm ${
+            cursorStatus.available
+              ? "border-emerald-300 bg-emerald-50 text-emerald-950"
+              : cursorConnecting
+                ? "border-sky-300 bg-sky-50 text-sky-950"
+                : cursorStatus.needs_api_key
+                  ? "border-amber-300 bg-amber-50 text-amber-950"
+                  : "border-[var(--border-subtle)] bg-[var(--surface-secondary)] text-[var(--text-secondary)]"
+          }`}
+        >
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="font-medium flex items-center gap-2 flex-wrap">
+                <Bot className="w-4 h-4 shrink-0" />
+                Cursor Discovery Advisor
+                {cursorStatus.available && <Badge variant="success">Connected</Badge>}
+                {cursorConnecting && <Badge variant="info">Waiting for sign-in…</Badge>}
+                {cursorStatus.needs_api_key && !cursorConnecting && (
+                  <Badge variant="warning">API key needed</Badge>
+                )}
+                {!cursorStatus.available && !cursorConnecting && !cursorStatus.needs_api_key && (
+                  <Badge variant="neutral">Not connected</Badge>
+                )}
+              </p>
+              <p className="mt-1 text-xs">
+                {cursorConnectHint || cursorStatus.message}
+                {cursorStatus.api_key_name && cursorStatus.available ? ` (${cursorStatus.api_key_name})` : ""}
+              </p>
+            </div>
+            <div className="flex gap-2 shrink-0">
+              {!cursorStatus.available && (
+                <button
+                  type="button"
+                  onClick={connectCursor}
+                  disabled={cursorConnecting}
+                  className="ds-btn-primary text-xs py-1.5 px-3 inline-flex items-center gap-1.5"
+                >
+                  {cursorConnecting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Bot className="w-3 h-3" />}
+                  {cursorConnecting ? "Waiting…" : cursorStatus.signed_in ? "Re-sign in" : "Connect Cursor"}
+                </button>
+              )}
+              {(cursorStatus.available || cursorStatus.signed_in) && (
+                <button
+                  type="button"
+                  onClick={disconnectCursor}
+                  disabled={cursorConnecting}
+                  className="ds-btn-secondary text-xs py-1.5 px-3"
+                >
+                  Disconnect
+                </button>
+              )}
+            </div>
+          </div>
+
+          {cursorStatus.needs_api_key && (
+            <div className="mt-3 space-y-2 border-t border-amber-200/80 pt-3">
+              <p className="text-xs">
+                Browser sign-in succeeded. Cursor&apos;s Cloud Agents API needs a separate key — create one in{" "}
+                <a
+                  href={cursorStatus.api_keys_url || "https://cursor.com/dashboard/api-keys"}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline font-medium"
+                >
+                  Cursor Dashboard → API Keys
+                </a>{" "}
+                (starts with <code className="font-mono">crsr_</code>), then paste it here once.
+              </p>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  className="ds-input text-xs font-mono flex-1"
+                  type="password"
+                  placeholder="crsr_…"
+                  value={cursorApiKeyInput}
+                  onChange={(e) => setCursorApiKeyInput(e.target.value)}
+                />
+                <button
+                  type="button"
+                  onClick={saveCursorApiKey}
+                  disabled={cursorApiKeySaving || !cursorApiKeyInput.trim()}
+                  className="ds-btn-primary text-xs py-1.5 px-3 inline-flex items-center justify-center gap-1.5"
+                >
+                  {cursorApiKeySaving ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                  Save API key
+                </button>
+              </div>
+            </div>
+          )}
+
+          {!cursorStatus.available && !cursorConnecting && !cursorStatus.needs_api_key && (
+            <p className="mt-2 text-xs">
+              Opens Cursor sign-in in your browser — click <strong>Yes, Log In</strong> once, then add your Agent API key.
+            </p>
+          )}
         </div>
       )}
 

@@ -39,6 +39,9 @@ temp/
 *.db
 *.db-shm
 *.db-wal
+data/cursor_credentials.json
+data/update_backups/
+*.db-wal
 qeos.db
 postgres_data/
 redis_data/

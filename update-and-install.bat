@@ -40,9 +40,27 @@ if "%AUTO%"=="0" (
   echo ============================================================
   echo.
   echo   Pulls latest code, then installs Python, Node, DB, and runners.
-  echo   Your .env file is NOT removed.
+  echo   Your data is preserved:
+  echo     - .env and settings
+  echo     - SQLite database (projects, test cases, discovery)
+  echo     - data\ folder (Cursor credentials, backups)
+  echo     - execution_artifacts
   echo.
+) else (
+  echo QEOS auto-update: preserving .env, database, and data folder...
 )
+
+REM Snapshot critical user data before pull (never overwrite on restore failure)
+if not exist "%ROOT%\data\update_backups" mkdir "%ROOT%\data\update_backups" >nul 2>&1
+for /f %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set "BK=%%T"
+set "BKDIR=%ROOT%\data\update_backups\!BK!"
+mkdir "!BKDIR!" >nul 2>&1
+if exist "%ROOT%\.env" copy /Y "%ROOT%\.env" "!BKDIR!\root.env" >nul 2>&1
+if exist "%BACKEND%\.env" copy /Y "%BACKEND%\.env" "!BKDIR!\backend.env" >nul 2>&1
+if exist "%BACKEND%\qeos.db" copy /Y "%BACKEND%\qeos.db" "!BKDIR!\backend.qeos.db" >nul 2>&1
+if exist "%ROOT%\qeos.db" copy /Y "%ROOT%\qeos.db" "!BKDIR!\qeos.db" >nul 2>&1
+if exist "%ROOT%\data\cursor_credentials.json" copy /Y "%ROOT%\data\cursor_credentials.json" "!BKDIR!\cursor_credentials.json" >nul 2>&1
+
 
 cd /d "%ROOT%"
 
@@ -363,7 +381,13 @@ if not exist ".venv\Scripts\python.exe" (
   echo ERROR: Backend venv missing.
   exit /b 1
 )
-echo Initializing SQLite database...
+REM init_db creates missing tables only — does not wipe existing project data.
+if exist "qeos.db" (
+  if "%AUTO%"=="0" echo Existing database found — keeping your projects and test cases.
+) else (
+  if "%AUTO%"=="0" echo Creating new SQLite database...
+)
+echo Initializing SQLite database (safe migrate)...
 call ".venv\Scripts\python.exe" -c "import asyncio; from app.db.session import init_db; asyncio.run(init_db()); print('Database ready.')"
 if errorlevel 1 exit /b 1
 exit /b 0

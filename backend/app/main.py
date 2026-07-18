@@ -5,7 +5,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import agents, audit, auth, automation, copilot, discovery, environments, executions, integrations, intelligence, llm, modules, monitoring, naming_patterns, performance, pipelines, platform, projects, quality_studio, reports, test_generation, updates
+from app.api import agents, audit, auth, automation, copilot, cursor, discovery, environments, executions, integrations, intelligence, llm, modules, monitoring, naming_patterns, performance, pipelines, platform, projects, quality_studio, reports, test_generation, updates
 from app.config import settings
 from app.core.security import AuthMiddleware
 from app.db.session import init_db
@@ -78,6 +78,7 @@ app.include_router(automation.router, prefix="/api/v1")
 app.include_router(performance.router, prefix="/api/v1")
 app.include_router(pipelines.router, prefix="/api/v1")
 app.include_router(discovery.router, prefix="/api/v1")
+app.include_router(cursor.router, prefix="/api/v1")
 app.include_router(executions.router, prefix="/api/v1")
 app.include_router(reports.router, prefix="/api/v1")
 app.include_router(environments.router, prefix="/api/v1")
