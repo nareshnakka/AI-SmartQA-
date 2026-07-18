@@ -1,0 +1,4 @@
+## Application logs (recent)
+
+2026-07-18T17:57:33.219330Z [info] playwright_browsers_configured path='C:\\Users\\nareshnakka-vedasoft\\AppData\\Local\\ms-playwright'
+2026-07-18T17:57:33.605439Z [info] platform_started plugins_discovered=0 integrations_loaded=0 phase='5-started'
