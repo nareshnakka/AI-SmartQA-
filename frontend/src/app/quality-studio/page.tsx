@@ -25,6 +25,34 @@ interface Sprint { id: string; name: string; goal?: string; status: string; test
 interface Release { id: string; name: string; version: string; status: string; sprint_ids: string[] }
 interface TestCase { id: string; title: string; case_code?: string | null; module_id?: string | null; module_name?: string | null; steps?: string[] }
 
+interface AutomationFile {
+  path: string;
+  content?: string;
+  type?: string;
+}
+
+interface AutomationAsset {
+  id: string;
+  name: string;
+  framework: string;
+  language?: string;
+  files: AutomationFile[];
+  version?: number;
+  status?: string;
+}
+
+interface AutomationGenerateResult {
+  asset: AutomationAsset;
+  source?: string;
+  derived_cases?: number;
+  llm_provider?: string;
+}
+
+interface PerformanceGenerateResult {
+  asset?: { id: string; name?: string; tool?: string; files?: AutomationFile[] };
+  source?: string;
+}
+
 const WORKLOADS = ["smoke", "load", "stress", "soak", "spike"];
 const FRAMEWORKS = ["playwright", "cypress", "selenium", "webdriverio"];
 
@@ -39,15 +67,19 @@ function QualityStudioContent() {
 
   const [functionalInput, setFunctionalInput] = useState("");
   const [functionalType, setFunctionalType] = useState("prompt");
+  const [functionalResult, setFunctionalResult] = useState<{ count?: number; test_cases?: { id: string; title: string }[] } | null>(null);
 
   const [autoInput, setAutoInput] = useState("");
   const [autoType, setAutoType] = useState("prompt");
   const [framework, setFramework] = useState("playwright");
   const [baseUrl, setBaseUrl] = useState("");
+  const [autoResult, setAutoResult] = useState<AutomationGenerateResult | null>(null);
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
 
   const [perfInput, setPerfInput] = useState("");
   const [perfType, setPerfType] = useState("prompt");
   const [workload, setWorkload] = useState("load");
+  const [perfResult, setPerfResult] = useState<PerformanceGenerateResult | null>(null);
 
   const [sprints, setSprints] = useState<Sprint[]>([]);
   const [releases, setReleases] = useState<Release[]>([]);
@@ -83,7 +115,7 @@ function QualityStudioContent() {
 
   useEffect(() => { loadStudio().catch(() => {}); }, [loadStudio]);
 
-  const run = async (label: string, fn: () => Promise<unknown>) => {
+  const run = async <T,>(label: string, fn: () => Promise<T>): Promise<T | undefined> => {
     setBusy(true);
     setMessage("");
     try {
@@ -93,36 +125,73 @@ function QualityStudioContent() {
       return result;
     } catch (e) {
       setMessage(String(e));
+      return undefined;
     } finally {
       setBusy(false);
     }
   };
 
-  const generateFunctional = () => run("Functional tests generated", () =>
-    apiFetch(`/api/v1/projects/${projectId}/quality-studio/functional/generate`, {
-      method: "POST",
-      body: JSON.stringify({ input_type: functionalType, content: functionalInput, llm_provider: llmProvider }),
-    })
-  );
+  const generateFunctional = async () => {
+    const result = await run("Functional tests generated", () =>
+      apiFetch<{ count?: number; test_cases?: { id: string; title: string }[] }>(
+        `/api/v1/projects/${projectId}/quality-studio/functional/generate`,
+        {
+          method: "POST",
+          body: JSON.stringify({ input_type: functionalType, content: functionalInput, llm_provider: llmProvider }),
+        }
+      )
+    );
+    if (result) {
+      setFunctionalResult(result);
+      setMessage(`Functional tests generated — ${result.count ?? result.test_cases?.length ?? 0} case(s)`);
+    }
+  };
 
-  const generateAutomation = () => run("Automation scripts generated", () =>
-    apiFetch(`/api/v1/projects/${projectId}/quality-studio/automation/generate`, {
-      method: "POST",
-      body: JSON.stringify({
-        input_type: autoType, content: autoInput, framework, base_url: baseUrl, llm_provider: llmProvider,
-      }),
-    })
-  );
+  const generateAutomation = async () => {
+    const result = await run("Automation scripts generated", () =>
+      apiFetch<AutomationGenerateResult>(`/api/v1/projects/${projectId}/quality-studio/automation/generate`, {
+        method: "POST",
+        body: JSON.stringify({
+          input_type: autoType, content: autoInput, framework, base_url: baseUrl, llm_provider: llmProvider,
+        }),
+      })
+    );
+    if (result?.asset) {
+      setAutoResult(result);
+      const files = result.asset.files || [];
+      setPreviewPath(files[0]?.path ?? null);
+      setMessage(
+        `Automation scripts generated — ${files.length} file(s)` +
+          (result.derived_cases ? `, ${result.derived_cases} derived case(s)` : "") +
+          ` (${result.asset.framework})`
+      );
+    }
+  };
 
-  const generatePerformance = () => run("Performance scripts generated", () =>
-    apiFetch(`/api/v1/projects/${projectId}/quality-studio/performance/generate`, {
-      method: "POST",
-      body: JSON.stringify({
-        input_type: perfType, content: perfInput, workload_profile: workload,
-        base_url: baseUrl, llm_provider: llmProvider,
-      }),
-    })
-  );
+  const generatePerformance = async () => {
+    const result = await run("Performance scripts generated", () =>
+      apiFetch<PerformanceGenerateResult>(`/api/v1/projects/${projectId}/quality-studio/performance/generate`, {
+        method: "POST",
+        body: JSON.stringify({
+          input_type: perfType,
+          content: perfInput,
+          workload_profile: workload,
+          base_url: baseUrl,
+          llm_provider: llmProvider,
+        }),
+      })
+    );
+    if (result) {
+      setPerfResult(result);
+      const n = result.asset?.files?.length ?? 0;
+      setMessage(`Performance scripts generated — ${n || "ok"} file(s)`);
+    }
+  };
+
+  const previewFile = useMemo(() => {
+    if (!autoResult?.asset?.files || !previewPath) return null;
+    return autoResult.asset.files.find((f) => f.path === previewPath) ?? null;
+  }, [autoResult, previewPath]);
 
   const createSprint = () => run("Sprint created", () =>
     apiFetch(`/api/v1/projects/${projectId}/quality-studio/sprints`, {
@@ -271,6 +340,18 @@ function QualityStudioContent() {
               {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
               Generate Test Cases
             </button>
+            {functionalResult && (
+              <div className="rounded-md border border-brand-200 bg-brand-50/50 p-3 space-y-2">
+                <p className="text-xs font-medium">
+                  Generated {functionalResult.count ?? functionalResult.test_cases?.length ?? 0} test case(s)
+                </p>
+                <ul className="text-xs space-y-1 max-h-40 overflow-y-auto">
+                  {(functionalResult.test_cases || []).slice(0, 12).map((tc) => (
+                    <li key={tc.id} className="truncate">• {tc.title}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         )}
 
@@ -304,8 +385,68 @@ function QualityStudioContent() {
                 {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
                 Generate Automation
               </button>
-              <Link href={`/studio?project=${projectId}`} className="ds-btn-secondary">Open in IDE</Link>
+              <Link
+                href={`/studio?project=${projectId}${autoResult?.asset?.id ? `&asset=${autoResult.asset.id}` : ""}`}
+                className="ds-btn-secondary"
+              >
+                Open in IDE
+              </Link>
             </div>
+
+            {autoResult?.asset && (
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50/60 p-4 space-y-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold text-emerald-950 flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4" />
+                      {autoResult.asset.name}
+                    </p>
+                    <p className="text-xs text-emerald-900/80 mt-1">
+                      {autoResult.asset.framework}
+                      {autoResult.asset.language ? ` · ${autoResult.asset.language}` : ""}
+                      {" · "}
+                      {(autoResult.asset.files || []).length} file(s)
+                      {autoResult.derived_cases != null ? ` · ${autoResult.derived_cases} derived case(s)` : ""}
+                      {autoResult.source ? ` · source: ${autoResult.source}` : ""}
+                    </p>
+                    <p className="text-[10px] font-mono text-emerald-900/60 mt-1">Asset ID: {autoResult.asset.id}</p>
+                  </div>
+                  <Link
+                    href={`/studio?project=${projectId}&asset=${autoResult.asset.id}`}
+                    className="ds-btn-primary text-xs py-1.5 px-3 inline-flex items-center gap-1"
+                  >
+                    Edit / Debug in IDE <ArrowRight className="w-3 h-3" />
+                  </Link>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <ul className="md:col-span-1 space-y-1 max-h-56 overflow-y-auto">
+                    {(autoResult.asset.files || []).map((f) => (
+                      <li key={f.path}>
+                        <button
+                          type="button"
+                          onClick={() => setPreviewPath(f.path)}
+                          className={`w-full text-left text-xs px-2 py-1.5 rounded font-mono truncate ${
+                            previewPath === f.path
+                              ? "bg-emerald-700 text-white"
+                              : "bg-white/80 text-emerald-950 hover:bg-white"
+                          }`}
+                          title={f.path}
+                        >
+                          {f.path}
+                        </button>
+                      </li>
+                    ))}
+                    {(autoResult.asset.files || []).length === 0 && (
+                      <li className="text-xs text-emerald-900/70">No files in asset response.</li>
+                    )}
+                  </ul>
+                  <pre className="md:col-span-2 text-[11px] font-mono bg-white border border-emerald-100 rounded-md p-3 max-h-56 overflow-auto whitespace-pre-wrap text-[var(--text-primary)]">
+                    {previewFile?.content || "// Select a file to preview"}
+                  </pre>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -341,6 +482,20 @@ function QualityStudioContent() {
               </button>
               <Link href={`/performance?project=${projectId}`} className="ds-btn-secondary">Performance Dashboard</Link>
             </div>
+            {perfResult?.asset && (
+              <div className="rounded-md border border-amber-200 bg-amber-50/60 p-3 text-xs space-y-1">
+                <p className="font-medium">{perfResult.asset.name || "Performance asset"}</p>
+                <p>
+                  {(perfResult.asset.files || []).length} file(s)
+                  {perfResult.asset.tool ? ` · ${perfResult.asset.tool}` : ""}
+                </p>
+                <ul className="font-mono space-y-0.5 max-h-28 overflow-y-auto">
+                  {(perfResult.asset.files || []).map((f) => (
+                    <li key={f.path}>{f.path}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         )}
 

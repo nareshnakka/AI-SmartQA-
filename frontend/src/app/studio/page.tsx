@@ -1,7 +1,7 @@
 "use client";
 
 import { Suspense, useEffect, useState, useCallback, useRef, useMemo } from "react";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import {
   Play, Save, GitCompare, CheckCircle2, Loader2, Sparkles,
   ChevronDown, AlertCircle, Download, PlayCircle, Upload, Bug, GitBranch,
@@ -36,6 +36,7 @@ interface TestCaseItem {
 
 function StudioPageContent() {
   const pathname = usePathname();
+  const searchParams = useSearchParams();
   const { projectId } = useActiveProject();
   const ws = useWorkspaceScope(projectId);
   const {
@@ -130,10 +131,14 @@ function StudioPageContent() {
     if (!projectId) return;
     const list = await apiFetch<AutomationAsset[]>(`/api/v1/projects/${projectId}/automation/assets`);
     setAssets(list);
-    if (list.length > 0) {
+    const wanted = searchParams.get("asset");
+    const match = wanted ? list.find((a) => a.id === wanted) : null;
+    if (match) {
+      selectAsset(match);
+    } else if (list.length > 0) {
       selectAsset(list[0]);
     }
-  }, [projectId]);
+  }, [projectId, searchParams]);
 
   useEffect(() => { loadAssets().catch(() => {}); }, [loadAssets]);
 
