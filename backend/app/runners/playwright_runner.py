@@ -1,6 +1,7 @@
 """Materialize automation assets and run Playwright tests via Node with video capture."""
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -80,7 +81,9 @@ def prepare_workspace(files: list[dict], framework: str) -> Path:
     return workspace
 
 
-def _configure_playwright_workspace(workspace: Path, *, headed: bool = False) -> None:
+def _configure_playwright_workspace(
+    workspace: Path, *, headed: bool = False, retries: int | None = None
+) -> None:
     """Force video recording and optionally open a visible browser for debug runs."""
     for path in workspace.glob("playwright.config.*"):
         text = path.read_text(encoding="utf-8")
@@ -99,6 +102,16 @@ def _configure_playwright_workspace(workspace: Path, *, headed: bool = False) ->
                 "use: { viewport: { width: 1280, height: 720 },",
                 1,
             )
+        if retries is not None:
+            if re.search(r"retries:\s*\d+", text):
+                text = re.sub(r"retries:\s*\d+", f"retries: {retries}", text, count=1)
+            else:
+                text = re.sub(
+                    r"(export default defineConfig\(\{)",
+                    rf"\1\n  retries: {retries},",
+                    text,
+                    count=1,
+                )
         path.write_text(text, encoding="utf-8")
 
 
@@ -200,7 +213,11 @@ async def run_playwright(
             await on_progress(phase, detail)
 
     use_headed = headed and not embed_live
-    _configure_playwright_workspace(workspace, headed=use_headed)
+    _configure_playwright_workspace(
+        workspace,
+        headed=use_headed,
+        retries=0 if embed_live else None,
+    )
 
     if cancel_run_id:
         from app.services.execution_worker import is_run_cancel_requested
@@ -289,13 +306,18 @@ async def run_playwright(
             extra_env["BASE_URL"] = resolved
             extra_env["PLAYWRIGHT_BASE_URL"] = resolved
     if progress_path:
+        progress_path = Path(progress_path).resolve()
         progress_path.parent.mkdir(parents=True, exist_ok=True)
         extra_env["QEOS_PROGRESS_FILE"] = str(progress_path)
     if live_frame_path:
+        live_frame_path = Path(live_frame_path).resolve()
         live_frame_path.parent.mkdir(parents=True, exist_ok=True)
-        extra_env["QEOS_LIVE_FRAME"] = str(live_frame_path.resolve())
+        extra_env["QEOS_LIVE_FRAME"] = str(live_frame_path)
     if total_steps:
         extra_env["QEOS_TOTAL_STEPS"] = str(total_steps)
+    # Default 3s pause between automation steps (overridable)
+    if "QEOS_STEP_PAUSE_MS" not in extra_env:
+        extra_env["QEOS_STEP_PAUSE_MS"] = os.environ.get("QEOS_STEP_PAUSE_MS", "3000")
     if login_env:
         extra_env.update(login_env)
 
@@ -310,17 +332,21 @@ async def run_playwright(
 
     async def _poll_step_progress() -> None:
         last_ts = 0.0
+        last_seq = 0
         while not stop_poll.is_set():
             if progress_path and progress_path.exists() and on_step_progress:
                 try:
                     data = json.loads(progress_path.read_text(encoding="utf-8"))
+                    seq = int(data.get("seq") or 0)
                     ts = float(data.get("ts") or 0)
-                    if ts > last_ts:
-                        last_ts = ts
+                    # Prefer monotonic seq so same-millisecond updates are not skipped
+                    if seq > last_seq or (seq == 0 and ts > last_ts):
+                        last_seq = max(last_seq, seq)
+                        last_ts = max(last_ts, ts)
                         await on_step_progress(data)
                 except Exception:
                     pass
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.25)
 
     poll_task = asyncio.create_task(_poll_step_progress()) if on_step_progress and progress_path else None
     try:
@@ -390,19 +416,19 @@ def persist_videos(
     return enriched
 
 
-def get_live_frame_path(project_id: uuid.UUID, run_id: uuid.UUID) -> Path | None:
-    path = Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id) / "live.jpg"
-    return path if path.exists() else None
-
-
 def run_artifact_dir(project_id: uuid.UUID, run_id: uuid.UUID) -> Path:
-    base = Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id)
+    base = (Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id)).resolve()
     base.mkdir(parents=True, exist_ok=True)
     return base
 
 
+def get_live_frame_path(project_id: uuid.UUID, run_id: uuid.UUID) -> Path | None:
+    path = (Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id) / "live.jpg").resolve()
+    return path if path.exists() else None
+
+
 def get_video_path(project_id: uuid.UUID, run_id: uuid.UUID, video_id: int) -> Path | None:
-    base = Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id)
+    base = (Path(settings.execution_artifacts_dir) / str(project_id) / str(run_id)).resolve()
     for ext in (".webm", ".mp4"):
         path = base / f"test_{video_id}{ext}"
         if path.exists():

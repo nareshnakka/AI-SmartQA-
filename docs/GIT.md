@@ -61,6 +61,7 @@ restart.bat
 | | Robot Framework + Browser library | Yes — pip + `rfbrowser init` |
 | | Selenium (Java/Maven) | Yes — via winget when available |
 | | Appium (Python client) | Yes — pip; Appium server is separate |
+| **Discovery agent** | Ollama (LLM advisor) + `e2e/orangehrm` Playwright | Yes — winget `Ollama.Ollama` + model pull + npm |
 | **Performance** | k6 (live runs) | Yes — via winget when available |
 | | Locust | Yes — pip |
 | | JMeter | Best-effort — winget |

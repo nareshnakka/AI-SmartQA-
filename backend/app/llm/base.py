@@ -11,9 +11,19 @@ class MessageRole(str, Enum):
 
 
 @dataclass
+class LLMImage:
+    """One image part for vision models (PNG/JPEG bytes as base64)."""
+
+    data_base64: str
+    mime_type: str = "image/jpeg"
+    detail: str = "low"
+
+
+@dataclass
 class LLMMessage:
     role: MessageRole
     content: str
+    images: list[LLMImage] = field(default_factory=list)
 
 
 @dataclass
@@ -48,3 +58,6 @@ class LLMProvider(ABC):
     @abstractmethod
     def list_models(self) -> list[str]:
         pass
+
+    def supports_vision(self) -> bool:
+        return False

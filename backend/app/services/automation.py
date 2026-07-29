@@ -56,6 +56,17 @@ class AutomationService:
 
         from app.services.test_case_naming import next_case_code
 
+        # Prefer navigate URL from first case step when available
+        base_url = "https://example.com"
+        for c in cases:
+            for step in (c.steps or []):
+                if isinstance(step, dict) and step.get("url") and str(step.get("action", "")).lower() == "navigate":
+                    base_url = step["url"]
+                    break
+            else:
+                continue
+            break
+
         case_type = "playwright" if framework == "playwright" else f"automation_{framework}"
         tc_data = []
         for c in cases:
@@ -76,7 +87,11 @@ class AutomationService:
                 "tags": (c.tags or []) + ([f"automation_code:{ap_code}"] if ap_code else []),
             })
 
-        output = self.generator.generate({"framework": framework, "test_cases": tc_data})
+        output = self.generator.generate({
+            "framework": framework,
+            "test_cases": tc_data,
+            "base_url": base_url,
+        })
         files = output.get("files", [])
         if framework == "playwright":
             for i, f in enumerate(files):

@@ -128,6 +128,15 @@ async def apply_cursor_discovery_plan(
         return intent
 
     raw_text = (intent.raw or intent.goals or "").strip()
+    # Never override when the user already authored explicit automation steps
+    if getattr(intent, "planned_steps", None) and len(intent.planned_steps) >= 2:
+        await emit({
+            "type": "status",
+            "message": f"Cursor advisor — using your {len(intent.planned_steps)} written automation steps as-is",
+            "url": base_url,
+        })
+        return intent
+
     user_parsed = extract_menu_list_targets(raw_text)
     if len(user_parsed) >= 2:
         await emit({

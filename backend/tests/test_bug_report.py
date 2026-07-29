@@ -49,6 +49,59 @@ async def test_build_diagnostics_includes_version():
 
 
 @pytest.mark.asyncio
+async def test_build_diagnostics_includes_client_logs():
+    docs = await build_diagnostics(
+        None,
+        page_url="http://localhost:3000/studio",
+        client_logs="2026-07-24 [error] boom\n",
+    )
+    assert "Browser console logs" in docs["logs.txt"]
+    assert "boom" in docs["logs.txt"]
+
+
+@pytest.mark.asyncio
+async def test_submit_always_attaches_diagnostics_even_when_flag_false():
+    with patch("app.services.bug_report.resolve_bug_target", new=AsyncMock(return_value={
+        "configured": True,
+        "owner": "nareshnakka",
+        "repo": "AI-SmartQA-",
+        "branch": "main",
+        "remote_url": "https://github.com/nareshnakka/AI-SmartQA-",
+        "has_token": True,
+        "token": "ghp_test",
+        "message": "ok",
+    })), patch(
+        "app.services.bug_report.push_repo_files",
+        new=AsyncMock(return_value={
+            "success": True,
+            "pushed": ["bug-reports/x/report.md", "bug-reports/x/logs.txt"],
+            "urls": {},
+            "errors": [],
+        }),
+    ) as push_mock, patch(
+        "app.services.bug_report.create_github_issue",
+        new=AsyncMock(return_value={
+            "number": 7,
+            "html_url": "https://github.com/nareshnakka/AI-SmartQA-/issues/7",
+        }),
+    ):
+        await submit_bug_report(
+            None,
+            title="Always logs",
+            description="Must attach logs always",
+            include_diagnostics=False,
+            client_logs="[error] client fail",
+            screenshot_bytes=b"\x89PNG\r\n",
+            screenshot_filename="auto.png",
+        )
+
+    pushed_paths = [f["path"] for f in push_mock.await_args.args[4]]
+    assert any(p.endswith("logs.txt") for p in pushed_paths)
+    assert any(p.endswith("diagnostics.md") for p in pushed_paths)
+    assert any(p.endswith("auto.png") for p in pushed_paths)
+
+
+@pytest.mark.asyncio
 async def test_submit_bug_report_happy_path():
     with patch("app.services.bug_report.resolve_bug_target", new=AsyncMock(return_value={
         "configured": True,
@@ -105,4 +158,4 @@ async def test_submit_requires_token():
         "message": "Set QEOS_GITHUB_BUG_TOKEN",
     })):
         with pytest.raises(ValueError, match="QEOS_GITHUB_BUG_TOKEN"):
-            await submit_bug_report(None, title="t", description="long enough")
+            await submit_bug_report(None, title="token missing", description="long enough")

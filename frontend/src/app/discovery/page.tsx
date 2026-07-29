@@ -4,11 +4,11 @@ import { useEffect, useState, useCallback, useRef, Suspense, useMemo } from "rea
 import Link from "next/link";
 import {
   Radar, Loader2, Globe, Map as MapIcon, CheckCircle2, ChevronDown, ChevronRight,
-  Bot, Play, CheckSquare, Square, GitCommitHorizontal, Trash2, Eraser,
+  Bot, Play, CheckSquare, Square, GitCommitHorizontal, Trash2, Eraser, Video,
 } from "lucide-react";
 import { AppShell } from "@/components/shell/AppShell";
 import { PageHeader, Badge, MetricCard } from "@/components/ui";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiUploadForm } from "@/lib/api";
 import { useActiveProject } from "@/context/ProjectContext";
 import { WorkspaceFilters } from "@/components/workspace/WorkspaceFilters";
 import { createModule, type ProjectModule } from "@/lib/modules";
@@ -33,8 +33,14 @@ interface ProposedTestCase {
   risk: string;
   module?: string;
   screen?: string;
+  flow_name?: string;
   steps: TestStep[];
   expected_results: string[];
+  validation?: {
+    validated?: boolean;
+    clarifications?: { step_order?: number; question?: string; error?: string; message?: string }[];
+    retries_per_step?: number;
+  };
 }
 
 interface NavEvent {
@@ -125,6 +131,19 @@ function DiscoveryPageContent() {
   const proposedPanelRef = useRef<HTMLDivElement | null>(null);
   const runStartedAtRef = useRef<number | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [videoFiles, setVideoFiles] = useState<File[]>([]);
+  const [videoNotes, setVideoNotes] = useState("");
+  const [videoAnalyzing, setVideoAnalyzing] = useState(false);
+  const [videoSaving, setVideoSaving] = useState(false);
+  const [videoProposed, setVideoProposed] = useState<ProposedTestCase | null>(null);
+  const [videoMeta, setVideoMeta] = useState<string>("");
+  const [llmAdvisor, setLlmAdvisor] = useState<{
+    enabled?: boolean;
+    ollama_reachable?: boolean;
+    active_provider?: string | null;
+    active_model?: string | null;
+    message?: string;
+  } | null>(null);
 
   const refreshCursorStatus = useCallback(() => {
     return apiFetch<{
@@ -164,9 +183,27 @@ function DiscoveryPageContent() {
     };
     loadHealth();
     refreshCursorStatus();
+    apiFetch<{
+      enabled?: boolean;
+      ollama_reachable?: boolean;
+      active_provider?: string | null;
+      active_model?: string | null;
+      message?: string;
+    }>("/api/v1/llm/discovery-advisor-status")
+      .then(setLlmAdvisor)
+      .catch(() => setLlmAdvisor(null));
     const onFocus = () => {
       loadHealth();
       refreshCursorStatus();
+      apiFetch<{
+        enabled?: boolean;
+        ollama_reachable?: boolean;
+        active_provider?: string | null;
+        active_model?: string | null;
+        message?: string;
+      }>("/api/v1/llm/discovery-advisor-status")
+        .then(setLlmAdvisor)
+        .catch(() => setLlmAdvisor(null));
     };
     window.addEventListener("focus", onFocus);
     return () => {
@@ -617,12 +654,36 @@ function DiscoveryPageContent() {
     if (type === "warning") return "⚠️";
     if (type === "observe") return "👁️";
     if (type === "action") return "🤖";
+    if (type === "clarification") return "❓";
+    if (type === "retry") return "🔁";
     return "•";
   };
 
   const proposed = active?.proposed_test_cases ?? [];
   const navLog = active?.navigation_log ?? [];
   const agentProgress = active?.coverage_matrix?.agent_progress;
+
+  const clarificationAsks = useMemo(() => {
+    const asks: { caseTitle: string; question: string }[] = [];
+    for (const tc of proposed) {
+      for (const c of tc.validation?.clarifications ?? []) {
+        const q = c.question || c.message;
+        if (q) asks.push({ caseTitle: tc.title, question: q });
+      }
+    }
+    for (const e of navLog) {
+      if (e.type === "clarification" && e.message) {
+        asks.push({ caseTitle: "Discovery agent", question: e.message });
+      }
+    }
+    const seen = new Set<string>();
+    return asks.filter((a) => {
+      const k = a.question.slice(0, 120);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  }, [proposed, navLog]);
 
   useEffect(() => {
     if (!navLogRef.current || navLog.length === 0) return;
@@ -697,11 +758,82 @@ function DiscoveryPageContent() {
     setSelected(new Set(reviewProposed.map((t) => t.id)));
   };
 
+  const analyzeVideo = async () => {
+    if (!projectId) return;
+    if (!videoFiles.length && !videoNotes.trim()) {
+      setMessage("Upload a video/screenshots or paste numbered notes first");
+      return;
+    }
+    setVideoAnalyzing(true);
+    setMessage("");
+    try {
+      const form = new FormData();
+      for (const f of videoFiles) form.append("files", f);
+      form.append("notes", videoNotes);
+      form.append("base_url", baseUrl || activeEnvironment?.base_url || "");
+      form.append("persist", "false");
+      const result = await apiUploadForm<{
+        proposed_test_case: ProposedTestCase & { vision_provider?: string; vision_model?: string; frames_used?: number };
+        message?: string;
+      }>(`/api/v1/projects/${projectId}/discovery/from-video`, form);
+
+      setVideoProposed(result.proposed_test_case);
+      const metaBits = [
+        result.proposed_test_case.vision_provider
+          ? `${result.proposed_test_case.vision_provider}/${result.proposed_test_case.vision_model}`
+          : "notes-only",
+        result.proposed_test_case.frames_used != null
+          ? `${result.proposed_test_case.frames_used} frames`
+          : null,
+      ].filter(Boolean);
+      setVideoMeta(metaBits.join(" · "));
+      setMessage(result.message || "Recording understood — review steps below, then Save");
+      setExpanded((prev) => new Set(prev).add(result.proposed_test_case.id));
+      proposedPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setVideoAnalyzing(false);
+    }
+  };
+
+  const saveVideoCase = async () => {
+    if (!projectId || !videoProposed) return;
+    setVideoSaving(true);
+    setMessage("");
+    try {
+      const created = await apiFetch<{ id: string; case_code?: string; title: string }>(
+        `/api/v1/projects/${projectId}/test-cases`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            title: videoProposed.title,
+            description: "Generated from video / screenshots",
+            steps: videoProposed.steps,
+            expected_results: videoProposed.expected_results || ["Flow completes successfully"],
+            priority: videoProposed.priority || "high",
+            module_id: commitModuleId || undefined,
+            module_name: videoProposed.module || "Automation",
+            environment_id:
+              activeEnvironmentId && activeEnvironmentId !== "all" ? activeEnvironmentId : undefined,
+          }),
+        }
+      );
+      setMessage(`Saved ${created.case_code || created.title} — open Automation IDE to Debug`);
+      await reloadSavedCases();
+      notifyTestCasesUpdated({ projectId });
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setVideoSaving(false);
+    }
+  };
+
   return (
     <AppShell title="App Discovery">
       <PageHeader
         title="QA Agent Discovery"
-        subtitle="AI navigates your app like a real QA user — captures test cases with steps for your review"
+        subtitle="AI navigates your app — or build cases from a screen recording / screenshots"
         breadcrumbs={[{ label: "Quality Engineering" }, { label: "Discovery" }]}
         actions={<Badge variant="success"><Bot className="w-3 h-3" /> QA Agent</Badge>}
       />
@@ -711,6 +843,28 @@ function DiscoveryPageContent() {
           <p className="font-medium">Playwright not ready — QA Agent will only do a basic HTTP crawl until this is fixed.</p>
           <p className="mt-1 text-xs">{playwrightHint}</p>
           <p className="mt-2 text-xs font-mono">update-and-install.bat → restart.bat</p>
+        </div>
+      )}
+
+      {llmAdvisor && (
+        <div
+          className={`mb-4 rounded-lg border px-4 py-3 text-sm ${
+            llmAdvisor.active_provider
+              ? "border-emerald-300 bg-emerald-50 text-emerald-950"
+              : "border-amber-300 bg-amber-50 text-amber-950"
+          }`}
+        >
+          <p className="font-medium">
+            {llmAdvisor.active_provider
+              ? `LLM step advisor ready — ${llmAdvisor.active_provider}/${llmAdvisor.active_model}`
+              : "LLM step advisor not ready"}
+          </p>
+          <p className="mt-1 text-xs">{llmAdvisor.message}</p>
+          {!llmAdvisor.active_provider && (
+            <p className="mt-2 text-xs font-mono">
+              ollama serve &amp;&amp; ollama pull llama3.2
+            </p>
+          )}
         </div>
       )}
 
@@ -829,18 +983,31 @@ function DiscoveryPageContent() {
                   value={requirements}
                   onChange={(e) => setRequirements(e.target.value)}
                   placeholder={
-                    "Describe exactly what the agent should do — it follows these instructions only.\n\n" +
-                    "Examples:\n" +
-                    "• Submit enquiry form with fields:\n  Name: Jane Doe\n  Email: jane@example.com\n  Message: Product demo request\n" +
-                    "• Login as admin/admin123, open Payroll and verify employee list\n" +
-                    "• No login — open Contact page and submit the form\n\n" +
-                    "Use field labels that match the form (Name, Email, Message, etc.). Add 'explore all modules' only for broad discovery."
+                    "Write automation flow(s) — Discovery validates steps (retry + self-correct) then proposes cases.\n\n" +
+                    "Single flow (numbered steps):\n" +
+                    "Automation steps:\n" +
+                    "1. Open the homepage\n" +
+                    "2. Search for \"iPhone 15\"\n" +
+                    "3. Click the first product\n" +
+                    "4. Click Add to cart\n" +
+                    "5. Verify cart shows iPhone 15\n\n" +
+                    "Multiple flows in one prompt:\n" +
+                    "Flow 1: Search Airpods\n" +
+                    "1. Search for \"Airpods\"\n" +
+                    "2. Click a random product\n" +
+                    "3. Add to cart\n\n" +
+                    "Flow 2: Empty cart\n" +
+                    "1. Go to Cart\n" +
+                    "2. Remove 1 item\n" +
+                    "3. Assert item removed\n\n" +
+                    "Or menu journey / form. Agent will ask if a step cannot be validated."
                   }
                   suppressHydrationWarning
                 />
                 <p className="text-[10px] text-[var(--text-tertiary)] mt-1.5">
-                  Put the site URL in <strong>Base URL</strong> above only — do not repeat it in this prompt.
-                  The agent fills and submits forms when you list field names and values (Name, Email, Message, etc.).
+                  Put the site URL in <strong>Base URL</strong> above only. Numbered steps become a test case
+                  (validated with up to 2 retries). Label <strong>Flow 1 / Flow 2</strong> for multiple flows
+                  in one prompt. The agent stays on your steps and asks when unclear.
                 </p>
               </div>
               <div className="flex gap-2">
@@ -861,6 +1028,80 @@ function DiscoveryPageContent() {
                   </button>
                 )}
               </div>
+            </div>
+          </div>
+
+          <div className="ds-card border-dashed border-[var(--border-default)]">
+            <div className="ds-card-header flex items-center gap-2">
+              <Video className="w-4 h-4 text-brand-700" />
+              <h2 className="text-sm font-semibold">Build from Video</h2>
+            </div>
+            <div className="ds-card-body space-y-3 pt-0">
+              <p className="text-[11px] text-[var(--text-secondary)]">
+                Upload a screen recording or screenshots of the flow you performed. QEOS samples frames and uses
+                vision (OpenAI gpt-4o / Gemini) to draft automation steps — or paste numbered notes if no vision API is set.
+              </p>
+              <input
+                type="file"
+                accept="video/*,image/png,image/jpeg,image/webp,.webm,.mp4,.mov"
+                multiple
+                className="block w-full text-xs text-[var(--text-secondary)] file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-brand-50 file:text-brand-800 hover:file:bg-brand-100"
+                onChange={(e) => setVideoFiles(Array.from(e.target.files || []))}
+              />
+              {videoFiles.length > 0 && (
+                <p className="text-[10px] text-[var(--text-tertiary)]">
+                  {videoFiles.length} file(s): {videoFiles.map((f) => f.name).join(", ")}
+                </p>
+              )}
+              <textarea
+                className="ds-input text-xs resize-none w-full"
+                rows={4}
+                value={videoNotes}
+                onChange={(e) => setVideoNotes(e.target.value)}
+                placeholder={
+                  "Optional notes (helps accuracy):\n" +
+                  "1. Open Flipkart\n2. Search for Samsung Galaxy\n3. Click the second product\n4. Add to cart…"
+                }
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={analyzeVideo}
+                  disabled={videoAnalyzing || videoSaving || !projectId}
+                  className="ds-btn-primary flex-1 text-xs"
+                >
+                  {videoAnalyzing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Video className="w-3.5 h-3.5" />}
+                  {videoAnalyzing ? "Understanding…" : "Understand recording"}
+                </button>
+                {videoProposed && (
+                  <button
+                    type="button"
+                    onClick={saveVideoCase}
+                    disabled={videoSaving || videoAnalyzing}
+                    className="ds-btn-secondary text-xs shrink-0 inline-flex items-center gap-1"
+                  >
+                    {videoSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <GitCommitHorizontal className="w-3.5 h-3.5" />}
+                    Save case
+                  </button>
+                )}
+              </div>
+              {videoProposed && (
+                <div className="rounded-md border border-[var(--border-default)] bg-[var(--surface-sunken)]/40 p-2.5 space-y-1.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-xs font-medium truncate">{videoProposed.title}</p>
+                    {videoMeta && <span className="text-[10px] text-[var(--text-tertiary)] shrink-0">{videoMeta}</span>}
+                  </div>
+                  <ol className="text-[11px] text-[var(--text-secondary)] space-y-1 max-h-40 overflow-auto list-decimal pl-4">
+                    {(videoProposed.steps || []).map((s, i) => (
+                      <li key={`${s.order}-${i}`}>
+                        <span className="font-mono text-[10px] text-[var(--text-tertiary)]">{s.action || "step"}</span>
+                        {" — "}
+                        {s.description}
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
             </div>
           </div>
 
@@ -1005,6 +1246,22 @@ function DiscoveryPageContent() {
                 <MetricCard label="Status" value={active.status} />
               </div>
 
+              {clarificationAsks.length > 0 && active.status !== "running" && (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+                  <p className="font-medium">Agent needs your input (will not invent steps)</p>
+                  <ul className="mt-1.5 text-xs space-y-1.5 list-disc list-inside">
+                    {clarificationAsks.slice(0, 6).map((a, i) => (
+                      <li key={i}>
+                        <span className="font-medium">{a.caseTitle}:</span> {a.question}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="text-[10px] mt-2 text-amber-800">
+                    Reply in a follow-up Discovery prompt with the corrected label/URL for the failing step, then re-run.
+                  </p>
+                </div>
+              )}
+
               {reviewProposed.length > 0 && active.status !== "running" && (
                 <div className="rounded-lg border border-brand-200 bg-brand-50 px-4 py-3 text-sm text-brand-900">
                   <p className="font-medium">Next step: import test cases into your project</p>
@@ -1083,6 +1340,12 @@ function DiscoveryPageContent() {
                             )}
                             <Badge variant={tc.priority === "critical" || tc.priority === "high" ? "error" : "neutral"}>{tc.priority}</Badge>
                             <Badge variant="info">{tc.type}</Badge>
+                            {tc.flow_name && <Badge variant="neutral">{tc.flow_name}</Badge>}
+                            {tc.validation && (
+                              <Badge variant={tc.validation.validated ? "success" : "error"}>
+                                {tc.validation.validated ? "Validated" : "Needs clarification"}
+                              </Badge>
+                            )}
                           </div>
                           <button onClick={() => toggleExpand(tc.id)} className="flex items-center gap-1 text-xs text-brand-700 mt-2">
                             {expanded.has(tc.id) ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}

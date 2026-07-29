@@ -22,6 +22,7 @@ from app.runners.framework_runner import (
 from app.runners.playwright_runner import cleanup_workspace, get_video_path, persist_videos
 from app.runners.test_case_runner import (
     map_steps_from_test_case,
+    merge_live_step_statuses,
     parse_framework_steps,
     run_single_test_case_workspace,
 )
@@ -520,8 +521,12 @@ class ExecutionService:
     def _apply_live_step_progress(results: list[dict], tc_index: int, step_index: int, status: str) -> None:
         if tc_index >= len(results):
             return
-        entry = results[tc_index]
-        steps = entry.get("steps") or []
+        entry = dict(results[tc_index])
+        # Deep-copy steps so SQLAlchemy JSON change detection always persists
+        steps = [dict(s) for s in (entry.get("steps") or [])]
+        if not steps:
+            return
+        step_index = max(0, min(int(step_index), len(steps) - 1))
         for i, step in enumerate(steps):
             if i < step_index:
                 step["status"] = "passed"
@@ -530,6 +535,8 @@ class ExecutionService:
             elif step.get("status") not in ("passed", "failed"):
                 step["status"] = "pending"
         entry["steps"] = steps
+        entry["status"] = "running" if status == "running" else entry.get("status", "running")
+        results[tc_index] = entry
 
     @staticmethod
     def _prepare_asset_files(files: list[dict], base_url: str) -> list[dict]:
@@ -685,7 +692,9 @@ class ExecutionService:
             })
             run.results = list(results)
             flag_modified(run, "results")
+            flag_modified(run, "progress")
             await self.db.flush()
+            await self.db.commit()
 
         passed = failed = 0
         workspace = prepare_framework_workspace(files, framework)
@@ -712,6 +721,11 @@ class ExecutionService:
         login_env = await self._resolve_login_env(cases[0] if cases else None)
         if login_env:
             logs.append("Login credentials loaded from environment secrets hint")
+        if cases:
+            login_env = {
+                **login_env,
+                "QEOS_TEST_CASE_ID": str(cases[0].id),
+            }
 
         await self._publish_run_progress(run, phase="prepare", detail="Preparing Playwright workspace…", logs=logs)
         await self.db.commit()
@@ -829,6 +843,14 @@ class ExecutionService:
             else:
                 persisted = [{**r, "has_video": False} for r in raw_results]
 
+            # Refresh run so we can merge live per-step progress captured during Playwright
+            await self.db.refresh(run)
+            live_by_tc = {
+                str(r.get("test_case_id")): r.get("steps") or []
+                for r in (run.results or [])
+                if isinstance(r, dict)
+            }
+
             for idx, tc in enumerate(cases):
                 tc_dict = {
                     "id": str(tc.id),
@@ -836,22 +858,25 @@ class ExecutionService:
                     "steps": tc.steps or [],
                     "expected_results": tc.expected_results or [],
                 }
+                live_steps = live_by_tc.get(str(tc.id)) or (
+                    results[idx].get("steps") if idx < len(results) and isinstance(results[idx], dict) else []
+                )
                 matched = self._match_playwright_result(persisted, tc.title, str(tc.id))
                 if matched:
                     status = matched.get("status", "failed")
                     if status not in ("passed", "passed_with_warnings"):
                         status = "failed"
-                    step_results = parse_framework_steps([matched], tc_dict, exit_code if status == "failed" else 0)
+                    step_results = merge_live_step_statuses(live_steps, status, tc_dict)
                     entry = matched
                 elif exit_code == 0 and len(persisted) == len(cases) and idx < len(persisted):
                     entry = persisted[idx]
                     status = entry.get("status", "failed")
                     if status not in ("passed", "passed_with_warnings"):
                         status = "failed"
-                    step_results = parse_framework_steps([entry], tc_dict, 0 if status == "passed" else 1)
+                    step_results = merge_live_step_statuses(live_steps, status, tc_dict)
                 else:
                     status = "failed"
-                    step_results = map_steps_from_test_case(tc_dict, "failed")
+                    step_results = merge_live_step_statuses(live_steps, "failed", tc_dict)
                     entry = {}
                     if not persisted:
                         err_msg = (outcome.get("stderr") or outcome.get("stdout") or "")[:500]
@@ -1312,7 +1337,11 @@ class ExecutionService:
         return run
 
     async def get_run(self, run_id: uuid.UUID) -> ExecutionRunModel | None:
-        return await self.db.get(ExecutionRunModel, run_id)
+        run = await self.db.get(ExecutionRunModel, run_id)
+        if run is not None:
+            # Ensure live progress/results written by the background worker are visible
+            await self.db.refresh(run)
+        return run
 
     def to_dict(self, run: ExecutionRunModel) -> dict:
         return {

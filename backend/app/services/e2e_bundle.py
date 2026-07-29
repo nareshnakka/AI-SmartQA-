@@ -206,16 +206,19 @@ def load_generic_e2e_files(base_url: str | None = None) -> list[dict]:
 
 
 def _ensure_generic_support(files: list[dict]) -> list[dict]:
-    """Add GenericSteps + progress helpers if missing."""
-    paths = {f.get("path", "").replace("\\", "/") for f in files}
-    if "pages/GenericSteps.ts" in paths:
-        return files
+    """Always refresh GenericSteps + helpers from disk so Debug picks up latest replay fixes."""
     try:
         extra = load_generic_e2e_files()
-        return dedupe_files(files + extra)
     except FileNotFoundError:
         return files
-
+    refresh_paths = {
+        f.get("path", "").replace("\\", "/")
+        for f in extra
+        if f.get("path", "").replace("\\", "/").startswith(("pages/", "utils/"))
+    }
+    kept = [f for f in files if f.get("path", "").replace("\\", "/") not in refresh_paths]
+    refreshed = [f for f in extra if f.get("path", "").replace("\\", "/") in refresh_paths]
+    return dedupe_files(kept + refreshed)
 
 def _generic_step_spec_content(title: str, steps: list[dict], base_url: str) -> str:
     import json

@@ -351,6 +351,9 @@ export function applyDebugFlowSteps(
       current_test_case_id?: string;
       current_step_index?: number;
       total_steps?: number;
+      phase?: string;
+      detail?: string;
+      executor?: string;
     };
     testCaseTitle?: string;
     testCaseId?: string;
@@ -358,19 +361,18 @@ export function applyDebugFlowSteps(
     resultSteps?: { order: number; status: string; description?: string; expected?: string }[];
   }
 ): { steps: FlowStep[]; activeStepIndex: number | null } {
-  const runFinished = opts.runStatus && opts.runStatus !== "running";
   let steps = baseSteps;
 
-  // Merge live or final step statuses from backend (preserve action/url/expected from base steps)
+  // Merge live or final step statuses from backend (by order, then by index)
   if (opts.resultSteps?.length) {
-    const statusMap = new Map(opts.resultSteps.map((s) => [s.order, s]));
+    const statusByOrder = new Map(opts.resultSteps.map((s) => [s.order, s]));
     steps = baseSteps.map((s, i) => {
       const order = s.order ?? i + 1;
-      const st = statusMap.get(order);
+      const st = statusByOrder.get(order) ?? opts.resultSteps?.[i];
       return {
         ...s,
         status: (st?.status as FlowStepStatus) ?? s.status ?? "pending",
-        description: st?.description ?? s.description,
+        description: s.description,
         expected: st?.expected ?? s.expected ?? null,
       };
     });
@@ -393,7 +395,7 @@ export function applyDebugFlowSteps(
     if (opts.runStatus === "running" && activeStepIndex != null) {
       if (i < activeStepIndex && (status === "pending" || status === "running")) {
         status = "passed";
-      } else if (i === activeStepIndex && status === "pending") {
+      } else if (i === activeStepIndex && (status === "pending" || status === "running")) {
         status = "running";
       }
     }

@@ -21,6 +21,7 @@ import { moduleFilterLabel } from "@/lib/modules";
 import { useWorkspaceScope } from "@/lib/workspace";
 import { WorkspaceFilters } from "@/components/workspace/WorkspaceFilters";
 import Link from "next/link";
+import clsx from "clsx";
 
 interface AutomationAsset {
   id: string; name: string; framework: string; language: string;
@@ -422,9 +423,20 @@ function StudioPageContent() {
         progress: debugRun?.progress,
         testCaseTitle: selectedTestCase.title,
         testCaseId: selectedTestCase.id,
-        resultSteps: debugRun?.results?.find((r) => r.test_case_id === selectedTestCase.id)?.steps,
+        resultSteps:
+          debugRun?.results?.find((r) => r.test_case_id === selectedTestCase.id)?.steps
+          ?? debugRun?.results?.[0]?.steps,
       })
     : { steps: scriptFlowSteps, activeStepIndex: null };
+
+  const liveStepLabel =
+    debugRun?.status === "running"
+      ? (debugRun.progress?.detail
+          || (debugFlowState.activeStepIndex != null
+            ? debugFlowState.steps[debugFlowState.activeStepIndex]?.description
+            : null)
+          || "Starting…")
+      : null;
 
   const stopDebugRun = async () => {
     if (!projectId || !debugRun?.id || debugRun.status !== "running") return;
@@ -554,12 +566,18 @@ function StudioPageContent() {
       setExecRunId(run.id);
 
       const poll = async () => {
-        if (debugPollStoppedRef.current) return;
+        if (debugPollStoppedRef.current) {
+          setExecuting(false);
+          return;
+        }
         try {
           const updated = await apiFetch<DebugRunState & { logs?: string; summary?: { executor?: string } }>(
             `/api/v1/projects/${projectId}/executions/${run.id}`
           );
-          if (debugPollStoppedRef.current) return;
+          if (debugPollStoppedRef.current) {
+            setExecuting(false);
+            return;
+          }
           setDebugRun(updated);
           if (updated.status === "running") {
             const phase = updated.progress?.detail ?? updated.progress?.phase ?? "Running Playwright…";
@@ -570,6 +588,7 @@ function StudioPageContent() {
               const live = updated.summary?.embed_live ? " (live view in panel)" : updated.summary?.headed ? " (visible browser)" : "";
               setExecMessage(`Live: ${phase}${live}`);
             }
+            // Keep executing=true while polling — do not use finally (it runs on every return).
             setTimeout(poll, 300);
             return;
           }
@@ -592,9 +611,9 @@ function StudioPageContent() {
           } else {
             setExecMessage(`Debug complete — ${label}${videoNote}${err ? `\n${formatDebugError(errText)}` : ""}`);
           }
+          setExecuting(false);
         } catch (e) {
           setExecMessage(formatDebugError(String(e)));
-        } finally {
           setExecuting(false);
         }
       };
@@ -1131,13 +1150,13 @@ function StudioPageContent() {
                   <div className="flex-1 overflow-auto p-4">
                     {debugRun?.status === "running" && (
                       <div className="mb-4 rounded-xl border-2 border-brand-300 bg-black/95 shadow-lg overflow-hidden">
-                        <div className="px-3 py-2 bg-brand-900/90 flex items-center justify-between">
-                          <p className="text-xs font-semibold text-white flex items-center gap-2">
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <div className="px-3 py-2 bg-brand-900/90 flex items-center justify-between gap-2">
+                          <p className="text-xs font-semibold text-white flex items-center gap-2 min-w-0">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
                             Live browser
                           </p>
-                          <span className="text-[10px] text-brand-200">
-                            {debugRun.progress?.detail ?? "Syncing with Playwright…"}
+                          <span className="text-[10px] text-brand-200 truncate max-w-[55%]" title={liveStepLabel ?? undefined}>
+                            {liveStepLabel ?? "Syncing with Playwright…"}
                           </span>
                         </div>
                         {projectId && debugRun.id && (
@@ -1153,9 +1172,35 @@ function StudioPageContent() {
                             </div>
                           )
                         )}
-                        <p className="px-3 py-1.5 text-[10px] text-brand-200/80 border-t border-brand-800">
-                          Step highlight updates as each action runs in the browser.
-                        </p>
+                        <div className="px-3 py-2 border-t border-brand-800 bg-brand-950/50">
+                          <p className="text-[10px] font-semibold text-brand-100 mb-1">
+                            Live step{" "}
+                            {debugFlowState.activeStepIndex != null
+                              ? `${debugFlowState.activeStepIndex + 1}/${debugFlowState.steps.length || "?"}`
+                              : "—"}
+                          </p>
+                          <p className="text-[10px] text-brand-200/90 truncate" title={liveStepLabel ?? undefined}>
+                            {liveStepLabel ?? "Waiting for step progress…"}
+                          </p>
+                          <div className="mt-2 flex gap-1 flex-wrap">
+                            {debugFlowState.steps.map((s, i) => (
+                              <span
+                                key={`live-dot-${i}`}
+                                title={`Step ${i + 1}: ${s.description}`}
+                                className={clsx(
+                                  "h-1.5 w-4 rounded-full transition-colors",
+                                  s.status === "passed" || s.status === "passed_with_warnings"
+                                    ? "bg-emerald-400"
+                                    : s.status === "failed"
+                                      ? "bg-red-400"
+                                      : s.status === "running" || debugFlowState.activeStepIndex === i
+                                        ? "bg-brand-300 animate-pulse"
+                                        : "bg-slate-600"
+                                )}
+                              />
+                            ))}
+                          </div>
+                        </div>
                       </div>
                     )}
                     {debugResult?.has_video && projectId && debugRun?.id && (
@@ -1277,12 +1322,16 @@ function StudioPageContent() {
 
       {message && <p className="mt-3 text-sm p-3 rounded-md bg-[var(--surface-sunken)]">{message}</p>}
       {execMessage && (
-        <p className="mt-2 text-sm p-3 rounded-md bg-brand-50 text-brand-800">
-          {execMessage}
+        <div className="mt-2 text-sm p-3 rounded-md bg-brand-50 text-brand-800 space-y-2">
+          <pre className="whitespace-pre-wrap font-sans m-0 break-words">{execMessage}</pre>
           {execRunId && projectId && (
-            <>{" "}<Link href="/executions" className="underline font-medium">Open Executions →</Link></>
+            <p className="m-0">
+              <Link href="/executions" className="underline font-medium">
+                Open Executions →
+              </Link>
+            </p>
           )}
-        </p>
+        </div>
       )}
     </AppShell>
   );

@@ -227,6 +227,17 @@ class DiscoveryService:
 
         cancelled = is_discovery_cancel_requested(session_id) or bool(agent_result.get("cancelled"))
 
+        from app.services.test_steps import steps_for_storage
+
+        sanitized_proposed = []
+        for case in proposed or []:
+            if not isinstance(case, dict):
+                continue
+            row = dict(case)
+            row["steps"] = steps_for_storage(row.get("steps") or [])
+            sanitized_proposed.append(row)
+        proposed = sanitized_proposed
+
         session.flow_map = flows
         session.screens = screens
         session.apis = apis
@@ -405,6 +416,16 @@ class DiscoveryService:
         return await self.db.get(DiscoverySessionModel, session_id)
 
     def to_dict(self, session: DiscoverySessionModel) -> dict:
+        from app.services.test_steps import steps_for_storage
+
+        proposed = []
+        for case in session.proposed_test_cases or []:
+            if not isinstance(case, dict):
+                continue
+            row = dict(case)
+            row["steps"] = steps_for_storage(row.get("steps") or [])
+            proposed.append(row)
+
         return {
             "id": str(session.id),
             "project_id": str(session.project_id),
@@ -417,7 +438,7 @@ class DiscoveryService:
             "apis": session.apis,
             "critical_journeys": session.critical_journeys,
             "coverage_matrix": session.coverage_matrix,
-            "proposed_test_cases": session.proposed_test_cases or [],
+            "proposed_test_cases": proposed,
             "navigation_log": session.navigation_log or [],
             "discovery_mode": (session.coverage_matrix or {}).get("discovery_mode", "agent"),
             "status": session.status,

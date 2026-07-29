@@ -39,7 +39,8 @@ if "%AUTO%"=="0" (
   echo   QEOS - Update from GitHub and Install Dependencies
   echo ============================================================
   echo.
-  echo   Pulls latest code, then installs Python, Node, DB, and runners.
+  echo   Pulls latest code, then installs Python, Node, DB, runners,
+  echo   and the Discovery agent ^(Ollama LLM + Playwright e2e^).
   echo   Your data is preserved:
   echo     - .env and settings
   echo     - SQLite database (projects, test cases, discovery)
@@ -188,15 +189,15 @@ if "%AUTO%"=="0" (
   echo.
 )
 
-call :banner "Step 1/8 - Python"
+call :banner "Step 1/9 - Python"
 call :ensure_python
 if errorlevel 1 exit /b 1
 
-call :banner "Step 2/8 - Node.js and npm"
+call :banner "Step 2/9 - Node.js and npm"
 call :ensure_node
 if errorlevel 1 exit /b 1
 
-call :banner "Step 3/8 - Environment file"
+call :banner "Step 3/9 - Environment file"
 if not exist "%ROOT%\.env" (
   if exist "%ROOT%\.env.example" (
     copy /Y "%ROOT%\.env.example" "%ROOT%\.env" >nul
@@ -206,31 +207,40 @@ if not exist "%ROOT%\.env" (
   )
 ) else (
   echo .env already exists.
+  call :merge_env_defaults
 )
 if not exist "%BACKEND%\.env" if exist "%ROOT%\.env" (
   copy /Y "%ROOT%\.env" "%BACKEND%\.env" >nul
   echo Synced .env to backend folder.
 )
 
-call :banner "Step 4/8 - Backend Python packages"
+call :banner "Step 4/9 - Backend Python packages"
 call :setup_backend
 if errorlevel 1 exit /b 1
 
-call :banner "Step 5/8 - Playwright and automation runners"
+call :banner "Step 5/9 - Playwright and automation runners"
 call :setup_runners
 if errorlevel 1 exit /b 1
 
-call :banner "Step 6/8 - Frontend npm packages"
+call :banner "Step 6/9 - Frontend npm packages"
 call :setup_frontend
 if errorlevel 1 exit /b 1
 
-call :banner "Step 7/8 - Database (SQLite)"
+call :banner "Step 7/9 - Database (SQLite)"
 call :setup_database
 if errorlevel 1 exit /b 1
 
-call :banner "Step 8/8 - Done"
+call :banner "Step 8/9 - Discovery agent (Ollama + e2e)"
+call :setup_discovery_agent
+REM Non-fatal if Ollama needs a reboot / PATH refresh
+if errorlevel 1 (
+  echo [WARNING] Discovery agent setup had issues — see messages above.
+)
+
+call :banner "Step 9/9 - Done"
 echo.
 echo All dependencies are installed and the database is ready.
+echo Discovery agent: Ollama LLM advisor + Playwright e2e GenericSteps.
 exit /b 0
 
 :banner
@@ -248,6 +258,7 @@ set "PATH=%PATH%;%ProgramFiles%\Python313;%ProgramFiles%\Python313\Scripts"
 set "PATH=%PATH%;%ProgramFiles%\Python312;%ProgramFiles%\Python312\Scripts"
 set "PATH=%PATH%;%ProgramFiles%\Python311;%ProgramFiles%\Python311\Scripts"
 set "PATH=%PATH%;%ProgramFiles%\nodejs"
+set "PATH=%PATH%;%LocalAppData%\Programs\Ollama;%ProgramFiles%\Ollama"
 exit /b 0
 
 :find_python
@@ -390,4 +401,159 @@ if exist "qeos.db" (
 echo Initializing SQLite database (safe migrate)...
 call ".venv\Scripts\python.exe" -c "import asyncio; from app.db.session import init_db; asyncio.run(init_db()); print('Database ready.')"
 if errorlevel 1 exit /b 1
+exit /b 0
+
+:merge_env_defaults
+REM Append new Discovery / Ollama keys from .env.example when missing in .env
+if not exist "%ROOT%\.env.example" exit /b 0
+findstr /B /C:"DISCOVERY_LLM_ADVISOR_ENABLED=" "%ROOT%\.env" >nul 2>&1
+if errorlevel 1 (
+  echo.>>"%ROOT%\.env"
+  echo # Discovery LLM advisor ^(added by update-and-install^)>>"%ROOT%\.env"
+  echo DISCOVERY_LLM_ADVISOR_ENABLED=true>>"%ROOT%\.env"
+  echo DISCOVERY_VALIDATE_BEFORE_SCRIPTS=true>>"%ROOT%\.env"
+  echo DISCOVERY_STEP_MAX_RETRIES=2>>"%ROOT%\.env"
+  echo Merged Discovery advisor settings into .env
+)
+findstr /B /C:"OLLAMA_MODEL=" "%ROOT%\.env" >nul 2>&1
+if errorlevel 1 (
+  echo OLLAMA_MODEL=llama3.2>>"%ROOT%\.env"
+  echo OLLAMA_BASE_URL=http://localhost:11434>>"%ROOT%\.env"
+  echo Merged Ollama settings into .env
+)
+exit /b 0
+
+:setup_discovery_agent
+REM Install / upgrade Ollama (Discovery LLM advisor) and e2e Playwright agent package
+set "OLLAMA_MODEL=llama3.2"
+if exist "%ROOT%\.env" (
+  for /f "usebackq tokens=1,* delims==" %%A in (`findstr /B /I /C:"OLLAMA_MODEL=" "%ROOT%\.env"`) do (
+    if /i "%%A"=="OLLAMA_MODEL" set "OLLAMA_MODEL=%%B"
+  )
+)
+REM Trim spaces
+for /f "tokens=* delims= " %%M in ("!OLLAMA_MODEL!") do set "OLLAMA_MODEL=%%M"
+
+echo Installing / updating Discovery agent dependencies...
+call :ensure_ollama
+set "OLLAMA_RC=!ERRORLEVEL!"
+
+call :setup_e2e_agent
+set "E2E_RC=!ERRORLEVEL!"
+
+if not "!OLLAMA_RC!"=="0" exit /b 1
+if not "!E2E_RC!"=="0" exit /b 1
+exit /b 0
+
+:ensure_ollama
+call :refresh_path
+set "PATH=%PATH%;%LocalAppData%\Programs\Ollama;%ProgramFiles%\Ollama"
+
+where ollama >nul 2>&1
+if errorlevel 1 goto :install_ollama
+
+echo Found Ollama — upgrading to latest...
+where winget >nul 2>&1
+if not errorlevel 1 (
+  "%LocalAppData%\Microsoft\WindowsApps\winget.exe" upgrade -e --id Ollama.Ollama --accept-package-agreements --accept-source-agreements >nul 2>&1
+  if errorlevel 1 (
+    echo Ollama already up to date ^(or upgrade skipped^).
+  ) else (
+    echo Ollama upgraded to latest.
+  )
+)
+goto :ollama_pull
+
+:install_ollama
+echo Ollama not found — installing latest...
+call :install_ollama_winget
+if errorlevel 1 call :install_ollama_setup_exe
+call :refresh_path
+set "PATH=%PATH%;%LocalAppData%\Programs\Ollama;%ProgramFiles%\Ollama"
+where ollama >nul 2>&1
+if errorlevel 1 (
+  echo [WARNING] Ollama install finished but ollama.exe is not on PATH yet.
+  echo Start the Ollama app from the Start menu, open a new terminal, then run:
+  echo   ollama pull !OLLAMA_MODEL!
+  exit /b 1
+)
+goto :ollama_pull
+
+:install_ollama_winget
+set "WINGET_EXE="
+where winget >nul 2>&1 && set "WINGET_EXE=winget"
+if not defined WINGET_EXE if exist "%LocalAppData%\Microsoft\WindowsApps\winget.exe" (
+  set "WINGET_EXE=%LocalAppData%\Microsoft\WindowsApps\winget.exe"
+)
+if not defined WINGET_EXE (
+  echo winget not available — will download OllamaSetup.exe instead.
+  exit /b 1
+)
+echo Installing Ollama via winget...
+"!WINGET_EXE!" install -e --id Ollama.Ollama --accept-package-agreements --accept-source-agreements --disable-interactivity
+exit /b !ERRORLEVEL!
+
+:install_ollama_setup_exe
+set "OLLAMA_SETUP=%TEMP%\OllamaSetup-qeos.exe"
+echo Downloading OllamaSetup.exe from ollama.com...
+curl.exe -L --retry 3 --retry-delay 2 -o "!OLLAMA_SETUP!" "https://ollama.com/download/OllamaSetup.exe"
+if errorlevel 1 (
+  echo [ERROR] Failed to download OllamaSetup.exe
+  echo Install manually from https://ollama.com/download/windows
+  exit /b 1
+)
+for %%S in ("!OLLAMA_SETUP!") do set "OLLAMA_SIZE=%%~zS"
+if not defined OLLAMA_SIZE set "OLLAMA_SIZE=0"
+if !OLLAMA_SIZE! LSS 10000000 (
+  echo [ERROR] OllamaSetup.exe download looks incomplete ^(!OLLAMA_SIZE! bytes^).
+  exit /b 1
+)
+echo Running silent Ollama install ^(!OLLAMA_SIZE! bytes^)...
+"!OLLAMA_SETUP!" /VERYSILENT /NORESTART /SUPPRESSMSGBOXES /SP-
+set "RC=!ERRORLEVEL!"
+if not "!RC!"=="0" (
+  echo [WARNING] Silent install exit code !RC! — trying interactive Start if needed.
+)
+timeout /t 5 /nobreak >nul
+exit /b 0
+
+:ollama_pull
+echo Ensuring Ollama service is reachable...
+REM Start Ollama app if serve is not up (best-effort)
+where ollama >nul 2>&1 || exit /b 1
+start "" /B ollama serve >nul 2>&1
+timeout /t 3 /nobreak >nul
+
+echo Pulling Discovery model: !OLLAMA_MODEL!
+ollama pull !OLLAMA_MODEL!
+if errorlevel 1 (
+  echo [WARNING] ollama pull failed — start the Ollama app and run: ollama pull !OLLAMA_MODEL!
+  exit /b 1
+)
+ollama list 2>nul
+echo Discovery LLM agent ready ^(Ollama / !OLLAMA_MODEL!^).
+exit /b 0
+
+:setup_e2e_agent
+REM Playwright GenericSteps package used by Discovery / Automation IDE agent
+if not exist "%ROOT%\e2e\orangehrm\package.json" (
+  echo No e2e\orangehrm package — skipping agent script deps.
+  exit /b 0
+)
+cd /d "%ROOT%\e2e\orangehrm"
+echo Installing Discovery e2e agent ^(Playwright GenericSteps^)...
+if exist "package-lock.json" (
+  call %NPM_CMD% ci
+) else (
+  call %NPM_CMD% install
+)
+if errorlevel 1 (
+  echo [WARNING] e2e agent npm install failed.
+  exit /b 1
+)
+call %NPM_CMD% exec -- playwright install chromium
+if errorlevel 1 (
+  echo [WARNING] Playwright Chromium for e2e agent failed — Discovery scripts may still use backend Playwright.
+)
+echo Discovery e2e agent package ready.
 exit /b 0

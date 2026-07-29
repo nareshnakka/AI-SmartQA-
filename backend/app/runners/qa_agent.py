@@ -874,13 +874,18 @@ async def _navigate_with_playwright(
     max_pages = max_pages or settings.discovery_max_pages
     max_steps = max_steps or settings.discovery_max_steps
     if strict_follow:
-        target_cap = max(len(explicit_targets), 1) + (1 if login_user else 0)
-        max_pages = min(max_pages, max(target_cap + 1, 3))
-        step_budget = max(len(explicit_targets) * 6 + 10, 15)
-        if intent.menu_list_navigation:
-            step_budget = max(len(explicit_targets) * 8 + 15, step_budget)
-            max_pages = min(max_pages, max(len(explicit_targets) + 2, 5))
-        max_steps = min(max_steps, step_budget)
+        n_plan = len(getattr(intent, "planned_steps", None) or [])
+        target_cap = max(len(explicit_targets), n_plan, 1) + (1 if login_user else 0)
+        # Never starve instruction-mode journeys — budgets must cover the full prompt
+        if n_plan >= 2:
+            max_pages = max(max_pages, min(settings.discovery_max_pages, n_plan + 5))
+            max_steps = max(max_steps, min(settings.discovery_max_steps, n_plan * 12 + 20))
+        elif intent.menu_list_navigation:
+            max_pages = max(max_pages, min(settings.discovery_max_pages, len(explicit_targets) + 4))
+            max_steps = max(max_steps, min(settings.discovery_max_steps, len(explicit_targets) * 10 + 25))
+        else:
+            max_pages = min(max_pages, max(target_cap + 2, 4))
+            max_steps = min(max_steps, max(len(explicit_targets) * 8 + 15, 20))
     start_url, origin = _agent_urls(base_url)
 
     navigation_log: list[dict] = []
@@ -895,6 +900,22 @@ async def _navigate_with_playwright(
             if hasattr(result, "__await__"):
                 await result
 
+    if settings.discovery_llm_advisor_enabled:
+        from app.services.llm_discovery_advisor import apply_llm_discovery_plan
+
+        intent = await apply_llm_discovery_plan(intent, start_url, emit)
+        nav_requirements = intent.goals or requirements
+        strict_follow = intent.strict_follow and not intent.broad_exploration
+        explicit_targets = intent.explicit_targets
+        if strict_follow:
+            n_plan = len(getattr(intent, "planned_steps", None) or [])
+            if n_plan >= 2:
+                max_pages = max(max_pages, min(settings.discovery_max_pages, n_plan + 5))
+                max_steps = max(max_steps, min(settings.discovery_max_steps, n_plan * 12 + 20))
+            elif intent.menu_list_navigation:
+                max_pages = max(max_pages, min(settings.discovery_max_pages, len(explicit_targets) + 4))
+                max_steps = max(max_steps, min(settings.discovery_max_steps, len(explicit_targets) * 10 + 25))
+
     if settings.discovery_cursor_advisor_enabled:
         from app.services.cursor_discovery_advisor import apply_cursor_discovery_plan
 
@@ -903,13 +924,17 @@ async def _navigate_with_playwright(
         strict_follow = intent.strict_follow and not intent.broad_exploration
         explicit_targets = intent.explicit_targets
         if strict_follow:
-            target_cap = max(len(explicit_targets), 1) + (1 if login_user else 0)
-            max_pages = min(max_pages, max(target_cap + 1, 3))
-            step_budget = max(len(explicit_targets) * 6 + 10, 15)
-            if intent.menu_list_navigation:
-                step_budget = max(len(explicit_targets) * 8 + 15, step_budget)
-                max_pages = min(max_pages, max(len(explicit_targets) + 2, 5))
-            max_steps = min(max_steps, step_budget)
+            n_plan = len(getattr(intent, "planned_steps", None) or [])
+            if n_plan >= 2:
+                max_pages = max(max_pages, min(settings.discovery_max_pages, n_plan + 5))
+                max_steps = max(max_steps, min(settings.discovery_max_steps, n_plan * 12 + 20))
+            elif intent.menu_list_navigation:
+                max_pages = max(max_pages, min(settings.discovery_max_pages, len(explicit_targets) + 4))
+                max_steps = max(max_steps, min(settings.discovery_max_steps, len(explicit_targets) * 10 + 25))
+            else:
+                target_cap = max(len(explicit_targets), 1) + (1 if login_user else 0)
+                max_pages = min(max_pages, max(target_cap + 2, 4))
+                max_steps = min(max_steps, max(len(explicit_targets) * 8 + 15, 20))
 
     proposed_cases: list[dict] = []
     visited_urls: set[str] = set()
@@ -960,20 +985,29 @@ async def _navigate_with_playwright(
             await _dismiss_blocking_popups(page, emit)
 
         form_completed = False
-        instruction_mode = (strict_follow and not intent.broad_exploration) or intent.menu_list_navigation
+        instruction_mode = (
+            (strict_follow and not intent.broad_exploration)
+            or intent.menu_list_navigation
+            or bool(getattr(intent, "planned_steps", None))
+        )
 
         if instruction_mode:
             from app.runners.discovery_prompt import has_actionable_instructions, navigation_targets
 
             await emit({
                 "type": "status",
-                "message": "Instruction mode — executing your prompt only (no menu crawl)",
+                "message": (
+                    f"Instruction mode — building full automation from your prompt "
+                    f"({len(intent.planned_steps)} written steps)"
+                    if intent.planned_steps
+                    else "Instruction mode — executing your prompt only (no junk crawl cases)"
+                ),
             })
             form_completed = await _run_instruction_plan(
                 page, intent, origin, emit, proposed_cases, logged_in,
                 start_url=start_url, navigation_log=navigation_log,
             )
-            step_count += max(len(intent.form_fields), 1)
+            step_count += max(len(intent.form_fields), len(intent.planned_steps), 1)
         else:
             if intent.wants_form_submit or intent.form_fields:
                 form_completed = await _execute_form_workflow(
@@ -995,7 +1029,7 @@ async def _navigate_with_playwright(
                     "url": page.url,
                     "elements": page_info,
                 })
-                if not strict_follow:
+                if not strict_follow and intent.split_test_cases:
                     proposed_cases.append(_page_smoke_test(page.url, title, page_info))
                     if page_info["forms"] > 0:
                         form_case = await _probe_form(page, title, emit)
@@ -1123,7 +1157,8 @@ async def _navigate_with_playwright(
                                     "title": title,
                                     "status": status,
                                 })
-                                proposed_cases.append(_link_navigation_test(prev_url, await page.title(), target))
+                                if intent.split_test_cases:
+                                    proposed_cases.append(_link_navigation_test(prev_url, await page.title(), target))
                                 step_count += 1
                             except Exception as e:
                                 await emit({"type": "warning", "message": f"Navigation skipped: {str(e)[:200]}", "url": href})
@@ -1135,7 +1170,7 @@ async def _navigate_with_playwright(
 
                         await explore_current_page("explore")
 
-                        if not strict_follow:
+                        if not strict_follow and intent.split_test_cases:
                             for btn in (await _collect_buttons(page))[:1]:
                                 if step_count >= max_steps:
                                     break
@@ -1208,8 +1243,9 @@ async def _navigate_with_playwright(
             seen_titles.add(t)
             unique_cases.append(case)
 
-    # Journey-level test from log — never for form-submit prompts (structured case is built separately)
+    # Journey-level test from log — never for form-submit / as-written / menu journeys
     has_form_flow = any(c.get("flow_kind") == "form_submit" for c in unique_cases)
+    has_as_written = any(c.get("flow_kind") == "as_written" for c in unique_cases)
     form_intent = bool(intent.form_fields) or intent.wants_form_submit
     unique_cases = [c for c in unique_cases if _case_looks_valid(c, origin)]
     has_menu_cases = any(
@@ -1217,7 +1253,16 @@ async def _navigate_with_playwright(
         or c.get("flow_kind") == "menu_journey"
         for c in unique_cases
     )
-    if (
+    if has_as_written or getattr(intent, "planned_steps", None):
+        # Prompt steps are authoritative — drop smoke/link/button junk if any slipped in
+        unique_cases = [
+            c for c in unique_cases
+            if c.get("flow_kind") in ("as_written", "form_submit", "menu_journey", "product_search")
+            or (c.get("title") or "").startswith(("Automation —", "Product search —"))
+        ]
+        if not unique_cases and intent.planned_steps:
+            unique_cases = [_build_case_from_planned_steps(intent, start_url, logged_in=False)]
+    elif (
         len(navigation_log) > 3
         and strict_follow
         and not has_form_flow
@@ -1226,8 +1271,13 @@ async def _navigate_with_playwright(
         and not intent.menu_list_navigation
     ):
         unique_cases.insert(0, _instruction_session_test(start_url, navigation_log, intent.goals or nav_requirements))
-    elif len(navigation_log) > 3 and not strict_follow:
+    elif len(navigation_log) > 3 and not strict_follow and intent.split_test_cases:
         unique_cases.insert(0, _full_session_test(start_url, navigation_log))
+
+    from app.services.test_steps import steps_for_storage
+
+    for case in unique_cases:
+        case["steps"] = steps_for_storage(case.get("steps") or [])
 
     return {
         "mode": "qa_agent",
@@ -1858,17 +1908,30 @@ async def _open_named_target(page, target: str, origin: str, emit, *, menu_list_
                     "url": best["href"],
                 })
 
-    if menu_list_mode and settings.discovery_cursor_advisor_enabled:
-        from app.services.cursor_discovery_advisor import suggest_menu_click_aliases
-
+    if menu_list_mode and (
+        settings.discovery_llm_advisor_enabled or settings.discovery_cursor_advisor_enabled
+    ):
         visible_links = [
             link["text"] for link in await _collect_nav_link_candidates(page, origin) if link.get("text")
         ]
-        aliases = await suggest_menu_click_aliases(target_clean, visible_links, origin or page.url)
+        aliases: list[str] = []
+        alias_source = ""
+        if settings.discovery_llm_advisor_enabled:
+            from app.services.llm_discovery_advisor import suggest_click_aliases_llm
+
+            aliases = await suggest_click_aliases_llm(target_clean, visible_links, origin or page.url)
+            if aliases:
+                alias_source = "LLM"
+        if not aliases and settings.discovery_cursor_advisor_enabled:
+            from app.services.cursor_discovery_advisor import suggest_menu_click_aliases
+
+            aliases = await suggest_menu_click_aliases(target_clean, visible_links, origin or page.url)
+            if aliases:
+                alias_source = "Cursor"
         for alias in aliases:
             await emit({
                 "type": "status",
-                "message": f"Cursor advisor — retrying menu click as \"{alias}\"",
+                "message": f"{alias_source} advisor — retrying menu click as \"{alias}\"",
                 "url": page.url,
                 "element": alias,
             })
@@ -1883,7 +1946,7 @@ async def _open_named_target(page, target: str, origin: str, emit, *, menu_list_
                     title = await page.title()
                     await emit({
                         "type": "navigate",
-                        "message": f"Opened {target_clean} via Cursor alias \"{alias}\" — {title or page.url}",
+                        "message": f"Opened {target_clean} via {alias_source} alias \"{alias}\" — {title or page.url}",
                         "url": page.url,
                         "title": title,
                     })
@@ -1922,8 +1985,8 @@ async def _run_instruction_plan(
     start_url: str = "",
     navigation_log: list[dict] | None = None,
 ) -> bool:
-    """Execute prompt instructions only — no menu crawl."""
-    from app.runners.discovery_prompt import has_actionable_instructions, navigation_targets
+    """Execute prompt instructions and emit ONE (or multi-flow) full automation case(s)."""
+    from app.runners.discovery_prompt import PlannedFlow, has_actionable_instructions, navigation_targets
 
     if not has_actionable_instructions(intent):
         await emit({
@@ -1933,6 +1996,80 @@ async def _run_instruction_plan(
         })
         return False
 
+    home_url = start_url or page.url
+    planned = list(getattr(intent, "planned_steps", None) or [])
+    flows = list(getattr(intent, "planned_flows", None) or [])
+    if not flows and planned:
+        flows = [PlannedFlow(name="Automation flow", steps=planned, order=1)]
+
+    # ── Path A: user wrote explicit automation steps — those ARE the test case(s) ──
+    if flows and getattr(intent, "case_mode", "") == "as_written":
+        await emit({
+            "type": "status",
+            "message": (
+                f"Validating {len(flows)} flow(s) / "
+                f"{sum(len(f.steps) for f in flows)} prompt steps before creating automation cases"
+                if len(flows) > 1
+                else f"Validating {len(flows[0].steps)} prompt steps before creating the automation case"
+            ),
+            "url": page.url,
+        })
+
+        for flow in flows:
+            clarifications: list[dict] = []
+            healed_steps = list(flow.steps)
+
+            if settings.discovery_validate_before_scripts:
+                for idx, step in enumerate(flow.steps):
+                    ok, clarification, healed = await _execute_planned_step_with_retries(
+                        page,
+                        step,
+                        origin=origin,
+                        home_url=home_url,
+                        emit=emit,
+                        max_retries=max(0, int(settings.discovery_step_max_retries)),
+                    )
+                    if healed is not None:
+                        healed_steps[idx] = healed
+                    if clarification:
+                        clarifications.append(clarification)
+                        await emit({
+                            "type": "clarification",
+                            "message": clarification.get("question") or clarification.get("message", ""),
+                            "url": page.url,
+                            "step_order": step.order,
+                            "ask": True,
+                        })
+                    elif ok:
+                        await emit({
+                            "type": "verify",
+                            "message": f"Step {step.order} validated — {step.description[:80]}",
+                            "url": page.url,
+                        })
+
+            proposed_cases.append(
+                _build_case_from_planned_steps(
+                    intent,
+                    home_url,
+                    logged_in=logged_in,
+                    planned_override=healed_steps,
+                    flow_name=flow.name if len(flows) > 1 else None,
+                    clarifications=clarifications,
+                )
+            )
+            await emit({
+                "type": "verify",
+                "message": (
+                    f"Automation case created for \"{flow.name}\" "
+                    f"({len(healed_steps)} steps"
+                    + (f", {len(clarifications)} need your input" if clarifications else ", validated")
+                    + ")"
+                ),
+                "url": page.url,
+            })
+
+        return True
+
     completed = False
     nav_targets = navigation_targets(intent)
     if (intent.wants_form_submit or intent.form_fields) and not intent.menu_list_navigation:
@@ -1940,7 +2077,6 @@ async def _run_instruction_plan(
             nav_targets = []
 
     navigated: list[tuple[str, str, str]] = []
-    home_url = start_url or page.url
     for target in nav_targets:
         on_home = _is_home_url(page.url, home_url)
         if not on_home:
@@ -1994,7 +2130,8 @@ async def _run_instruction_plan(
         )
     elif navigated:
         home = start_url or home_url
-        if intent.split_test_cases:
+        # Default: ONE full journey. Split only when user explicitly asked for separate cases.
+        if intent.split_test_cases and getattr(intent, "case_mode", "") == "per_target":
             for target, _url, title in navigated:
                 proposed_cases.append(
                     _menu_module_test(target, home, title, logged_in=logged_in, home_url=home)
@@ -2024,6 +2161,415 @@ async def _run_instruction_plan(
         completed = True
 
     return completed
+
+
+async def _live_search_on_page(page, query: str, emit) -> bool:
+    """Best-effort product/site search during Discovery validation."""
+    q = (query or "").strip()
+    if not q:
+        return False
+    await _dismiss_blocking_popups(page, emit)
+    selectors = [
+        "input[type=search]",
+        "input[name=q]",
+        "input[name=query]",
+        "input[placeholder*='Search' i]",
+        "input[title*='Search' i]",
+        "input[aria-label*='Search' i]",
+    ]
+    for sel in selectors:
+        loc = page.locator(sel).first
+        try:
+            if await loc.count() == 0:
+                continue
+            if not await loc.is_visible():
+                continue
+            await loc.click(timeout=5000)
+            await loc.fill(q, timeout=8000)
+            await page.keyboard.press("Enter")
+            await _wait_for_spa(page)
+            await emit({
+                "type": "fill",
+                "message": f'Search for "{q}"',
+                "url": page.url,
+            })
+            return True
+        except Exception:
+            continue
+    # Role-based fallback
+    try:
+        box = page.get_by_role("textbox", name=re.compile(r"search", re.I)).first
+        if await box.count():
+            await box.fill(q, timeout=8000)
+            await page.keyboard.press("Enter")
+            await _wait_for_spa(page)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _live_click_search_result(page, index: str | int, emit) -> bool:
+    await _dismiss_blocking_popups(page, emit)
+    cards = page.locator('div[data-id]').filter(has=page.locator('a[href*="/p/"], a[href*="pid="]'))
+    count = await cards.count()
+    if count < 1:
+        cards = page.locator('a[href*="/p/"]')
+        count = await cards.count()
+    if count < 1:
+        return False
+    if str(index).lower() == "random":
+        import random
+        pick = 1 + random.randint(0, min(count, 12) - 1)
+    else:
+        try:
+            pick = max(1, min(int(index), count))
+        except Exception:
+            pick = 1
+    card = cards.nth(pick - 1)
+    link = card.locator('a[href*="/p/"], a[href*="pid="]').first
+    target = link if await link.count() else card
+    href = None
+    try:
+        href = await target.get_attribute("href")
+    except Exception:
+        href = None
+    try:
+        if href and ("/p/" in href or "pid=" in href):
+            abs_url = href if href.startswith("http") else page.url.rstrip("/") + "/" + href.lstrip("/")
+            try:
+                from urllib.parse import urljoin
+                abs_url = urljoin(page.url, href)
+            except Exception:
+                pass
+            await page.goto(abs_url, timeout=settings.playwright_timeout_ms, wait_until="domcontentloaded")
+        else:
+            await target.click(timeout=15_000)
+        await _wait_for_spa(page)
+        await emit({
+            "type": "click",
+            "message": f"Opened search result #{pick}",
+            "url": page.url,
+        })
+        return True
+    except Exception:
+        return False
+
+
+async def _execute_planned_step_with_retries(
+    page,
+    step,
+    *,
+    origin: str,
+    home_url: str,
+    emit,
+    max_retries: int = 2,
+) -> tuple[bool, dict | None, object | None]:
+    """
+    Try a planned step, then retry up to max_retries with self-correct strategies.
+    Never invents new steps — only retries / alias corrections for the same instruction.
+    Returns (ok, clarification_or_None, healed_step_or_None).
+    """
+    action = (step.action or "").lower()
+    interaction = (step.interaction or "").lower()
+    last_error = ""
+    attempts = 1 + max(0, max_retries)
+
+    async def try_once(attempt: int) -> bool:
+        nonlocal last_error
+        try:
+            if action == "navigate":
+                target_url = step.url or home_url
+                if target_url and not _is_home_url(page.url, target_url):
+                    await page.goto(
+                        target_url,
+                        timeout=settings.playwright_timeout_ms,
+                        wait_until="domcontentloaded",
+                    )
+                    await _wait_for_spa(page)
+                    await _dismiss_blocking_popups(page, emit)
+                await emit({"type": "navigate", "message": step.description, "url": page.url})
+                return True
+
+            if action == "dismiss" or interaction == "popup":
+                await _dismiss_blocking_popups(page, emit)
+                return True
+
+            if action == "verify":
+                body = page.locator("body")
+                if await body.count() == 0:
+                    last_error = "page body not found"
+                    return False
+                await emit({
+                    "type": "verify",
+                    "message": step.description,
+                    "url": page.url,
+                    "title": await page.title(),
+                })
+                return True
+
+            if action in ("search",) or interaction == "search":
+                q = step.value or step.element or ""
+                if not q:
+                    m = re.search(r'search\s+for\s+["\']?(.+?)["\']?\s*$', step.description or "", re.I)
+                    q = (m.group(1) if m else "").strip().strip(".,;")
+                ok = await _live_search_on_page(page, q, emit)
+                if not ok:
+                    last_error = f'could not find search box for "{q}"'
+                return ok
+
+            if interaction == "result":
+                ok = await _live_click_search_result(page, step.element or "1", emit)
+                if not ok:
+                    last_error = "could not open a product from search results"
+                return ok
+
+            if interaction == "cart":
+                for sel in (
+                    page.get_by_role("link", name=re.compile(r"^cart$", re.I)),
+                    page.get_by_role("link", name=re.compile(r"cart", re.I)),
+                    page.locator('a[href*="viewcart"], a[href*="/cart"]'),
+                ):
+                    loc = sel.first
+                    if await loc.count() and await loc.is_visible():
+                        if await _safe_click(page, loc):
+                            await _wait_for_spa(page)
+                            return True
+                last_error = "could not find Cart link"
+                return False
+
+            if interaction == "cart_remove":
+                for sel in (
+                    page.get_by_role("button", name=re.compile(r"remove|delete", re.I)),
+                    page.get_by_role("link", name=re.compile(r"remove|delete", re.I)),
+                ):
+                    loc = sel.first
+                    if await loc.count() and await loc.is_visible():
+                        if await _safe_click(page, loc):
+                            await _wait_for_spa(page)
+                            return True
+                last_error = "could not find Remove control on cart"
+                return False
+
+            if interaction == "quantity":
+                n = step.value or step.element or "2"
+                qty = page.locator(
+                    "select[name*=qty i], input[name*=qty i], input[aria-label*=quantity i]"
+                ).first
+                if await qty.count() and await qty.is_visible():
+                    try:
+                        tag = await qty.evaluate("e => e.tagName.toLowerCase()")
+                        if tag == "select":
+                            await qty.select_option(str(n))
+                        else:
+                            await qty.fill(str(n))
+                        return True
+                    except Exception as exc:
+                        last_error = str(exc)[:120]
+                # Soft-pass quantity when control missing — Flipkart UIs vary
+                if attempt >= attempts:
+                    await emit({
+                        "type": "warning",
+                        "message": f"Quantity control not found — keeping step as written (qty={n})",
+                        "url": page.url,
+                    })
+                    return True
+                last_error = "quantity control not found"
+                return False
+
+            if action == "click" and interaction == "home":
+                return await _return_to_homepage_via_ui(page, home_url, origin, emit)
+
+            if action == "click" and step.element:
+                opened = await _open_named_target(
+                    page,
+                    step.element,
+                    origin,
+                    emit,
+                    menu_list_mode=(interaction == "menu"),
+                )
+                if opened:
+                    return True
+                # Self-correct attempt: try description quoted text / Add to cart style labels
+                if attempt > 1 and step.element:
+                    alt = re.sub(r"\s+in the.*$", "", step.element, flags=re.I).strip()
+                    if alt and alt != step.element:
+                        opened = await _open_named_target(page, alt, origin, emit, menu_list_mode=False)
+                        if opened:
+                            return True
+                last_error = f'could not click "{step.element}"'
+                return False
+
+            if action in ("fill", "type") and (step.value or step.field):
+                # Recorded for scripts; live fill is best-effort
+                await emit({
+                    "type": "status",
+                    "message": f"Recorded fill step: {step.description}",
+                    "url": page.url,
+                })
+                return True
+
+            # Unknown / soft steps — do not invent behavior
+            await emit({
+                "type": "status",
+                "message": f"Recorded step for automation (no live action): {step.description}",
+                "url": page.url,
+            })
+            return True
+        except Exception as exc:
+            last_error = str(exc)[:160]
+            return False
+
+    for attempt in range(1, attempts + 1):
+        await emit({
+            "type": "status",
+            "message": (
+                f"Step {step.order} attempt {attempt}/{attempts}: {step.description[:70]}"
+            ),
+            "url": page.url,
+        })
+        if await try_once(attempt):
+            return True, None, None
+        if attempt < attempts:
+            await emit({
+                "type": "warning",
+                "message": (
+                    f"Step {step.order} failed ({last_error or 'unknown'}) — "
+                    f"self-correcting and retrying ({attempt}/{attempts})"
+                ),
+                "url": page.url,
+            })
+            await _dismiss_blocking_popups(page, emit)
+            await page.wait_for_timeout(600)
+
+    clarification = {
+        "step_order": step.order,
+        "action": action,
+        "description": step.description,
+        "error": last_error or "step could not be validated",
+        "question": (
+            f"I could not complete step {step.order} after {attempts} tries "
+            f"(\"{step.description[:90]}\"). "
+            f"Error: {last_error or 'unknown'}. "
+            "Please confirm the correct control/label or URL — I will not invent a different step."
+        ),
+        "message": (
+            f"Ask: clarify step {step.order} — {last_error or 'validation failed'}"
+        ),
+    }
+    return False, clarification, None
+
+
+def _build_case_from_planned_steps(
+    intent,
+    start_url: str,
+    *,
+    logged_in: bool = False,
+    planned_override: list | None = None,
+    flow_name: str | None = None,
+    clarifications: list[dict] | None = None,
+) -> dict:
+    """Build one full e2e automation case whose steps match the prompt 1:1."""
+    planned = list(planned_override if planned_override is not None else (getattr(intent, "planned_steps", None) or []))
+    steps: list[dict] = []
+    expected: list[str] = []
+
+    # Ensure the case always starts on the application URL when the first step isn't navigate
+    first = planned[0] if planned else None
+    needs_entry = True
+    if first and (first.action or "").lower() == "navigate":
+        needs_entry = False
+    if needs_entry and planned:
+        steps.append({
+            "order": 1,
+            "action": "navigate",
+            "description": f"Navigate to {start_url}",
+            "url": start_url,
+            "expected": "Application loads without errors",
+        })
+
+    order_base = len(steps)
+    for i, ps in enumerate(planned):
+        order = order_base + i + 1
+        action = (ps.action or "click").lower()
+        step: dict = {
+            "order": order,
+            "action": action,
+            "description": ps.description,
+        }
+        if ps.url:
+            step["url"] = ps.url
+        elif action == "navigate" and not ps.url:
+            step["url"] = start_url
+        if ps.element:
+            step["element"] = ps.element
+        if ps.field:
+            step["field"] = ps.field
+        if ps.value and action in ("fill", "search", "type"):
+            if action == "search" and ps.value and "search" in ps.description.lower():
+                step["description"] = ps.description
+            elif action == "fill" and ps.field and ps.value:
+                step["description"] = f"Enter {ps.field}: {ps.value}"
+            step["field"] = ps.field or step.get("field")
+            step["value"] = ps.value
+        elif ps.value:
+            step["value"] = ps.value
+        if ps.interaction:
+            step["interaction"] = ps.interaction
+        if ps.expected:
+            step["expected"] = ps.expected
+            expected.append(ps.expected)
+        elif action == "verify":
+            step["expected"] = ps.description
+            expected.append(ps.description)
+        steps.append(step)
+
+    # Re-number densely
+    for i, step in enumerate(steps, start=1):
+        step["order"] = i
+
+    if flow_name:
+        title = f"Automation — {flow_name}"[:120]
+    else:
+        title_hint = (intent.goals or intent.summary or "Automation").split("\n")[0][:70].strip()
+        if len(planned) >= 2:
+            title = f"Automation — {title_hint}" if title_hint else f"Automation flow ({len(steps)} steps)"
+        else:
+            title = title_hint or "Automation flow"
+
+    if not expected:
+        expected = [
+            "Every step from the Discovery prompt executes in order",
+            "No unrequested pages or modules are opened",
+        ]
+    if clarifications:
+        expected.append(
+            f"{len(clarifications)} step(s) need clarification before reliable automation"
+        )
+
+    from app.services.test_steps import steps_for_storage
+
+    case = {
+        "id": _new_id(),
+        "title": title[:120],
+        "type": "e2e",
+        "priority": "high",
+        "source": "qa_agent",
+        "risk": "high",
+        "module": "Automation",
+        "screen": "as_written",
+        "flow_kind": "as_written",
+        "steps": steps_for_storage(steps),
+        "expected_results": expected[:12],
+        "validation": {
+            "validated": not bool(clarifications),
+            "clarifications": clarifications or [],
+            "retries_per_step": int(settings.discovery_step_max_retries),
+        },
+    }
+    if flow_name:
+        case["flow_name"] = flow_name
+    return case
 
 
 async def _fill_remaining_fields_sequential(page, fields: list, filled_labels: set[str], emit) -> int:
@@ -2595,6 +3141,8 @@ def _build_combined_navigation_test_case(
     logged_in: bool = False,
 ) -> dict:
     """One end-to-end test case: start at base URL, open each menu from the homepage in order."""
+    from app.runners.discovery_prompt import _is_search_or_product_query
+
     steps: list[dict] = []
     order = 1
 
@@ -2619,7 +3167,7 @@ def _build_combined_navigation_test_case(
     order += 1
 
     for idx, (target, _page_url, title) in enumerate(navigated):
-        if idx > 0:
+        if idx > 0 and not _is_search_or_product_query(target):
             brand = urlparse(start_url).netloc.replace("www.", "").split(".")[0].title() or "Home"
             steps.append({
                 "order": order,
@@ -2632,22 +3180,41 @@ def _build_combined_navigation_test_case(
             order += 1
             steps.append(_popup_dismiss_step(order))
             order += 1
-        steps.append({
-            "order": order,
-            "action": "click",
-            "description": f"Click '{target}' in the main navigation menu",
-            "element": target,
-            "interaction": "menu",
-            "expected": f"{target} category or module page opens",
-        })
-        order += 1
-        page_title = title or target
-        steps.append({
-            "order": order,
-            "action": "verify",
-            "description": f"Verify {target} page loads ({page_title})",
-            "expected": f"{target} content is displayed",
-        })
+
+        if _is_search_or_product_query(target):
+            steps.append({
+                "order": order,
+                "action": "search",
+                "description": f'Search for "{target}"',
+                "field": "Search",
+                "interaction": "search",
+                "expected": f"Search results for {target} are displayed",
+            })
+            order += 1
+            page_title = title or target
+            steps.append({
+                "order": order,
+                "action": "verify",
+                "description": f"Verify search results for {target} load ({page_title})",
+                "expected": f"Results related to {target} are visible",
+            })
+        else:
+            steps.append({
+                "order": order,
+                "action": "click",
+                "description": f"Click '{target}' in the main navigation menu",
+                "element": target,
+                "interaction": "menu",
+                "expected": f"{target} category or module page opens",
+            })
+            order += 1
+            page_title = title or target
+            steps.append({
+                "order": order,
+                "action": "verify",
+                "description": f"Verify {target} page loads ({page_title})",
+                "expected": f"{target} content is displayed",
+            })
         order += 1
         steps.append(_popup_dismiss_step(order))
         order += 1
@@ -2666,18 +3233,21 @@ def _build_combined_navigation_test_case(
         "risk": "high",
         "module": labels[0] if labels else "Navigation",
         "screen": journey_name,
-        "flow_kind": "menu_journey",
+        "flow_kind": "menu_journey" if not any(_is_search_or_product_query(t) for t, _, _ in navigated) else "product_search",
         "steps": steps,
         "expected_results": [
             f"Journey starts from {start_url}",
             "Login, location, and cookie popups are dismissed when they appear",
-            "Each menu is opened from the homepage via UI clicks (not deep links)",
-            "All requested menus load without errors",
+            "Product searches use the site search box (not top-nav menus)",
+            "Menu items are opened via UI clicks (not deep links)",
+            "All requested targets load without errors",
         ],
     }
 
 
 def _menu_module_test(module_name: str, url: str, title: str, *, logged_in: bool = False, home_url: str = "") -> dict:
+    from app.runners.discovery_prompt import _is_search_or_product_query
+
     start_url = home_url or url
     entry_step = (
         "Login and reach application dashboard"
@@ -2685,6 +3255,52 @@ def _menu_module_test(module_name: str, url: str, title: str, *, logged_in: bool
         else f"Navigate to {start_url}"
     )
     page_title = title or module_name
+    if _is_search_or_product_query(module_name):
+        return {
+            "id": _new_id(),
+            "title": f"Product search — {module_name}",
+            "type": "functional",
+            "priority": "high",
+            "source": "qa_agent",
+            "risk": "high",
+            "module": module_name,
+            "screen": page_title,
+            "flow_kind": "product_search",
+            "steps": [
+                {
+                    "order": 1,
+                    "action": "navigate",
+                    "description": entry_step,
+                    "url": start_url,
+                    "expected": "Application homepage loads without errors",
+                },
+                {
+                    "order": 2,
+                    "action": "dismiss",
+                    "description": "Close login, location, cookie, or overlay popups if visible",
+                    "interaction": "popup",
+                    "expected": "Blocking popups are closed and navigation can continue",
+                },
+                {
+                    "order": 3,
+                    "action": "search",
+                    "description": f'Search for "{module_name}"',
+                    "field": "Search",
+                    "interaction": "search",
+                    "expected": f"Search results for {module_name} are displayed",
+                },
+                {
+                    "order": 4,
+                    "action": "verify",
+                    "description": f"Verify search results for {module_name} ({page_title})",
+                    "expected": f"Results related to {module_name} are visible",
+                },
+            ],
+            "expected_results": [
+                f"Search for {module_name} succeeds",
+                "Product results are displayed",
+            ],
+        }
     return {
         "id": _new_id(),
         "title": f"Module flow — {module_name}",
@@ -2801,7 +3417,7 @@ def _button_click_test(from_url: str, btn: dict, result_title: str) -> dict:
 def _instruction_session_test(start_url: str, log: list[dict], goals: str | None) -> dict:
     """One test case summarizing only what the agent did per user instructions."""
     skip_types = {"status", "warning", "error", "observe", "agent_start", "agent_complete"}
-    action_types = {"navigate", "click", "fill", "verify", "inspect", "dismiss"}
+    action_types = {"navigate", "click", "fill", "verify", "inspect", "dismiss", "search"}
     nav_events = [
         e for e in log
         if e.get("type") in action_types
@@ -2809,8 +3425,9 @@ def _instruction_session_test(start_url: str, log: list[dict], goals: str | None
         and not (e.get("type") == "action" and "starting form" in (e.get("message") or "").lower())
     ]
     nav_events.sort(key=lambda e: e.get("timestamp") or "")
+    # Keep the full observed journey — do not truncate mid-flow
     steps = []
-    for i, e in enumerate(nav_events[:20], start=1):
+    for i, e in enumerate(nav_events, start=1):
         step: dict = {
             "order": i,
             "action": e.get("type", "action"),
@@ -2832,6 +3449,7 @@ def _instruction_session_test(start_url: str, log: list[dict], goals: str | None
         "priority": "high",
         "source": "qa_agent",
         "risk": "high",
+        "flow_kind": "instruction_session",
         "steps": steps or [{"order": 1, "action": "navigate", "description": f"Open {start_url}", "url": start_url}],
         "expected_results": [
             "Agent completes only the steps described in the Discovery prompt",
@@ -2841,10 +3459,10 @@ def _instruction_session_test(start_url: str, log: list[dict], goals: str | None
 
 
 def _full_session_test(start_url: str, log: list[dict]) -> dict:
-    nav_events = [e for e in log if e.get("type") in ("navigate", "click", "fill", "verify")]
+    nav_events = [e for e in log if e.get("type") in ("navigate", "click", "fill", "verify", "dismiss", "search")]
     nav_events.sort(key=lambda e: e.get("timestamp") or "")
     steps = []
-    for i, e in enumerate(nav_events[:15], start=1):
+    for i, e in enumerate(nav_events, start=1):
         steps.append({
             "order": i,
             "action": e.get("type", "action"),
@@ -2858,6 +3476,7 @@ def _full_session_test(start_url: str, log: list[dict]) -> dict:
         "priority": "critical",
         "source": "qa_agent",
         "risk": "high",
+        "flow_kind": "session_walkthrough",
         "steps": steps,
         "expected_results": [
             "Complete user session executes without blocking errors",

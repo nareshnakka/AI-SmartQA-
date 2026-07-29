@@ -21,7 +21,14 @@ from app.models.phase1_schemas import (
 )
 from app.services.generation import GenerationService
 from app.services.export import ExportService
-from app.services.test_cases import bulk_test_case_action, create_project_test_case, list_project_test_cases, remove_case_references, test_case_to_dict
+from app.services.test_cases import (
+    bulk_test_case_action,
+    create_project_test_case,
+    heal_test_case_steps,
+    list_project_test_cases,
+    remove_case_references,
+    test_case_to_dict,
+)
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["Phase 1 — Test Generation"])
 
@@ -118,6 +125,12 @@ async def list_test_cases(
         module_ids=module_ids,
         environment_ids=environment_ids,
     )
+    healed = False
+    for c in cases:
+        if heal_test_case_steps(c):
+            healed = True
+    if healed:
+        await db.flush()
     return [TestCaseResponse(**test_case_to_dict(c)) for c in cases]
 
 
@@ -150,6 +163,8 @@ async def get_test_case(project_id: UUID, case_id: UUID, db: AsyncSession = Depe
     case = await db.get(TestCaseModel, case_id)
     if not case or case.project_id != project_id:
         raise HTTPException(404, "Test case not found")
+    if heal_test_case_steps(case):
+        await db.flush()
     if case.module_id:
         await db.refresh(case, attribute_names=["module"])
     if case.environment_id:
@@ -164,9 +179,13 @@ async def update_test_case(
     case = await db.get(TestCaseModel, case_id)
     if not case or case.project_id != project_id:
         raise HTTPException(404, "Test case not found")
+    from app.services.test_steps import steps_for_storage
+
     for field in ["title", "description", "steps", "expected_results", "priority", "status", "module_id", "environment_id"]:
         val = getattr(body, field, None)
         if val is not None:
+            if field == "steps":
+                val = steps_for_storage(val)
             setattr(case, field, val)
     await db.flush()
     if case.module_id:

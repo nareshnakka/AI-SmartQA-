@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -165,3 +165,73 @@ async def generate_tests_from_discovery(
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@router.post("/from-video")
+async def understand_from_video(
+    project_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    files: list[UploadFile] = File(default=[]),
+    notes: str = Form(""),
+    base_url: str = Form(""),
+    llm_provider: str | None = Form(None),
+    persist: bool = Form(False),
+    module_id: UUID | None = Form(None),
+    environment_id: UUID | None = Form(None),
+    _user: AuthUser = Depends(require_project("tester")),
+):
+    """
+    Build a test case from a screen recording and/or screenshots (+ optional notes).
+    Requires OpenAI or Gemini for vision, or numbered notes as a text fallback.
+    """
+    from app.services.video_understanding import save_uploads_and_understand
+
+    uploads: list[tuple[str, bytes]] = []
+    for f in files or []:
+        raw = await f.read()
+        if raw:
+            uploads.append((f.filename or "upload.bin", raw))
+
+    try:
+        case = await save_uploads_and_understand(
+            files=uploads,
+            notes=notes,
+            base_url=base_url,
+            llm_provider=llm_provider,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+    committed = None
+    if persist:
+        from app.services.test_cases import create_project_test_case, test_case_to_dict
+
+        try:
+            row = await create_project_test_case(
+                db,
+                project_id,
+                title=case.get("title") or "From video",
+                description=f"Generated from video/screenshots ({case.get('source')})",
+                steps=case.get("steps") or [],
+                expected_results=case.get("expected_results") or ["Flow completes successfully"],
+                priority=case.get("priority") or "high",
+                module_id=module_id,
+                module_name=case.get("module") or "Automation",
+                environment_id=environment_id,
+                tags=["video", "vision", case.get("source") or "video_understanding"],
+                status="approved",
+                case_type="functional",
+            )
+            await db.commit()
+            committed = test_case_to_dict(row)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+    return {
+        "proposed_test_case": case,
+        "committed": committed,
+        "message": (
+            f"Understood recording — {len(case.get('steps') or [])} steps"
+            + (f" via {case.get('vision_provider')}/{case.get('vision_model')}" if case.get("vision_provider") else "")
+        ),
+    }

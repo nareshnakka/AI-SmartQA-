@@ -39,9 +39,16 @@ class Settings(BaseSettings):
     discovery_max_pages: int = 15
     discovery_max_steps: int = 80
     discovery_agent_enabled: bool = True
-    # Cursor Cloud API — optional Discovery advisor (planning + stuck menu recovery)
+    # Live-validate each as-written step before proposing the case (retry + self-correct)
+    discovery_validate_before_scripts: bool = True
+    discovery_step_max_retries: int = 2  # attempts after the first try (total tries = 1 + retries)
+    # LLM Discovery advisor — Ollama-first open-source GPT for understanding automation steps
+    discovery_llm_advisor_enabled: bool = True
+    discovery_llm_provider: str = ""  # empty = auto ollama → openai → gemini
+    discovery_llm_model: str = ""  # empty = provider default (llama3.2 / gpt-4o-mini / …)
+    # Cursor Cloud API — optional (menu recovery); LLM advisor is primary for step planning
     cursor_api_key: str = ""
-    discovery_cursor_advisor_enabled: bool = True
+    discovery_cursor_advisor_enabled: bool = False
     cursor_discovery_model: str = "composer-2"
     cursor_api_timeout_sec: int = 60
     cursor_discovery_plan_timeout_sec: int = 90

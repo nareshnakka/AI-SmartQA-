@@ -17,6 +17,7 @@ import { WorkspaceBar } from "@/components/workspace/WorkspaceBar";
 import { useClientMounted } from "@/hooks/useClientMounted";
 import { apiFetch, BACKEND_URL } from "@/lib/api";
 import { clearSession, getStoredUser, type AuthUser } from "@/lib/auth";
+import { installClientLogCapture } from "@/lib/clientLogs";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -176,6 +177,10 @@ export function TopBar({ title }: { title?: string }) {
 }
 
 export function AppShell({ children, title }: { children: React.ReactNode; title?: string }) {
+  useEffect(() => {
+    installClientLogCapture();
+  }, []);
+
   return (
     <div className="min-h-screen">
       <Sidebar />

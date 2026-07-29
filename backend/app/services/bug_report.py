@@ -99,8 +99,9 @@ async def resolve_bug_target(db: AsyncSession | None = None) -> dict[str, Any]:
 
 def _redact(text: str) -> str:
     patterns = [
-        (r"(?i)(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*\S+", r"\1=***"),
         (r"(?i)bearer\s+[a-z0-9\-._~+/]+=*", "Bearer ***"),
+        (r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*\S+", r"\1=***"),
+        (r"(?i)authorization\s*[:=]\s*.+", "Authorization=***"),
         (r"ghp_[A-Za-z0-9]+", "ghp_***"),
         (r"github_pat_[A-Za-z0-9_]+", "github_pat_***"),
         (r"crsr_[A-Za-z0-9]+", "crsr_***"),
@@ -133,6 +134,7 @@ async def build_diagnostics(
     *,
     page_url: str | None = None,
     execution_run_id: str | None = None,
+    client_logs: str | None = None,
 ) -> dict[str, str]:
     info = version_info()
     update = await check_for_updates(fetch=False)
@@ -153,14 +155,18 @@ async def build_diagnostics(
         f"Reported at (UTC): {datetime.now(timezone.utc).isoformat()}",
     ]
 
-    app_logs = _redact(recent_logs_text(limit=250))
+    # Full in-memory buffer (maxlen 500)
+    app_logs = _redact(recent_logs_text(limit=500))
     exec_logs = await _execution_logs(db, execution_run_id)
+    browser_logs = _redact((client_logs or "").strip())
 
     diagnostics_md = "# QEOS Bug Diagnostics\n\n" + "\n".join(f"- {line}" for line in meta_lines) + "\n"
     if execution_run_id:
         diagnostics_md += f"\nExecution run id: `{execution_run_id}`\n"
 
     logs_txt = "## Application logs (recent)\n\n" + app_logs
+    if browser_logs:
+        logs_txt += "\n\n## Browser console logs\n\n" + browser_logs + "\n"
     if exec_logs:
         logs_txt += "\n\n## Execution run logs\n\n" + exec_logs + "\n"
 
@@ -179,6 +185,7 @@ async def submit_bug_report(
     page_url: str | None = None,
     execution_run_id: str | None = None,
     include_diagnostics: bool = True,
+    client_logs: str | None = None,
     screenshot_bytes: bytes | None = None,
     screenshot_filename: str | None = None,
     reporter: str | None = None,
@@ -203,10 +210,15 @@ async def submit_bug_report(
     files: list[dict[str, Any]] = []
     attachment_links: list[str] = []
 
-    if include_diagnostics:
-        docs = await build_diagnostics(db, page_url=page_url, execution_run_id=execution_run_id)
-        for name, content in docs.items():
-            files.append({"path": f"{base_path}/{name}", "content": content})
+    # Always attach diagnostics + logs for remote triage
+    docs = await build_diagnostics(
+        db,
+        page_url=page_url,
+        execution_run_id=execution_run_id,
+        client_logs=client_logs,
+    )
+    for name, content in docs.items():
+        files.append({"path": f"{base_path}/{name}", "content": content})
 
     report_md = (
         f"# {title}\n\n"
@@ -250,6 +262,7 @@ async def submit_bug_report(
         f"- **Version:** {version_label()}\n"
         f"- **Page:** {page_url or 'n/a'}\n"
         f"- **Reporter:** {reporter or 'anonymous'}\n"
+        f"- **Screenshot:** {'yes' if screenshot_bytes else 'no'}\n"
         f"- **Attachments folder:** [{base_path}]({raw_base})\n\n"
         f"### Description\n\n{description}\n\n"
     )

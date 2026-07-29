@@ -33,6 +33,7 @@ async def create_bug_report(
     page_url: str = Form(""),
     execution_run_id: str = Form(""),
     include_diagnostics: bool = Form(True),
+    client_logs: str = Form(""),
     reporter: str = Form(""),
     screenshot: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db),
@@ -55,7 +56,8 @@ async def create_bug_report(
             steps_to_reproduce=steps_to_reproduce,
             page_url=page_url or None,
             execution_run_id=execution_run_id or None,
-            include_diagnostics=include_diagnostics,
+            include_diagnostics=True,  # always attach diagnostics + logs
+            client_logs=client_logs or None,
             screenshot_bytes=screenshot_bytes,
             screenshot_filename=screenshot_name,
             reporter=reporter or None,

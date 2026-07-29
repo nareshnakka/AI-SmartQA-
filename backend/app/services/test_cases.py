@@ -22,6 +22,25 @@ def is_automation_enabled(case: TestCaseModel) -> bool:
     return (case.status or "").lower() != DISABLED_STATUS
 
 
+def heal_test_case_steps(case: TestCaseModel) -> bool:
+    """
+    Persist rewritten steps when legacy Discovery stored product queries as menu clicks.
+    Returns True when the stored JSON was updated in-memory (caller should flush).
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.services.test_steps import steps_for_storage
+
+    if not case.steps:
+        return False
+    healed = steps_for_storage(case.steps)
+    if healed == case.steps:
+        return False
+    case.steps = healed
+    flag_modified(case, "steps")
+    return True
+
+
 def test_case_to_dict(case: TestCaseModel) -> dict:
     from app.services.test_steps import steps_for_storage
 
@@ -123,6 +142,8 @@ async def create_project_test_case(
 
     case_code = await next_case_code(db, project_id, mod.id, case_type, env.id)
     human = (title or description or "Test case").strip()
+    from app.services.test_steps import steps_for_storage
+
     case = TestCaseModel(
         project_id=project_id,
         module_id=mod.id,
@@ -130,7 +151,7 @@ async def create_project_test_case(
         case_code=case_code,
         title=case_code,
         description=f"{human}\n\n{description}".strip() if description else human,
-        steps=steps,
+        steps=steps_for_storage(steps or []),
         expected_results=expected_results or ["Test completes successfully"],
         priority=priority,
         tags=tags or [],

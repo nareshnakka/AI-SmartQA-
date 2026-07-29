@@ -1,12 +1,15 @@
 import fs from 'fs';
 import type { Page } from '@playwright/test';
+import { publishLiveFrame } from './helpers';
 
 let stepIndex = 0;
 let progressPage: Page | null = null;
+let progressSeq = 0;
 
 export function resetQeosProgress() {
   stepIndex = 0;
   progressPage = null;
+  progressSeq = 0;
 }
 
 export function setQeosProgressPage(page: Page) {
@@ -22,13 +25,18 @@ function writeProgress(payload: Record<string, unknown>) {
   const file = process.env.QEOS_PROGRESS_FILE;
   if (!file) return;
   try {
-    fs.writeFileSync(file, JSON.stringify({ ...payload, ts: Date.now() }));
+    progressSeq += 1;
+    const body = {
+      ...payload,
+      test_case_id: payload.test_case_id || process.env.QEOS_TEST_CASE_ID || undefined,
+      ts: Date.now(),
+      seq: progressSeq,
+    };
+    fs.writeFileSync(file, JSON.stringify(body));
   } catch {
     /* ignore */
   }
 }
-
-import { publishLiveFrame } from './helpers';
 
 async function captureLiveFrame() {
   if (progressPage) {
@@ -37,7 +45,7 @@ async function captureLiveFrame() {
 }
 
 /** Report a specific test-case step index — keeps Studio flow in sync with stored steps */
-export function reportQeosStepAt(
+export async function reportQeosStepAt(
   index: number,
   description: string,
   status: 'running' | 'passed' | 'failed',
@@ -45,7 +53,7 @@ export function reportQeosStepAt(
   const idx = Math.max(0, Math.min(index, totalSteps() - 1));
   stepIndex = idx;
   writeProgress({ step_index: idx, description, status });
-  void captureLiveFrame();
+  await captureLiveFrame();
   if (status === 'passed') {
     stepIndex = Math.min(idx + 1, totalSteps() - 1);
   }

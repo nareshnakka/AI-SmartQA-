@@ -71,6 +71,10 @@ class LLMRouter:
             try:
                 llm = self.get_provider(provider_name)
                 resolved_model = model or settings.default_llm_model
+                if provider_name == "ollama" and (
+                    not model or str(model).startswith("qeos") or model == settings.default_llm_model
+                ):
+                    resolved_model = settings.ollama_model or "llama3.2"
                 return await llm.complete(messages, resolved_model, **kwargs)
             except Exception as e:
                 last_error = e

@@ -237,6 +237,85 @@ def test_consolidate_module_flow_into_journey():
     assert len(merged[0]["steps"]) >= 7
 
 
+def test_planned_steps_from_numbered_automation_prompt():
+    from app.runners.discovery_prompt import extract_planned_steps, parse_discovery_prompt
+
+    prompt = """no login
+
+Automation steps:
+1. Open https://www.flipkart.com
+2. Dismiss any login or location popups
+3. Search for "iPhone 15"
+4. Click the first product result
+5. Click Add to cart
+6. Verify the cart shows iPhone 15
+"""
+    intent = parse_discovery_prompt(prompt)
+    assert intent.case_mode == "as_written"
+    assert intent.split_test_cases is False
+    assert intent.strict_follow is True
+    assert len(intent.planned_steps) >= 5
+    actions = [s.action for s in intent.planned_steps]
+    assert "navigate" in actions or intent.planned_steps[0].url
+    assert "search" in actions
+    assert "verify" in actions
+
+    steps = extract_planned_steps(prompt)
+    assert steps[0].order == 1
+    search = next(s for s in steps if s.action == "search")
+    assert search.value and "iphone" in search.value.lower()
+
+
+def test_menu_template_numbered_steps_do_not_override_journey():
+    """Flipkart 'for each menu: 1. 2.' template must not become a 2-step junk case."""
+    prompt = """no login
+
+Navigate each of the below menus:
+For You
+Fashion
+Mobiles
+
+For each menu in the list above:
+1. Start from the homepage (https://www.flipkart.com).
+2. Click the menu item in the top navigation bar (do not use direct category URLs).
+
+Expected outcome:
+- One combined test case covering all menus above in a single flow.
+"""
+    intent = parse_discovery_prompt(prompt)
+    assert intent.planned_steps == []
+    assert intent.case_mode == "single_journey"
+    assert intent.menu_list_navigation is True
+    assert intent.split_test_cases is False
+
+
+def test_build_case_from_planned_steps_preserves_order():
+    from app.runners.discovery_prompt import parse_discovery_prompt
+    from app.runners.qa_agent import _build_case_from_planned_steps
+
+    intent = parse_discovery_prompt(
+        "Steps:\n"
+        "1. Open https://www.example.com\n"
+        "2. Search for \"shoes\"\n"
+        "3. Click Add to cart\n"
+        "4. Verify cart has shoes\n"
+    )
+    case = _build_case_from_planned_steps(intent, "https://www.example.com")
+    assert case["flow_kind"] == "as_written"
+    assert len(case["steps"]) >= 4
+    descs = " | ".join(s["description"] for s in case["steps"]).lower()
+    assert "search" in descs
+    assert "cart" in descs
+    assert "verify" in descs
+
+
+def test_broad_explore_alone_does_not_force_split_cases():
+    intent = parse_discovery_prompt("Explore all main menus on the site")
+    assert intent.broad_exploration is True
+    assert intent.split_test_cases is False
+    assert intent.case_mode == "single_journey"
+
+
 def test_sanitize_prompt_strips_base_url_line():
     from app.runners.discovery_prompt import sanitize_prompt_text
 
@@ -253,3 +332,146 @@ Message: Hello"""
     assert "base url" not in labels
     assert "your name" in labels
     assert not any("debug" in t.lower() for t in intent.explicit_targets)
+
+
+def test_iphone_search_not_extracted_as_menu_target():
+    from app.runners.discovery_prompt import extract_explicit_targets, navigation_targets, parse_discovery_prompt
+
+    prompt = """no login
+
+Automation steps:
+1. Open Flipkart homepage
+2. Search for "iPhone 15"
+3. Click the first product
+4. Click Add to cart
+5. Verify cart shows iPhone 15
+"""
+    intent = parse_discovery_prompt(prompt)
+    targets = extract_explicit_targets(prompt)
+    assert not any("iphone" in t.lower() for t in targets)
+    assert not any("iphone" in t.lower() for t in navigation_targets(intent))
+    assert intent.case_mode == "as_written"
+    search_steps = [s for s in intent.planned_steps if s.action == "search"]
+    assert search_steps
+    assert "iphone" in (search_steps[0].value or "").lower()
+
+
+def test_combined_product_search_not_menu_click():
+    from app.runners.qa_agent import _build_combined_navigation_test_case, _menu_module_test
+
+    case = _build_combined_navigation_test_case(
+        "https://www.flipkart.com",
+        [("iPhone 15", "https://www.flipkart.com/search?q=iphone", "iPhone 15")],
+    )
+    assert case["flow_kind"] == "product_search"
+    search = next(s for s in case["steps"] if s.get("action") == "search")
+    assert 'Search for "iPhone 15"' in search["description"]
+    assert not any(
+        s.get("interaction") == "menu" and "iphone" in (s.get("description") or "").lower()
+        for s in case["steps"]
+    )
+
+    module = _menu_module_test(
+        "iPhone 15",
+        "https://www.flipkart.com",
+        "iPhone 15",
+        home_url="https://www.flipkart.com",
+    )
+    assert module["flow_kind"] == "product_search"
+    assert module["steps"][2]["action"] == "search"
+    assert "navigation menu" not in module["steps"][2]["description"].lower()
+
+
+def test_rewrite_legacy_iphone_menu_step_to_search():
+    from app.services.test_steps import normalize_test_steps
+
+    steps = normalize_test_steps([
+        {"order": 1, "action": "navigate", "description": "Navigate to https://www.flipkart.com", "url": "https://www.flipkart.com"},
+        {
+            "order": 2,
+            "action": "click",
+            "description": "Click 'iPhone 15' in the main navigation menu",
+            "element": "iPhone 15",
+            "interaction": "menu",
+        },
+    ])
+    assert steps[1]["action"] == "search"
+    assert steps[1]["interaction"] == "search"
+    assert "Search for" in steps[1]["description"]
+    assert "iPhone 15" in steps[1]["description"]
+
+
+def test_second_phone_from_results_is_click_not_search():
+    from app.runners.discovery_prompt import extract_planned_steps, parse_discovery_prompt
+
+    prompt = """no login
+
+Automation steps:
+1. Open https://www.flipkart.com
+2. Dismiss any login or location popups
+3. Search for "Samsung Galaxy"
+4. Click the second phone in the search results
+5. Click Add to cart
+6. Go to Cart
+7. Remove the Samsung Galaxy item from the cart
+8. Verify the cart no longer shows that item
+"""
+    steps = extract_planned_steps(prompt)
+    actions = [(s.action, s.interaction, s.description) for s in steps]
+    search = next(s for s in steps if s.action == "search")
+    assert "Samsung" in (search.value or search.description)
+
+    result = next(s for s in steps if (s.interaction or "") == "result")
+    assert result.action == "click"
+    assert result.element == "2"
+    assert "second" in result.description.lower()
+    assert "Search for" not in result.description
+    assert not any(
+        s.action == "search" and "result" in (s.description or "").lower()
+        for s in steps
+    )
+
+    cart = next(s for s in steps if (s.interaction or "") == "cart")
+    assert cart.element == "Cart"
+    remove = next(s for s in steps if (s.interaction or "") == "cart_remove")
+    assert remove.action == "click"
+
+    intent = parse_discovery_prompt(prompt)
+    assert intent.case_mode == "as_written"
+    assert any((s.interaction or "") == "result" for s in intent.planned_steps)
+
+
+def test_rewrite_search_for_results_to_product_click():
+    from app.services.test_steps import normalize_test_steps
+
+    steps = normalize_test_steps([
+        {
+            "order": 4,
+            "action": "search",
+            "description": 'Search for "results"',
+            "field": "Search",
+            "interaction": "search",
+        },
+    ])
+    assert steps[0]["action"] == "click"
+    assert steps[0]["interaction"] == "result"
+    assert steps[0]["element"] == "2"
+    assert "second" in steps[0]["description"].lower()
+    assert "Search for" not in steps[0]["description"]
+
+
+def test_rewrite_go_to_cart_navigate_to_cart_click():
+    from app.services.test_steps import normalize_test_steps
+
+    steps = normalize_test_steps([
+        {
+            "order": 6,
+            "action": "navigate",
+            "description": "Go to Cart",
+            "url": "https://www.flipkart.com",
+        },
+    ])
+    assert steps[0]["action"] == "click"
+    assert steps[0]["interaction"] == "cart"
+    assert steps[0]["element"] == "Cart"
+    assert "url" not in steps[0] or not steps[0].get("url")

@@ -294,72 +294,70 @@ public class {class_name} {{
     def generate(self, input_data: dict) -> dict:
         framework = input_data.get("framework", "playwright")
         test_cases = input_data.get("test_cases", [])
+        base_url = input_data.get("base_url") or "https://example.com"
         if not test_cases and isinstance(input_data, dict):
             test_cases = input_data.get("test_cases", [input_data]) if "title" not in input_data else [input_data]
 
         if not test_cases:
             test_cases = [{"title": "Sample Test", "steps": ["Navigate to app", "Verify homepage"], "expected_results": ["Page loads"]}]
 
-        template = self.TEMPLATES.get(framework, self.TEMPLATES["playwright"])
-        files = []
+        # Prefer action-accurate scripts from normalized Discovery steps
+        from app.services.step_script_codegen import build_all_framework_files
 
-        for i, tc in enumerate(test_cases[:5]):
-            title = tc.get("title", f"Test_{i + 1}")
-            safe_name = "".join(c if c.isalnum() else "_" for c in title)[:30]
-            steps = tc.get("steps", [])
-            expected = "; ".join(tc.get("expected_results", ["Success"]))
+        known = {
+            "playwright", "selenium", "cypress", "webdriverio",
+            "robot_framework", "appium", "puppeteer", "testcafe",
+        }
+        fw = framework if framework in known else "playwright"
+        files = build_all_framework_files(test_cases, fw, base_url)
 
-            if framework == "playwright":
-                step_lines = "\n".join(f"    await pg.performStep{i + 1}();  // {s}" for i, s in enumerate(steps))
-                page_class = "AppPage"
-                content = template["test_file"].format(
-                    page_class=page_class,
-                    suite_name=safe_name,
-                    test_name=title,
-                    steps=step_lines or "    await page.goto('/');",
-                    expected=expected[:80],
-                )
-                files.append({"path": f"tests/{safe_name}.spec.ts", "content": content, "type": "test"})
+        # Optional page object stub for Playwright (first case only)
+        if fw == "playwright" and test_cases:
+            steps = test_cases[0].get("steps") or []
+            methods = "\n".join(
+                f"  async performStep{j + 1}() {{ /* {(s.get('description') if isinstance(s, dict) else s)} */ }}"
+                for j, s in enumerate(steps[:12])
+            )
+            files.append({
+                "path": "pages/AppPage.ts",
+                "content": self.TEMPLATES["playwright"]["page_object"].format(
+                    page_class="AppPage",
+                    locators="  readonly submitBtn: Locator;",
+                    locator_init='    this.submitBtn = page.locator(\'[data-testid="submit"]\');',
+                    methods=methods or "  async navigate() { await this.page.goto('/'); }",
+                ),
+                "type": "page_object",
+            })
 
-                if i == 0:
-                    methods = "\n".join(
-                        f"  async performStep{j + 1}() {{ /* {s} */ }}"
-                        for j, s in enumerate(steps)
-                    )
-                    po_content = template["page_object"].format(
-                        page_class=page_class,
-                        locators="  readonly submitBtn: Locator;",
-                        locator_init="    this.submitBtn = page.locator('[data-testid=\"submit\"]');",
-                        methods=methods or "  async navigate() { await this.page.goto('/'); }",
-                    )
-                    files.append({"path": f"pages/{page_class}.ts", "content": po_content, "type": "page_object"})
+        language = {
+            "playwright": "typescript",
+            "selenium": "java",
+            "cypress": "javascript",
+            "webdriverio": "typescript",
+            "robot_framework": "python",
+            "appium": "python",
+            "puppeteer": "javascript",
+            "testcafe": "javascript",
+        }.get(fw, "typescript")
 
-            elif framework == "selenium":
-                step_lines = "\n".join(f"        // Step: {s}" for s in steps)
-                content = template["test_file"].format(
-                    class_name=safe_name,
-                    test_name=title,
-                    method_name=f"test{safe_name}",
-                    steps=step_lines or "        // Implement test steps",
-                )
-                files.append({"path": f"src/test/java/{safe_name}.java", "content": content, "type": "test"})
-
-            else:  # cypress
-                step_lines = "\n".join(f"    // {s}" for s in steps)
-                content = template["test_file"].format(
-                    suite_name=safe_name,
-                    test_name=title,
-                    steps=step_lines or "    cy.visit('/');",
-                )
-                files.append({"path": f"cypress/e2e/{safe_name}.cy.js", "content": content, "type": "test"})
+        deps = {
+            "playwright": ["@playwright/test"],
+            "selenium": ["selenium-java", "testng"],
+            "cypress": ["cypress"],
+            "webdriverio": ["@wdio/cli"],
+            "robot_framework": ["robotframework", "robotframework-browser"],
+            "appium": ["Appium-Python-Client", "pytest"],
+            "puppeteer": ["puppeteer"],
+            "testcafe": ["testcafe"],
+        }.get(fw, ["@playwright/test"])
 
         return {
-            "framework": framework,
-            "language": template["language"],
+            "framework": fw,
+            "language": language,
             "files": files,
-            "dependencies": template["deps"],
-            "ci_pipeline_snippet": self._ci_snippet(framework),
-            "_engine": "qeos-native",
+            "dependencies": deps,
+            "ci_pipeline_snippet": self._ci_snippet(fw),
+            "_engine": "qeos-step-codegen",
         }
 
     def _ci_snippet(self, framework: str) -> str:

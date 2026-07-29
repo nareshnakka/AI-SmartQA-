@@ -4,7 +4,22 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.config import settings
-from app.llm.base import LLMMessage, LLMProvider, LLMResponse
+from app.llm.base import LLMImage, LLMMessage, LLMProvider, LLMResponse
+
+
+def _openai_content(message: LLMMessage) -> str | list[dict]:
+    if not message.images:
+        return message.content
+    parts: list[dict] = [{"type": "text", "text": message.content or "Analyze these frames."}]
+    for img in message.images:
+        parts.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{img.mime_type};base64,{img.data_base64}",
+                "detail": img.detail or "low",
+            },
+        })
+    return parts
 
 
 class OpenAIProvider(LLMProvider):
@@ -15,6 +30,9 @@ class OpenAIProvider(LLMProvider):
 
     def is_available(self) -> bool:
         return bool(settings.openai_api_key)
+
+    def supports_vision(self) -> bool:
+        return self.is_available()
 
     def list_models(self) -> list[str]:
         return ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o1", "o1-mini"]
@@ -30,9 +48,14 @@ class OpenAIProvider(LLMProvider):
         if not self._client:
             raise RuntimeError("OpenAI API key not configured")
 
+        # Vision requires a multimodal-capable model
+        has_images = any(m.images for m in messages)
+        if has_images and model in ("o1", "o1-mini"):
+            model = "gpt-4o"
+
         response = await self._client.chat.completions.create(
             model=model,
-            messages=[{"role": m.role.value, "content": m.content} for m in messages],
+            messages=[{"role": m.role.value, "content": _openai_content(m)} for m in messages],
             temperature=temperature,
             max_tokens=max_tokens,
             **kwargs,
@@ -53,7 +76,6 @@ class OpenAIProvider(LLMProvider):
             usage=usage,
             raw=response,
         )
-
 
 class AnthropicProvider(LLMProvider):
     name = "anthropic"
@@ -131,6 +153,9 @@ class GeminiProvider(LLMProvider):
     def is_available(self) -> bool:
         return self._configured
 
+    def supports_vision(self) -> bool:
+        return self.is_available()
+
     def list_models(self) -> list[str]:
         return ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
 
@@ -145,10 +170,20 @@ class GeminiProvider(LLMProvider):
         if not self._configured:
             raise RuntimeError("Google API key not configured")
 
-        prompt = "\n".join(f"{m.role.value}: {m.content}" for m in messages)
+        import base64
+
+        parts: list[Any] = []
+        for m in messages:
+            label = m.role.value.upper()
+            if m.content:
+                parts.append(f"{label}: {m.content}")
+            for img in m.images or []:
+                raw = base64.b64decode(img.data_base64)
+                parts.append({"mime_type": img.mime_type, "data": raw})
+
         gemini_model = self._genai.GenerativeModel(model)
         response = await gemini_model.generate_content_async(
-            prompt,
+            parts if parts else "Analyze",
             generation_config={"temperature": temperature},
         )
 

@@ -141,6 +141,36 @@ export async function apiUpload<T>(path: string, file: File, extra?: Record<stri
   throw wrapNetworkError(lastError);
 }
 
+/** Multipart upload with multiple files + form fields (video / screenshots). */
+export async function apiUploadForm<T>(path: string, form: FormData): Promise<T> {
+  let lastError: unknown;
+  for (const base of apiBases()) {
+    try {
+      const response = await fetch(`${base}${path}`, {
+        method: "POST",
+        body: form,
+        headers: authHeaders(),
+      });
+      if (!response.ok) {
+        let detail = `Upload failed: ${response.status}`;
+        try {
+          const body = await response.json();
+          if (body?.detail) detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+        } catch {
+          /* ignore */
+        }
+        throw new Error(detail);
+      }
+      return response.json();
+    } catch (err) {
+      lastError = err;
+      if (base === "" && isBackendNetworkError(err)) continue;
+      throw wrapNetworkError(err);
+    }
+  }
+  throw wrapNetworkError(lastError);
+}
+
 export function exportUrl(projectId: string, format: "json" | "csv") {
   return `${BACKEND_URL}/api/v1/projects/${projectId}/export/${format}`;
 }
