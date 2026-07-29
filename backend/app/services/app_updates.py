@@ -124,6 +124,27 @@ def _remote_version_sync(repo_root: Path, branch: str) -> dict | None:
         return None
 
 
+def _env_file_changes_sync(repo_root: Path, branch: str) -> dict:
+    """Detect whether remote update includes .env / .env.example changes."""
+    names = (".env", ".env.example")
+    changed: list[str] = []
+    for name in names:
+        diff = _run_git(
+            ["diff", "--name-only", f"HEAD..origin/{branch}", "--", name],
+            repo_root,
+        )
+        if diff.returncode == 0 and (diff.stdout or "").strip():
+            changed.append(name)
+    # Also surface when remote .env exists and differs in content preview
+    remote_env = _run_git(["show", f"origin/{branch}:.env"], repo_root)
+    has_remote_env = remote_env.returncode == 0 and bool((remote_env.stdout or "").strip())
+    return {
+        "env_file_changed": len(changed) > 0,
+        "env_files_changed": changed,
+        "remote_env_tracked": has_remote_env,
+    }
+
+
 def _git_check_sync(repo_root: Path, fetch: bool) -> dict:
     branch_proc = _run_git(["branch", "--show-current"], repo_root)
     branch = (branch_proc.stdout or "").strip() or "main"
@@ -168,6 +189,11 @@ def _git_check_sync(repo_root: Path, fetch: bool) -> dict:
     local_version = _read_version_file(repo_root / "version.json")
     remote_version = _remote_version_sync(repo_root, branch) if available else local_version
     changelog = _changelog_sync(repo_root, branch) if available else []
+    env_meta = _env_file_changes_sync(repo_root, branch) if available else {
+        "env_file_changed": False,
+        "env_files_changed": [],
+        "remote_env_tracked": (_run_git(["show", f"origin/{branch}:.env"], repo_root).returncode == 0),
+    }
 
     summary = "You are on the latest version."
     if available:
@@ -175,6 +201,9 @@ def _git_check_sync(repo_root: Path, fetch: bool) -> dict:
         from_label = _version_label(local_version) or _short_sha(local_commit)
         to_label = _version_label(remote_version) or _short_sha(remote_commit)
         summary = f"{behind} new {commit_word} available — {from_label} → {to_label}."
+        if env_meta.get("env_file_changed"):
+            files = ", ".join(env_meta.get("env_files_changed") or [".env"])
+            summary += f" Includes environment file updates ({files})."
 
     origin_proc = _run_git(["remote", "get-url", "origin"], repo_root)
     remote_url = (origin_proc.stdout or "").strip() if origin_proc.returncode == 0 else ""
@@ -194,6 +223,7 @@ def _git_check_sync(repo_root: Path, fetch: bool) -> dict:
         "remote_version": _version_label(remote_version),
         "auto_update_enabled": bool(settings.qeos_auto_update_enabled),
         "poll_interval_sec": int(settings.qeos_auto_update_poll_sec),
+        **env_meta,
     }
 
 

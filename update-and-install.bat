@@ -39,10 +39,11 @@ if "%AUTO%"=="0" (
   echo   QEOS - Update from GitHub and Install Dependencies
   echo ============================================================
   echo.
-  echo   Pulls latest code, then installs Python, Node, DB, runners,
-  echo   and the Discovery agent ^(Ollama LLM + Playwright e2e^).
+  echo   Pulls latest code ^(including .env updates^), then installs Python, Node, DB,
+  echo   runners, and the Discovery agent ^(Ollama LLM + Playwright e2e^).
   echo   Your data is preserved:
-  echo     - .env and settings
+  echo     - Local secret values in .env / .env.local ^(non-empty keys kept^)
+  echo     - New .env keys from GitHub are merged automatically
   echo     - SQLite database (projects, test cases, discovery)
   echo     - data\ folder (Cursor credentials, backups)
   echo     - execution_artifacts
@@ -100,10 +101,14 @@ if exist "%ROOT%\.git" (
   if errorlevel 1 goto :fetch_failed
   git pull origin !BRANCH!
   if errorlevel 1 goto :pull_failed
+  REM Capture repo .env from pull before stash pop can overwrite with older local copy
+  if exist "%ROOT%\.env" copy /Y "%ROOT%\.env" "%TEMP%\qeos-env-from-repo.env" >nul 2>&1
   if "!DID_STASH!"=="1" (
     if "%AUTO%"=="0" echo Restoring your saved local changes...
     git stash pop >nul 2>&1
   )
+  REM Merge downloaded .env keys into local .env (local non-empty secrets win)
+  call :apply_env_from_update
   if "%AUTO%"=="0" echo Code update complete.
   if "%AUTO%"=="0" echo.
 ) else (
@@ -206,10 +211,13 @@ if not exist "%ROOT%\.env" (
     echo No .env.example found - using built-in defaults.
   )
 ) else (
-  echo .env already exists.
-  call :merge_env_defaults
+  echo .env already exists — merging new keys from repo / .env.example...
+  call :apply_env_from_update
 )
 if not exist "%BACKEND%\.env" if exist "%ROOT%\.env" (
+  copy /Y "%ROOT%\.env" "%BACKEND%\.env" >nul
+  echo Synced .env to backend folder.
+) else if exist "%ROOT%\.env" (
   copy /Y "%ROOT%\.env" "%BACKEND%\.env" >nul
   echo Synced .env to backend folder.
 )
@@ -403,9 +411,32 @@ call ".venv\Scripts\python.exe" -c "import asyncio; from app.db.session import i
 if errorlevel 1 exit /b 1
 exit /b 0
 
+:apply_env_from_update
+REM Prefer .env downloaded from git; also merge .env.example for any extra documented keys
+set "MERGE_PY="
+if exist "%BACKEND%\.venv\Scripts\python.exe" set "MERGE_PY=%BACKEND%\.venv\Scripts\python.exe"
+if not defined MERGE_PY if defined PYTHON_CMD set "MERGE_PY=%PYTHON_CMD%"
+if not defined MERGE_PY where py >nul 2>&1 && set "MERGE_PY=py -3"
+if not defined MERGE_PY (
+  echo [WARNING] Python not ready — skipping .env merge helper.
+  call :merge_env_defaults
+  exit /b 0
+)
+if exist "%TEMP%\qeos-env-from-repo.env" (
+  echo Merging .env keys downloaded from GitHub...
+  "!MERGE_PY!" "%BACKEND%\scripts\merge_env_file.py" "%ROOT%\.env" "%TEMP%\qeos-env-from-repo.env"
+)
+if exist "%ROOT%\.env.example" (
+  echo Merging documented keys from .env.example...
+  "!MERGE_PY!" "%BACKEND%\scripts\merge_env_file.py" "%ROOT%\.env" "%ROOT%\.env.example"
+)
+call :merge_env_defaults
+if exist "%ROOT%\.env" copy /Y "%ROOT%\.env" "%BACKEND%\.env" >nul 2>&1
+exit /b 0
+
 :merge_env_defaults
-REM Append new Discovery / Ollama keys from .env.example when missing in .env
-if not exist "%ROOT%\.env.example" exit /b 0
+REM Append critical Discovery / Ollama keys when still missing
+if not exist "%ROOT%\.env" exit /b 0
 findstr /B /C:"DISCOVERY_LLM_ADVISOR_ENABLED=" "%ROOT%\.env" >nul 2>&1
 if errorlevel 1 (
   echo.>>"%ROOT%\.env"

@@ -1,7 +1,10 @@
-# Environment
-.env
+# Environment — track shared root .env; keep machine secrets in .env.local
 .env.local
 .env.*.local
+backend/.env
+# Note: root .env IS tracked so updates can download shared settings.
+# Put API tokens / private keys in .env.local (never committed).
+# backend/.env is a runtime copy synced from root .env by update-and-install.bat.
 
 # Python
 __pycache__/

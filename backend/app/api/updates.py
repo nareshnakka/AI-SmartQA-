@@ -35,6 +35,9 @@ def _build_notifications(update: dict, auto_result: dict | None) -> list[dict]:
     message = (update.get("summary") or "A newer version is available on GitHub.") + (
         f"\n{detail}" if detail else ""
     )
+    if update.get("env_file_changed"):
+        files = ", ".join(update.get("env_files_changed") or [".env"])
+        message += f"\n• Environment file updates will be downloaded and merged ({files})."
 
     action_label = "Install & restart"
     if auto_result and auto_result.get("started"):
@@ -61,6 +64,8 @@ def _build_notifications(update: dict, auto_result: dict | None) -> list[dict]:
                 "changelog": changelog,
                 "auto_update_enabled": update.get("auto_update_enabled"),
                 "auto_status": (auto_result or {}).get("status"),
+                "env_file_changed": bool(update.get("env_file_changed")),
+                "env_files_changed": update.get("env_files_changed") or [],
             },
         }
     )

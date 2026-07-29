@@ -38,6 +38,8 @@ type AppNotification = {
     auto_update_enabled?: boolean;
     auto_status?: string;
     data_preserved?: boolean;
+    env_file_changed?: boolean;
+    env_files_changed?: string[];
   };
 };
 
@@ -55,6 +57,8 @@ type UpdatesStatus = {
     remote_version?: string;
     changelog?: ChangelogEntry[];
     auto_update_enabled?: boolean;
+    env_file_changed?: boolean;
+    env_files_changed?: string[];
   };
   running_activity: {
     has_active: boolean;
@@ -263,8 +267,18 @@ export function NotificationBell() {
                           </ul>
                         )}
                         <p className="text-[10px] text-[var(--text-tertiary)] mt-2">
-                          Projects, database, and settings are kept during updates.
+                          Projects, database, and settings are kept. New .env keys from GitHub are merged
+                          (your non-empty secret values are not overwritten).
                         </p>
+                        {item.meta?.env_file_changed && (
+                          <p className="text-[11px] text-amber-800 mt-1">
+                            This update includes environment file changes
+                            {(item.meta.env_files_changed?.length
+                              ? `: ${item.meta.env_files_changed.join(", ")}`
+                              : "")}
+                            .
+                          </p>
+                        )}
                         {item.created_at && (
                           <p className="text-[10px] text-[var(--text-tertiary)] mt-1">{formatWhen(item.created_at)}</p>
                         )}
